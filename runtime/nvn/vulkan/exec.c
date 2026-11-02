@@ -875,12 +875,218 @@ static inline bool ss_need(uint32_t bit, bool same) {
     return true;
 }
 
+// ---- the other co-op player, drawn into the 3D scene (runtime/hle/coop.c has where and how). The game's first big pass with
+// depth is its world; drawing as that pass ends puts the figure behind the world's walls, and under everything drawn later.
+#define FIGURE_PASS_DRAWS 50
+static uint64_t pass_start_draws;
+extern bool coop_figure_get(float feet[3], float *yaw, float *swing, float view[12], float *proj_x, float *proj_y);
+static void pass_size(int *w, int *h);
+
+static const char FIGURE_VS[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { mat4 mvp; vec4 color; vec4 turn; } p;\n"
+    "layout(location = 0) out vec3 v_color;\n"
+    "const ivec3 CORNERS[8] = ivec3[8](ivec3(-1,-1,-1), ivec3(1,-1,-1), ivec3(1,1,-1), ivec3(-1,1,-1),\n"
+    "                                  ivec3(-1,-1,1), ivec3(1,-1,1), ivec3(1,1,1), ivec3(-1,1,1));\n"
+    "const int FACES[36] = int[36](4,5,6,4,6,7, 1,0,3,1,3,2, 5,1,2,5,2,6, 0,4,7,0,7,3, 3,7,6,3,6,2, 0,1,5,0,5,4);\n"
+    "const vec3 NORMALS[6] = vec3[6](vec3(0,0,1), vec3(0,0,-1), vec3(1,0,0), vec3(-1,0,0), vec3(0,1,0), vec3(0,-1,0));\n"
+    "void main() {\n"
+    "    gl_Position = p.mvp * vec4(vec3(CORNERS[FACES[gl_VertexIndex]]), 1.0);\n"
+    "    vec3 n = NORMALS[gl_VertexIndex / 6];\n"
+    "    vec3 w = vec3(n.x * p.turn.x + n.z * p.turn.y, n.y, -n.x * p.turn.y + n.z * p.turn.x);\n"
+    "    v_color = p.color.rgb * (0.68 + 0.32 * max(dot(w, normalize(vec3(0.4, 0.8, 0.45))), 0.0));\n"
+    "}\n";
+static const char FIGURE_FS[] =
+    "#version 450\n"
+    "layout(location = 0) in vec3 v_color;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() { o_color = vec4(v_color, 1.0); }\n";
+
+typedef struct { float mvp[16], color[4], turn[4]; } FigurePush;
+
+static VkPipelineLayout figure_layout(void) {
+    static VkPipelineLayout l;
+    if (!l) {
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(FigurePush)};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+                                         .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
+    }
+    return l;
+}
+
+static VkPipeline figure_pipeline(void) {
+    static VkPipeline pipe;
+    static VkFormat color0, depth, stencil;
+    static uint32_t ncolor, samples;
+    static bool failed;
+    if (pipe && color0 == pass_color[0] && depth == pass_depth && stencil == pass_stencil && ncolor == pass_ncolor &&
+        samples == pass_samples)
+        return pipe;
+    if (failed) return VK_NULL_HANDLE;
+    size_t nv = 0, nf = 0;
+    uint32_t *sv = vk_glsl_to_spirv(FIGURE_VS, STAGE_VERTEX, "coop_figure.vert", &nv);
+    uint32_t *sf = vk_glsl_to_spirv(FIGURE_FS, STAGE_FRAGMENT, "coop_figure.frag", &nf);
+    if (!sv || !sf) { failed = true; return VK_NULL_HANDLE; }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_module(sv, nv), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_module(sf, nf), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)pass_samples};
+    // (the game's projection is reversed: nearer is greater)
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
+                                                .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL};
+    VkPipelineColorBlendAttachmentState cba[8] = {0};
+    cba[0].colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = pass_ncolor, .pAttachments = cba};
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = pass_ncolor,
+                                           .pColorAttachmentFormats = pass_color, .depthAttachmentFormat = pass_depth,
+                                           .stencilAttachmentFormat = pass_stencil};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rinfo, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = figure_layout()};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) {
+        LOG("[coop] figure pipeline failed\n");
+        failed = true;
+        return VK_NULL_HANDLE;
+    }
+    pipe = p, color0 = pass_color[0], depth = pass_depth, stencil = pass_stencil, ncolor = pass_ncolor, samples = pass_samples;
+    return pipe;
+}
+
+// A second Link: the game's own draws of Link, issued again with their bones moved to where the other player stands. The
+// bones are matrices in view space in vertex constant buffer 3 (the same draw's buffer 4 has their rotations alone), so
+// moving them is adding the same view-space offset to each translation.
+#define LINK_CBUFS 0xd8        // constant buffers skinned meshes use
+#define LINK_RIGID_CBUFS 0x18  // pieces fixed to one bone use fewer. They write depth; many effects don't
+#define LINK_BONES_NEAR 250.0f // the first bone of a mesh of Link's is within this of him
+#define LINK_BIG_MESH_BYTES 8000      // bone buffers this big are his
+#define LINK_MODEL_SLACK 0x100000ull  // how far from his big meshes in memory the rest of his model is
+#define DUP_BUF_SIZE (4u << 20)
+static uint64_t dup_seen_frame = ~0ull;
+extern bool coop_my_position(float out[3]);
+#include "../../hle/coop_pose.h"
+
+// Once a frame: the same smoothed target for the whole frame.
+static bool figure_state(float feet[3], float *yaw, float *swing, float view[12], float *px, float *py) {
+    static uint64_t frame = ~0ull;
+    static bool ok;
+    static float f[3], y, s, v[12], x, z;
+    uint64_t now = renderer_present_count();
+    if (now != frame) {
+        frame = now;
+        ok = coop_figure_get(f, &y, &s, v, &x, &z);
+    }
+    memcpy(feet, f, sizeof f), *yaw = y, *swing = s, memcpy(view, v, sizeof v), *px = x, *py = z;
+    return ok;
+}
+
+// Column-major, as GLSL reads it. m = a * b.
+static void figure_mul(float m[16], const float a[16], const float b[16]) {
+    float r[16];
+    for (int c = 0; c < 4; c++)
+        for (int w = 0; w < 4; w++)
+            r[c * 4 + w] = a[w] * b[c * 4] + a[4 + w] * b[c * 4 + 1] + a[8 + w] * b[c * 4 + 2] + a[12 + w] * b[c * 4 + 3];
+    memcpy(m, r, sizeof r);
+}
+
+static void figure_draw(VkCommandBuffer cb) {
+    // Link's proportions, in game units, facing +z: centre, half size, the joint it swings from, and how it swings.
+    enum { STILL, LEG_L, LEG_R, ARM_L, ARM_R };
+    static const struct { float c[3], h[3]; int swing; float color[3]; } PARTS[] = {
+        {{-12, 16, 3}, {9, 16, 13}, LEG_L, {0.33f, 0.21f, 0.13f}},   // boots
+        {{12, 16, 3}, {9, 16, 13}, LEG_R, {0.33f, 0.21f, 0.13f}},
+        {{-12, 60, 0}, {8, 30, 9}, LEG_L, {0.86f, 0.80f, 0.64f}},    // legs
+        {{12, 60, 0}, {8, 30, 9}, LEG_R, {0.86f, 0.80f, 0.64f}},
+        {{0, 84, 0}, {25, 14, 16}, STILL, {0.20f, 0.52f, 0.20f}},    // tunic skirt
+        {{0, 118, 0}, {22, 24, 13}, STILL, {0.24f, 0.60f, 0.24f}},   // tunic
+        {{0, 98, 0}, {24, 4, 15}, STILL, {0.38f, 0.23f, 0.12f}},     // belt
+        {{-31, 112, 0}, {7, 28, 8}, ARM_L, {0.24f, 0.60f, 0.24f}},   // arms
+        {{31, 112, 0}, {7, 28, 8}, ARM_R, {0.24f, 0.60f, 0.24f}},
+        {{-31, 78, 0}, {6, 6, 7}, ARM_L, {0.96f, 0.76f, 0.60f}},     // hands
+        {{31, 78, 0}, {6, 6, 7}, ARM_R, {0.96f, 0.76f, 0.60f}},
+        {{0, 158, 0}, {15, 16, 15}, STILL, {0.96f, 0.76f, 0.60f}},   // head
+        {{0, 170, 7}, {16, 6, 10}, STILL, {0.80f, 0.56f, 0.24f}},    // fringe
+        {{0, 178, -2}, {17, 8, 17}, STILL, {0.20f, 0.52f, 0.20f}},   // hat
+        {{0, 172, -24}, {11, 8, 12}, STILL, {0.20f, 0.52f, 0.20f}},  // its tail
+        {{0, 166, -42}, {7, 6, 10}, STILL, {0.20f, 0.52f, 0.20f}},
+    };
+    float feet[3], yaw, swing, view[12], px, py;
+    if (!pass_depth || !figure_state(feet, &yaw, &swing, view, &px, &py)) return;
+    if (dup_seen_frame != ~0ull) return;  // (a real Link can be drawn: this is only until there's been one to copy)
+    VkPipeline pipe = figure_pipeline();
+    if (!pipe) return;
+    int w, h;
+    pass_size(&w, &h);
+    if (w <= 0 || h <= 0) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
+    VkRect2D sc = {{0, 0}, {(uint32_t)w, (uint32_t)h}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    // World to clip: x y scaled, z = 1 and w = distance, which is the game's reversed depth. y isn't negated for Vulkan: the
+    // game's targets are drawn with y up, as the renderer's own viewports have them.
+    const float clip[16] = {px * view[0], py * view[4], 0, -view[8],
+                            px * view[1], py * view[5], 0, -view[9],
+                            px * view[2], py * view[6], 0, -view[10],
+                            px * view[3], py * view[7], 1, -view[11]};
+    float cy = cosf(yaw), sy = sinf(yaw);
+    const float place[16] = {cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, feet[0], feet[1], feet[2], 1};
+    float world[16];
+    figure_mul(world, clip, place);
+    for (size_t i = 0; i < sizeof PARTS / sizeof *PARTS; i++) {
+        int s = PARTS[i].swing;
+        float a = s == LEG_L || s == ARM_R ? swing : s == LEG_R || s == ARM_L ? -swing : 0;
+        float joint = s == LEG_L || s == LEG_R ? 90.0f : 140.0f, ca = cosf(a), sa = sinf(a);
+        float y = PARTS[i].c[1] - joint, z = PARTS[i].c[2];
+        const float *c = PARTS[i].c, *e = PARTS[i].h;
+        const float part[16] = {e[0], 0, 0, 0,
+                                0, e[1] * ca, e[1] * sa, 0,
+                                0, -e[2] * sa, e[2] * ca, 0,
+                                c[0], s == STILL ? c[1] : joint + y * ca - z * sa, s == STILL ? c[2] : y * sa + z * ca, 1};
+        FigurePush push = {.color = {PARTS[i].color[0], PARTS[i].color[1], PARTS[i].color[2], 1}, .turn = {cy, sy, 0, 0}};
+        figure_mul(push.mvp, world, part);
+        vkCmdPushConstants(cb, figure_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof push, &push);
+        vkCmdDraw(cb, 36, 1, 0, 0);
+    }
+    ss_forget();  // (the pipeline and state just changed behind the state cache)
+}
+
+static uint64_t figure_world_frame = ~0ull;  // the world's targets this frame: where a Link kept for later can be drawn
+static NvnTexture *figure_world_color, *figure_world_depth;
+
+static void figure_pass_end(VkCommandBuffer cb) {
+    static uint64_t drawn_frame = ~0ull;
+    if (!g_is_skyward || !st.rt.ncolor || !st.rt.color[0] || !st.rt.depth) return;
+    if (stat_draws - pass_start_draws < FIGURE_PASS_DRAWS) return;
+    uint64_t f = renderer_present_count();
+    if (f == drawn_frame) return;
+    drawn_frame = f;
+    figure_world_frame = f, figure_world_color = st.rt.color[0], figure_world_depth = st.rt.depth;
+    figure_draw(cb);
+}
+
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
+    figure_pass_end(vk_cmd());
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
@@ -973,6 +1179,7 @@ static void begin_pass(void) {
     vkCmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
+    pass_start_draws = stat_draws;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -2689,14 +2896,198 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 
 static void draw_(CmdRec *r, bool indexed);
 static void linear_rt_writeback(void);
+static Prog *dup_program(void);
+// ---- Link as last seen. The game doesn't draw him in first person, or in some scenes, and then there'd be nothing to
+// repeat: each of his draws is kept, with all its state and a copy of the buffers it reads, to draw from instead.
+#define KEEP_PARTS 48
+#define KEEP_BUFFERS (2 * 18)
+#define KEEP_BYTES (256u << 10)
+typedef __typeof__(st) DrawState;
+#define KEEP_RECORD 512  // bytes of a draw's command record, with what follows its header
+typedef struct {
+    _Alignas(8) uint8_t record[KEEP_RECORD];
+    DrawState state;
+    bool indexed, skinned;
+    uint32_t vertices, nbones;
+} KeptPart;
+static KeptPart *kept;
+static uint8_t *kept_data[KEEP_PARTS];
+static int kept_n;
+static uint64_t kept_frame = ~0ull;
+
+static void link_keep(const CmdRec *r, bool indexed, bool skinned, uint32_t vertices, uint32_t nbones, uint64_t frame) {
+    if (frame != kept_frame) kept_frame = frame, kept_n = 0;
+    if (kept_n == KEEP_PARTS) return;
+    if (!kept) kept = malloc(sizeof *kept * KEEP_PARTS);
+    if (!kept) return;
+    KeptPart *k = &kept[kept_n];
+    if (!kept_data[kept_n]) kept_data[kept_n] = malloc(KEEP_BYTES);
+    uint8_t *to = kept_data[kept_n];
+    if (!to) return;
+    if (r->size > KEEP_RECORD) return;
+    memcpy(k->record, r, r->size);
+    k->indexed = indexed, k->skinned = skinned, k->vertices = vertices, k->nbones = nbones;
+    k->state = st;
+    uint32_t used = 0;
+    for (int stage = 0; stage < 2; stage++)
+        for (int u = 0; u < 18; u++) {
+            Range *b = &k->state.ubuf[stage][u];
+            if (!b->addr || !b->size) continue;
+            uint32_t size = (uint32_t)b->size > 0x10000 ? 0x10000 : (uint32_t)b->size;
+            if (used + size > KEEP_BYTES) return;  // (never seen; a part that doesn't fit isn't kept)
+            memcpy(to + used, (const void *)(uintptr_t)b->addr, size);
+            b->addr = (uint64_t)(uintptr_t)(to + used);
+            used += (size + 255u) & ~255u;
+        }
+    kept_n++;
+}
+
+static void link_replay(void) {
+    static bool active;
+    static uint64_t replayed = ~0ull;
+    const uint64_t frame = renderer_present_count();
+    if (active || !kept_n || !in_pass || frame == replayed || frame < kept_frame + 2) return;  // (he's being drawn)
+    if (figure_world_frame != frame || !st.rt.ncolor || st.rt.color[0] != figure_world_color || st.rt.depth != figure_world_depth) return;
+    float feet[3], view[12], yaw, swing, px, py;
+    if (!figure_state(feet, &yaw, &swing, view, &px, &py)) return;
+    replayed = frame;
+    active = true;
+    static DrawState saved;
+    saved = st;
+    const uint64_t now = SDL_GetTicks();
+    for (int i = 0; i < kept_n; i++) {
+        KeptPart *k = &kept[i];
+        st = k->state;
+        st.rt = saved.rt, st.rt_dirty = false;
+        memcpy(st.viewport, saved.viewport, sizeof st.viewport);
+        memcpy(st.scissor, saved.scissor, sizeof st.scissor);
+        Range *base = &st.ubuf[0][0], *bones = k->skinned ? &st.ubuf[0][3] : base, *rots = k->skinned ? &st.ubuf[0][4] : NULL;
+        const uint32_t first = k->skinned ? 0 : 16;
+        if (!bones->addr || bones->size < (first + 12) * 4) continue;
+        if (base->addr && base->size >= 24) {  // (the projection, which first person changes)
+            float *p = (float *)(uintptr_t)base->addr;
+            p[0] = px, p[5] = py;
+        }
+        // (these are this part's own copies: nothing else reads them)
+        if (!coop_pose_apply(frame, now, k->vertices, !k->skinned, (float *)(uintptr_t)bones->addr + first,
+                             rots && rots->addr && rots->size == bones->size ? (float *)(uintptr_t)rots->addr : NULL, k->nbones, view))
+            continue;
+        guest_copy_flush();  // (same addresses as last time, different contents)
+        draw_((CmdRec *)k->record, k->indexed);
+    }
+    st = saved;
+    ss_forget();
+    active = false;
+}
+
+static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
+    if (!g_is_skyward || !in_pass || !pr || !st.rt.depth) return;
+    // cbuf_mask counts from cbuf_base: bit k is uniform buffer k - 3. A skinned mesh (bits 3 4 6 7) has its bones in buffer 3;
+    // a piece fixed to one bone (bits 3 4: eyes, hands, belt) has its one matrix in buffer 0, after the projection.
+    bool skinned = pr->vi->cbuf_mask == LINK_CBUFS;
+    if (!skinned && !(pr->vi->cbuf_mask == LINK_RIGID_CBUFS && st.ds[1])) return;
+    Range *bones = &st.ubuf[0][skinned ? 3 : 0];
+    const uint32_t first = skinned ? 0 : 16;  // floats before the first matrix
+    if (!bones->addr || bones->size < (first + 12) * 4 || (skinned && bones->size % 48)) return;
+    const uint32_t nbones = skinned ? bones->size / 48 : 1, vertices = (uint32_t)r->x[2];
+    float me[3], feet[3], view[12], yaw, swing, px, py;
+    if (!coop_my_position(me) || !figure_state(feet, &yaw, &swing, view, &px, &py)) return;
+    const float *src = (const float *)(uintptr_t)bones->addr;
+    float d[3];
+    for (int i = 0; i < 3; i++)
+        d[i] = src[first + i * 4 + 3] - (view[i * 4] * me[0] + view[i * 4 + 1] * me[1] + view[i * 4 + 2] * me[2] + view[i * 4 + 3]);
+    if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > LINK_BONES_NEAR * LINK_BONES_NEAR) return;  // not Link
+    // Near him isn't enough: save statues, villagers. His model is loaded in one place, so what else is his has its vertices
+    // close to those of his big meshes, which nothing else has this many bones for. (Last frame's: pieces can come first.)
+    static uint64_t range_frame = ~0ull, lo = ~0ull, hi, next_lo = ~0ull, next_hi;
+    uint64_t this_frame = renderer_present_count();
+    if (this_frame != range_frame) {
+        range_frame = this_frame;
+        if (next_hi) lo = next_lo, hi = next_hi;
+        next_lo = ~0ull, next_hi = 0;
+    }
+    const uint64_t vb = st.vbuf[0].addr;
+    if (skinned && bones->size >= LINK_BIG_MESH_BYTES) {
+        if (vb < next_lo) next_lo = vb;
+        if (vb > next_hi) next_hi = vb;
+    } else if (!hi || vb + LINK_MODEL_SLACK < lo || vb > hi + LINK_MODEL_SLACK) {
+        return;
+    }
+    dup_seen_frame = renderer_present_count();
+    if (g_debug_frame) {  // (F9, for measuring what a pose takes to send)
+        static int n;
+        char path[64];
+        snprintf(path, sizeof path, "build/link_%03d.bin", n++);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            uint32_t head[3] = {pr->vi->cbuf_mask, bones->size, st.ubuf[0][4].size};
+            fwrite(head, sizeof head, 1, f);
+            fwrite(view, sizeof view, 1, f);
+            fwrite(me, sizeof me, 1, f);
+            fwrite(src, bones->size, 1, f);
+            if (st.ubuf[0][4].addr) fwrite((const void *)(uintptr_t)st.ubuf[0][4].addr, st.ubuf[0][4].size, 1, f);
+            fclose(f);
+        }
+    }
+
+    // (each copy its own address: copies of one address are shared within a submission)
+    static uint8_t *buf;
+    static uint32_t used;
+    if (!buf) buf = malloc(DUP_BUF_SIZE);
+    uint32_t size = (bones->size + 255u) & ~255u;
+    if (!buf || size > DUP_BUF_SIZE) return;
+    if (used + size > DUP_BUF_SIZE) used = 0;
+    float *dst = (float *)(buf + used);
+    used += size;
+    memcpy(dst, src, bones->size);
+    // The other player's own bones when they've arrived; until then, this Link's pose where they stand.
+    const uint64_t frame = renderer_present_count();
+    coop_pose_capture(frame, SDL_GetTicks(), vertices, !skinned, src + first, nbones, view, me);
+    link_keep(r, indexed, skinned, vertices, nbones, frame);
+    Range *rots = skinned ? &st.ubuf[0][4] : NULL;
+    float *rdst = NULL;
+    if (rots && rots->addr && rots->size == bones->size) {
+        uint32_t rsize = (rots->size + 255u) & ~255u;
+        if (used + rsize > DUP_BUF_SIZE) used = 0;
+        if (used + rsize <= DUP_BUF_SIZE && (float *)(buf + used) != dst) {
+            rdst = (float *)(buf + used);
+            used += rsize;
+        }
+    }
+    if (!coop_pose_apply(frame, SDL_GetTicks(), vertices, !skinned, dst + first, rdst, nbones, view)) {
+        rdst = NULL;
+        const float w[3] = {feet[0] - me[0], feet[1] - me[1], feet[2] - me[2]};
+        for (int i = 0; i < 3; i++) {
+            float shift = view[i * 4] * w[0] + view[i * 4 + 1] * w[1] + view[i * 4 + 2] * w[2];
+            for (uint32_t b = 0; b < nbones; b++) dst[first + b * 12 + i * 4 + 3] += shift;
+        }
+    }
+    Range saved = *bones, saved_rots = rots ? *rots : (Range){0, 0};
+    bones->addr = (uint64_t)(uintptr_t)dst;
+    if (rdst) rots->addr = (uint64_t)(uintptr_t)rdst;
+    static bool active;
+    if (!active) {
+        active = true;
+        draw_(r, indexed);
+        active = false;
+    }
+    *bones = saved;
+    if (rots) *rots = saved_rots;
+}
+
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
+    dup_link(dup_program(), r, indexed);
+    link_replay();
     linear_rt_writeback();
     PROF_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
+static Prog *g_last_draw_prog;  // what the last draw_ ran
+static Prog *dup_program(void) { return g_last_draw_prog; }
 static void draw_(CmdRec *r, bool indexed) {
+    g_last_draw_prog = NULL;
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { stat_skipped++; return; }
     ShaderKey vkey = {0}, fkey = {0};
@@ -2718,6 +3109,7 @@ static void draw_(CmdRec *r, bool indexed) {
     Prog *pr = get_program(st.program, &vkey, &fkey, wait);
     if (pr && wait) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; return; }
+    g_last_draw_prog = pr;
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
         extern bool mirror_draw(bool composite);
@@ -3185,6 +3577,22 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (getenv("LARECOMP_COOP_TEST")) {  // vertex cbufs other than the camera's: skinned meshes have their bones in these
+        for (int c = 0; c < 18; c++) {
+            if (c < 3 || !((pr->vi->cbuf_mask >> c) & 1) || !st.ubuf[0][c - 3].addr) continue;  // (the mask counts from cbuf_base)
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][c - 3].addr;
+            LOG("[draw]   vcb%d %llx size %u:", c - 3, (unsigned long long)st.ubuf[0][c - 3].addr, (unsigned)st.ubuf[0][c - 3].size);
+            for (int k = 0; k < 24 && k * 4 < (int)st.ubuf[0][c - 3].size; k++) LOG(" %.5g", u[k]);
+            LOG("\n");
+        }
+        for (int b = 0; b < 3; b++) {  // the vertices themselves, for pieces the game may transform on the CPU
+            if (!st.vbuf[b].addr) continue;
+            const float *v = (const float *)(uintptr_t)st.vbuf[b].addr;
+            LOG("[draw]   vbuf%d %llx size %llu:", b, (unsigned long long)st.vbuf[b].addr, (unsigned long long)st.vbuf[b].size);
+            for (int k = 0; k < 12 && (uint64_t)(k + 1) * 4 <= st.vbuf[b].size; k++) LOG(" %.5g", v[k]);
+            LOG("\n");
+        }
+    }
     if (getenv("LARECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;

@@ -197,6 +197,13 @@ void settings_load(void) {
         char key[64];
         char val[1024] = "";
         if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) < 1) continue;
+        if (!strcmp(key, "coop_mode") || !strcmp(key, "coop_addr") || !strcmp(key, "coop_key")) {
+            if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) != 2) val[0] = 0;
+            if (!strcmp(key, "coop_mode")) strlcpy(g_settings.coop_mode, val, sizeof g_settings.coop_mode);
+            else if (!strcmp(key, "coop_addr")) strlcpy(g_settings.coop_addr, val, sizeof g_settings.coop_addr);
+            else strlcpy(g_settings.coop_key, val, sizeof g_settings.coop_key);
+            continue;
+        }
         if (!strcmp(key, "rando_seed")) {
             if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) != 2) val[0] = 0;
             strlcpy(g_settings.rando_seed, val, sizeof g_settings.rando_seed);
@@ -279,6 +286,7 @@ void settings_load(void) {
         else if (!strcmp(key, "drop_ammo")) g_settings.drop_ammo = atoi(val) != 0;
         else if (!strcmp(key, "drop_treasures")) g_settings.drop_treasures = atoi(val) != 0;
         else if (!strcmp(key, "drop_always")) g_settings.drop_always = atoi(val) != 0;
+        else if (!strcmp(key, "coop_port")) g_settings.coop_port = atoi(val);
         else if (!strcmp(key, "cheat_rupees")) g_settings.cheat_rupees = atoi(val) != 0;
         else if (!strcmp(key, "cheat_hookshot")) g_settings.cheat_hookshot = atoi(val) != 0;
         else if (!strcmp(key, "no_buff_drops")) g_settings.no_buff_drops = atoi(val) != 0;
@@ -369,5 +377,7 @@ void settings_save(void) {
     fprintf(f, "rando_seed = %s\n", g_settings.rando_seed);
     fprintf(f, "rom_path = %s\n", g_settings.rom_path);
     fprintf(f, "keys_path = %s\n", g_settings.keys_path);
+    fprintf(f, "coop_mode = %s\ncoop_addr = %s\ncoop_port = %d\ncoop_key = %s\n", g_settings.coop_mode, g_settings.coop_addr,
+            g_settings.coop_port, g_settings.coop_key);
     fclose(f);
 }

@@ -819,8 +819,9 @@ void ui_window_init(void) {
         }
     }
 #endif
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     settings_load();
+    // (co-op: two copies on one machine each answer only while focused, so one controller doesn't move both)
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, g_settings.coop_mode[0] || getenv("LARECOMP_COOP") ? "0" : "1");
     LOG("[vk] initializing SDL video and input\n");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     LOG("[vk] SDL ready\n");
@@ -835,7 +836,8 @@ void ui_window_init(void) {
                                             getenv("LARECOMP_HOST_INPUT") || getenv("LARECOMP_BIND_TEST"));
         if (scripted) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
     }
-    window = SDL_CreateWindow("Sky Recomp", win_w, win_h, wflags);
+    const char *title = getenv("LARECOMP_WINDOW_TITLE");  // (telling apart copies on one machine)
+    window = SDL_CreateWindow(title && *title ? title : "Sky Recomp", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     LOG("[vk] SDL window created at %llums\n", (unsigned long long)SDL_GetTicks());
     rt_window_icon(window);

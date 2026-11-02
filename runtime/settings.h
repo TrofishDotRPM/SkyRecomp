@@ -88,6 +88,10 @@ typedef struct {
     char rando_seed[128];  // active randomizer seed (rando/<name>/), empty = vanilla
     char rom_path[1024];   // path to user ROM file (.nsp, .xci)
     char keys_path[1024];  // path to user keys file (prod.keys, title.keys)
+    char coop_mode[16];    // co-op (runtime/hle/coop.c): "host", "join", or empty = off
+    char coop_addr[256];   // the host's address, to join
+    int coop_port;         // 0 = the default
+    char coop_key[64];     // shared between the players; keeps strangers out, doesn't encrypt
 } Settings;
 
 enum { N_TUNIC_COLOURS = 13, N_HEART_COLOURS = 9 };

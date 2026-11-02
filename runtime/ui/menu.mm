@@ -362,6 +362,7 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
 static bool g_inited;
 static ImGuiContext *g_ctx;  // ours: the start screen (back to it after a reboot) has its own context
 static ImFont *g_font, *g_font_big;
+static ImFont *g_font_serif;  // co-op marker's label, near the game's HUD lettering (its own is a bitmap font)
 static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Baloo 2); everything else keeps g_font
 static int g_tab, g_tab_request = -2;  // (-2: no request; -1 is the Prelaunch tab)
 static int g_focus_tab = -99;  // put the nav cursor on this tab next frame (-100: the selected one; -99: none)
@@ -429,6 +430,16 @@ static void init(void) {
         else continue;
         if (!g_font) g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
         if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
+    }
+    const char *serifs[] = {"/usr/share/fonts/google-noto/NotoSerif-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
+                            "/usr/share/fonts/noto/NotoSerif-Bold.ttf", "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif-Bold.ttf",
+                            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf",
+                            "C:/Windows/Fonts/georgiab.ttf", "/System/Library/Fonts/Supplemental/Georgia Bold.ttf"};
+    for (const char *p : serifs) {
+        if (FILE *f = fopen(p, "rb")) fclose(f);
+        else continue;
+        g_font_serif = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
+        break;
     }
     // the menu window itself: Baloo 2 SemiBold, as on the start screen (shipped, OFL), at its Settings window's sizes; the
     // FPS counter, overlays and on-screen keyboard keep the fonts above
@@ -816,6 +827,8 @@ extern "C" bool tracker_overlay_wanted(void);
 extern "C" void tracker_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" bool chaos_overlay_wanted(void);
 extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
+extern "C" void coop_overlay_draw(ImVec2 display, ImFont *font, ImFont *label_font);
+extern "C" bool coop_overlay_wanted(void);
 extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
 
 // Reboot (runtime/main.c): the game is gone - menu and name dialog close; the ImGui context stays.
@@ -1015,7 +1028,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool trk = !open && tracker_overlay_wanted();
     bool chaos = !open && chaos_overlay_wanted();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && g_settings.perf_overlay == PERF_OFF && !inv && !trk && !chaos && !g_settings.free_cam) {
+    if (!open && !kbd && g_settings.perf_overlay == PERF_OFF && !inv && !trk && !chaos && !g_settings.free_cam &&
+        !coop_overlay_wanted()) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -1080,6 +1094,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 
     if (trk) tracker_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
     if (chaos) chaos_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
+    coop_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont(), g_font_serif ? g_font_serif : ImGui::GetFont());
     if (inv) {
         inventory_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
     }

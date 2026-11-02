@@ -285,13 +285,39 @@ static void pad_opened(void) {  // its name, its button prompts, its gyro (DualS
     motion_reset(gyro);
 }
 
+// Every controller stays open and the one last pressed drives the game: a pad left on nearby mustn't lock out the one
+// in your hands.
+static void pad_follow(SDL_JoystickID which) {
+    if (pad && SDL_GetGamepadID(pad) == which) return;
+    SDL_Gamepad *g = SDL_GetGamepadFromID(which);
+    if (g) { pad = g; pad_opened(); }
+}
+
+static void pad_removed(SDL_JoystickID which) {
+    SDL_Gamepad *g = SDL_GetGamepadFromID(which);
+    bool active = g && g == pad;
+    if (g) SDL_CloseGamepad(g);
+    if (!active) return;
+    pad = NULL;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    for (int i = 0; i < n && !pad; i++)
+        if (ids[i] != which) pad = SDL_GetGamepadFromID(ids[i]);
+    SDL_free(ids);
+    if (pad) pad_opened();
+    else { note_family(); motion_reset(false); }
+}
+
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
     if (!scanned) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad && (pad = SDL_OpenGamepad(ids[0]))) pad_opened();
+        for (int i = 0; i < n; i++) {
+            SDL_Gamepad *g = SDL_OpenGamepad(ids[i]);
+            if (g && !pad) { pad = g; pad_opened(); }
+        }
         SDL_free(ids);
     }
     switch (e->type) {
@@ -336,14 +362,24 @@ void input_handle_event(const SDL_Event *e) {
             }
         }
         break;
-    case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad && (pad = SDL_OpenGamepad(e->gdevice.which))) pad_opened();
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        SDL_Gamepad *g = SDL_OpenGamepad(e->gdevice.which);
+        if (g && !pad) { pad = g; pad_opened(); }
         break;
+    }
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); motion_reset(false); }
+        pad_removed(e->gdevice.which);
         recompute_pad();
         break;
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        pad_follow(e->gbutton.which);
+        recompute_pad();
+        break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (e->gaxis.value > 24000 || e->gaxis.value < -24000) pad_follow(e->gaxis.which);  // (not drift)
+        recompute_pad();
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
@@ -686,6 +722,10 @@ static void fill_state(Cpu *c) {
     *(int64_t *)s = sampling = (int64_t)(plat_now_ns() / 4000000ull) + 1;
     if (id != 0) return;
 
+    if (g_is_skyward) {
+        extern void coop_tick(void);
+        coop_tick();
+    }
     if (g_is_las) {
         extern void warp_game_tick(Cpu *c);
         warp_game_tick(c);  // game main thread, once per frame: apply a queued warp
