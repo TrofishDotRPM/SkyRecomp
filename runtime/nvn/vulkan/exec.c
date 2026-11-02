@@ -987,9 +987,59 @@ static bool rigid_rot_copy(const float *m, const Range *b) {
         if (fabsf(r[i] - (i % 4 == 3 ? 0 : m[i])) > 1e-3f) return false;
     return true;
 }
-// What he carries is loaded apart from his body, so it's known by its size instead: pieces fixed to one bone, with this many
-// vertices, near him. (Practice sword: blade 102, hilt 630, sheath 882, loaded together. Later swords and shields aren't known yet.)
+// What he carries is loaded apart from his body. The practice sword is known by its size (blade 102, hilt 630, sheath 882,
+// loaded together); anything else fixed to one bone near him is his if it goes where he goes: once he's walked LINK_CARRY_WALK
+// with it, it must have kept about the same place relative to him (scenery he passes falls behind by as far as he went). The
+// rest of what's loaded beside a piece that's his is his too (a sword's blade, drawn or not, beside its sheath).
+#define LINK_CARRY_WALK 200.0f
+#define LINK_CARRY_SLIP 0.5f  // of how far he walked: the most it may have moved relative to him
+#define LINK_CARRY_GROUP 0x40000ull
 static bool link_equipment(uint32_t vertices) { return vertices == 882 || vertices == 102 || vertices == 630; }
+static bool link_carried(uint32_t vertices, uint64_t vb, const float m[12], const float view[12], const float me[3]) {
+    static int known = -1;  // (LARECOMP_CARRY_TEST: not by size, to try the rest on the practice sword)
+    if (known < 0) known = getenv("LARECOMP_CARRY_TEST") == NULL;
+    if (known && link_equipment(vertices)) return true;
+    enum { N = 64 };
+    static struct { uint64_t vb, seen; float start_me[3], start_off[3]; int8_t state; } tab[N];  // state: 0 deciding, 1 his, -1 not
+    const uint64_t frame = renderer_present_count();
+    float off[3];  // where it is in the world, from his feet (the view's rotation is orthonormal: its transpose undoes it)
+    for (int c = 0; c < 3; c++) {
+        float w = 0;
+        for (int r = 0; r < 3; r++) w += view[r * 4 + c] * (m[r * 4 + 3] - view[r * 4 + 3]);
+        off[c] = w - me[c];
+    }
+    int at = -1, oldest = 0;
+    for (int i = 0; i < N; i++) {
+        if (tab[i].vb && tab[i].seen + 300 < frame) tab[i].vb = 0;  // (not drawn for 5 s: a loading screen, maybe another stage)
+        if (tab[i].vb == vb) at = i;
+        if (tab[i].seen < tab[oldest].seen) oldest = i;
+    }
+    if (at < 0) {
+        at = oldest;
+        tab[at].vb = vb, tab[at].state = 0;
+        memcpy(tab[at].start_me, me, sizeof tab[at].start_me), memcpy(tab[at].start_off, off, sizeof tab[at].start_off);
+    }
+    tab[at].seen = frame;
+    if (tab[at].state) return tab[at].state > 0;
+    for (int i = 0; i < N; i++)
+        if (tab[i].vb && tab[i].state == 1 && (vb > tab[i].vb ? vb - tab[i].vb : tab[i].vb - vb) < LINK_CARRY_GROUP) {
+            tab[at].state = 1;
+            if (getenv("LARECOMP_COOP_TEST")) LOG("[coop] carried: %u vertices at %llx, beside something he carries\n", vertices, (unsigned long long)vb);
+            return true;
+        }
+    float walked = 0, slipped = 0;
+    for (int c = 0; c < 3; c++) {
+        walked += (me[c] - tab[at].start_me[c]) * (me[c] - tab[at].start_me[c]);
+        slipped += (off[c] - tab[at].start_off[c]) * (off[c] - tab[at].start_off[c]);
+    }
+    walked = sqrtf(walked), slipped = sqrtf(slipped);
+    if (walked < LINK_CARRY_WALK) return false;
+    tab[at].state = slipped < walked * LINK_CARRY_SLIP ? 1 : -1;
+    if (getenv("LARECOMP_COOP_TEST"))
+        LOG("[coop] carried: %u vertices at %llx: walked %.0f, it moved %.0f relative to him: %s\n", vertices, (unsigned long long)vb, walked, slipped,
+            tab[at].state > 0 ? "his" : "not his");
+    return tab[at].state > 0;
+}
 // A piece that may be drawn for another when the other player's Link has that instead: an open hand (744) and the one
 // gripping a sword (750).
 // The cull mode for a piece of the other Link: everything (3) if theirs is hidden; if this one is hidden and theirs isn't, back
@@ -3241,7 +3291,7 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     if (skinned && bones->size >= LINK_BIG_MESH_BYTES) {
         if (vb < next_lo) next_lo = vb;
         if (vb > next_hi) next_hi = vb;
-    } else if ((!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) && (skinned || !link_equipment(vertices))) {
+    } else if ((!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) && (skinned || !link_carried(vertices, vb, src + first, view, me))) {
         return;
     }
     dup_seen_frame = renderer_present_count();
