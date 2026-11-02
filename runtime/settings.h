@@ -103,7 +103,8 @@ typedef struct {
     char coop_mode[16];    // co-op (runtime/hle/coop.c): "host", "join", or empty = off
     char coop_addr[256];   // the host's address, to join
     int coop_port;         // 0 = the default
-    char coop_key[64];     // shared between the players; keeps strangers out, doesn't encrypt
+    char coop_key[64];     // the host's password: joining proves it without sending it (runtime/hle/coop_net.c)
+    bool coop_upnp;        // hosting: open the port on the router (runtime/hle/coop_upnp.c)
     char coop_name[24];    // shown over your Link to the other players (up to 20 characters); empty: "Other player"
     uint32_t coop_look[COOP_LOOK_PARTS];  // your Link's clothes (COOP_LOOK_PARTS): 0xRRGGBB | COOP_LOOK_SET, or 0 for the
                                           // game's own color. Both players see them.

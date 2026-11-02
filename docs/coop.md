@@ -16,19 +16,18 @@ CPATH=/usr/include/ffmpeg make -j16 SHADERC=-lshaderc_shared build/skyrecomp
 
 Everyone needs the same game build (v1.0.0) and the same build of this mod. **Back up your saves first**: connecting merges progress into your save permanently, so use a fresh file or one you're happy to merge.
 
-In `skyrecomp.ini`:
+Open the menu (F1), go to the Co-op tab, and under Online:
 
-```ini
-# host                     # everyone else
-coop_mode = host           coop_mode = join
-coop_port = 27183          coop_addr = 100.64.0.1
-coop_key = something       coop_port = 27183
-                           coop_key = something
-```
+- **Host a game**: pick a port (27183 unless you change it) and a password, and press Start hosting. With "Open the port on my router automatically" ticked, the game asks your router (UPnP) to forward the port to this computer, for an hour at a time while you host, and removes it when you stop. It then shows the address friends join with, hidden until you press the eye, with a Copy button.
+- **Join a game**: type or paste the host's address (`203.0.113.7`, or `203.0.113.7:27183`), the port and the password, and press Join game.
 
-For a test run, `LARECOMP_COOP=host:<port>:<key>` or `LARECOMP_COOP=join:<addr>:<port>:<key>` overrides the file. To run two copies on one machine, give the second its own `LARECOMP_DATA_ROOT`.
+Stop disconnects and sets the mode back to Off. It's all saved in `skyrecomp.ini` (`coop_mode`, `coop_addr`, `coop_port`, `coop_key`, `coop_upnp`), and a game set to host or join there starts that way. For a test run, `LARECOMP_COOP=host:<port>:<key>` or `LARECOMP_COOP=join:<addr>:<port>:<key>` overrides the file until the menu's settings are applied. To run two copies on one machine, give the second its own `LARECOMP_DATA_ROOT`.
 
-The connection isn't encrypted, and the key only keeps out people who find the port by chance. Play over a LAN or a VPN such as Tailscale, or forward the port only while playing.
+**If friends can't connect**: the menu says why. If your router has UPnP turned off, turn it on or forward the port (TCP) by hand. If it says your router is behind another one (common on mobile internet and some fibre), nobody outside can reach you directly: ask your provider for a public address, or use a VPN such as Tailscale and join with its address. Joining your own public address from inside your home often fails even when friends can connect: use your computer's local address (192.168.x.x) there.
+
+The password is never sent: joining answers the host's random challenge with an HMAC of it. The game data itself isn't encrypted.
+
+When you join, you get a copy of the host's inventory and progress, once: every item, upgrade and story and dungeon flag the host has, and their rupees, ammo, treasures, bugs, heart pieces and heart capacity where those are larger than yours. You keep your own name and where you are, and nothing you had is taken away; what only you had reaches the host as usual. After that, the amounts are each player's own again. Pouch contents (shields, bottles) aren't copied.
 
 For testing, `LARECOMP_COOP_TEST=1` logs every event and adds keys in the focused window: F6 gives the next test item, F7 a heart piece, F5 a heart container (not shared), F8 a map and small key for the current scene. They change the same memory a real pickup does.
 

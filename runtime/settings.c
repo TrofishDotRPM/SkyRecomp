@@ -51,6 +51,7 @@ Settings g_settings = {
     .drop_ammo = true,
     .drop_treasures = true,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
+    .coop_upnp = true,
 };
 
 // The game's own text languages: its RomFS carries these per region (regionUS/USen|USes|USfr, regionEU/EUen|EUes|...,
@@ -301,6 +302,7 @@ void settings_load(void) {
         else if (!strcmp(key, "drop_treasures")) g_settings.drop_treasures = atoi(val) != 0;
         else if (!strcmp(key, "drop_always")) g_settings.drop_always = atoi(val) != 0;
         else if (!strcmp(key, "coop_port")) g_settings.coop_port = atoi(val);
+        else if (!strcmp(key, "coop_upnp")) g_settings.coop_upnp = atoi(val) != 0;
         else if (!strcmp(key, "cheat_rupees")) g_settings.cheat_rupees = atoi(val) != 0;
         else if (!strcmp(key, "cheat_hookshot")) g_settings.cheat_hookshot = atoi(val) != 0;
         else if (!strcmp(key, "no_buff_drops")) g_settings.no_buff_drops = atoi(val) != 0;
@@ -393,6 +395,7 @@ void settings_save(void) {
     fprintf(f, "keys_path = %s\n", g_settings.keys_path);
     fprintf(f, "coop_mode = %s\ncoop_addr = %s\ncoop_port = %d\ncoop_key = %s\n", g_settings.coop_mode, g_settings.coop_addr,
             g_settings.coop_port, g_settings.coop_key);
+    fprintf(f, "coop_upnp = %d\n", g_settings.coop_upnp);
     fprintf(f, "coop_name = %s\n", g_settings.coop_name);
     {
         static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings"};

@@ -1,5 +1,5 @@
 // Co-op networking over loopback, three players in one process:
-//   cc -I runtime/hle tools/test_coop_net.c runtime/hle/coop_net.c -o /tmp/t && /tmp/t
+//   cc -I runtime/hle tools/test_coop_net.c runtime/hle/coop_net.c runtime/hle/coop_sha256.c -lpthread -o /tmp/t && /tmp/t
 // The module holds one connection set per process, so each player runs as its own forked process.
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -30,7 +30,8 @@ static int rogue(const void *d, int n) {
     struct timeval tv = {3, 0};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     char b[64];
-    ssize_t r = read(s, b, sizeof b);
+    ssize_t r;
+    while ((r = read(s, b, sizeof b)) > 0) {}  // (the host's challenge first)
     close(s);
     return r == 0;
 }
@@ -53,8 +54,21 @@ int main(void) {
     if (!(kids[2] = fork())) {                                     // wrong key: never joined
         coop_net_start("join", "127.0.0.1", PORT, "nope", on_event, on_join, NULL);
         pump(2000);
-        printf("wrong key: joined=%d got=%d %s\n", joined, got[1] + got[2], !joined && !got[1] && !got[2] ? "ok" : "FAIL");
-        return joined || got[1] || got[2];
+        CoopNetStatus st;
+        coop_net_status(&st);
+        int ok = !joined && !got[1] && !got[2] && !strcmp(st.error, "Wrong password.") && !st.joining;
+        printf("wrong key: joined=%d got=%d error=\"%s\" %s\n", joined, got[1] + got[2], st.error, ok ? "ok" : "FAIL");
+        return !ok;
+    }
+    if (!fork()) {  // nobody hosting there: can't reach
+        coop_net_start("join", "127.0.0.1", PORT + 1, "secret", on_event, on_join, NULL);
+        pump(1500);
+        CoopNetStatus st;
+        coop_net_status(&st);
+        int ok = !joined && !strncmp(st.error, "Can't reach the host", 20);
+        printf("no host: error=\"%s\" %s\n", st.error, ok ? "ok" : "FAIL");
+        fflush(stdout);
+        _exit(!ok);
     }
     if (!coop_net_start("host", "", PORT, "secret", on_event, on_join, NULL)) return 2;
     pump(300);
@@ -64,6 +78,7 @@ int main(void) {
         memset(junk, 0x41, sizeof junk);
         int r = rogue(junk, sizeof junk);
         printf("garbage hello: hung up=%d %s\n", r, r == 1 ? "ok" : "FAIL");
+        fflush(stdout);
         _exit(r != 1);
     }
     pump(2200);
@@ -73,8 +88,10 @@ int main(void) {
         fails += !WIFEXITED(st) || WEXITSTATUS(st);
     }
     int st;
-    wait(&st);
-    fails += !WIFEXITED(st) || WEXITSTATUS(st);
+    for (int i = 0; i < 2; i++) {  // (the junk client and the one with no host)
+        wait(&st);
+        fails += !WIFEXITED(st) || WEXITSTATUS(st);
+    }
     int ok = got[1] == 1 && got[2] == 1;
     printf("host: got[1]=%d got[2]=%d joined=%d %s\n", got[1], got[2], joined, ok ? "ok" : "FAIL");
     fails += !ok;

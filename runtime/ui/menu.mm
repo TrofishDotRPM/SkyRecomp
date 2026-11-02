@@ -9,6 +9,8 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "imgui.h"
@@ -159,6 +161,41 @@ static ImGuiKey key_from_pad(Uint8 b) {
     }
 }
 
+// ---- the system clipboard, for the menu's text fields (Ctrl+V) and Copy buttons. SDL's clipboard is the main thread's: the
+// menu reads a copy kept up to date there (menu_handle_event, menu_apply_window_requests), and what it copies is set there.
+static std::mutex g_clip_lock;
+static std::string g_clip_cache, g_clip_out;
+static bool g_clip_pending, g_clip_stale = true;
+
+static const char *clip_get(ImGuiContext *) {
+    static std::string got;  // (ImGui reads it before the next call)
+    std::lock_guard<std::mutex> l(g_clip_lock);
+    got = g_clip_cache;
+    return got.c_str();
+}
+
+static void clip_set(ImGuiContext *, const char *text) {
+    std::lock_guard<std::mutex> l(g_clip_lock);
+    g_clip_out = text ? text : "";
+    g_clip_cache = g_clip_out;
+    g_clip_pending = true;
+}
+
+static void clip_main_thread(void) {  // (the main thread)
+    std::lock_guard<std::mutex> l(g_clip_lock);
+    if (g_clip_pending) {
+        SDL_SetClipboardText(g_clip_out.c_str());
+        g_clip_pending = false;
+        g_clip_stale = false;
+    }
+    if (g_clip_stale) {
+        char *t = SDL_GetClipboardText();
+        g_clip_cache = t ? t : "";
+        SDL_free(t);
+        g_clip_stale = false;
+    }
+}
+
 // ---- software keyboard (runtime/hle/swkbd.c: the game's name entry etc.) --------------------------------------
 // The game thread waits in menu_keyboard_run (re-presenting the last frame); this dialog takes the text: typed
 // directly when the player last used a keyboard, an on-screen keyboard (d-pad + A, B deletes, Start / + OK) when
@@ -173,6 +210,10 @@ extern "C" bool menu_input_captured(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
+    if (e->type == SDL_EVENT_CLIPBOARD_UPDATE) {
+        std::lock_guard<std::mutex> l(g_clip_lock);
+        g_clip_stale = true;
+    }
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
@@ -218,6 +259,12 @@ bool menu_handle_event(const SDL_Event *e) {
         }
         ImGuiKey k = key_from_scancode(e->key.scancode);
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
+        // (and as modifiers, which shortcuts like Ctrl+V go by)
+        ImGuiKey mod = k == ImGuiKey_LeftCtrl || k == ImGuiKey_RightCtrl     ? ImGuiMod_Ctrl
+                       : k == ImGuiKey_LeftShift || k == ImGuiKey_RightShift ? ImGuiMod_Shift
+                       : k == ImGuiKey_LeftSuper || k == ImGuiKey_RightSuper ? ImGuiMod_Super
+                                                                             : ImGuiKey_None;
+        if (mod != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = mod; q.down = down; push(q); }
         return true;
     }
     case SDL_EVENT_TEXT_INPUT:
@@ -282,6 +329,7 @@ bool menu_handle_event(const SDL_Event *e) {
 
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
+    clip_main_thread();
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
     bool want_text = capturing();
@@ -420,6 +468,9 @@ static void init(void) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.IniFilename = NULL;
+    ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
+    pio.Platform_GetClipboardTextFn = clip_get;
+    pio.Platform_SetClipboardTextFn = clip_set;
     ImFontConfig cfg;
     cfg.OversampleH = 2;
     const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",

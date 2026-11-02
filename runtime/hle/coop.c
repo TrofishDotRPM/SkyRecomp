@@ -19,9 +19,11 @@
 
 #include "../hle.h"
 #include "../settings.h"
+#include "coop.h"
 #include "coop_core.h"
 #include "coop_net.h"
 #include "coop_pose.h"
+#include "coop_upnp.h"
 
 #define SAVE (0x7005AF0056ull - 0x5302)  // SaveFile in play: cheats.mm's SAVE_HEALTH less its offset
 #define S_STORY 0x08E4
@@ -49,6 +51,9 @@ static CoopCore g_core;
 static uint16_t g_sh_story[128], g_sh_item[64], g_sh_dungeon[COOP_SCENES * 8], g_sh_scene[COOP_SCENES * 8],
     g_sh_tbox[COOP_SCENES * 2], g_sh_enemy[4096];
 static int g_state;  // 0 not started, 1 running, -1 off
+static int g_mode, g_port;    // as started: 0 off, 1 hosting, 2 joining
+static bool g_from_env, g_upnp_on;
+static volatile int g_apply;  // (the menu, any thread: start again from the settings)
 static bool g_layout_bad;
 
 static uint16_t *at(uint64_t a) { return (uint16_t *)(uintptr_t)a; }
@@ -302,6 +307,7 @@ bool coop_look(bool other, int part, float rgb[3]) {
 
 // ---- popups: what another player's progress just gave this one (drawn by runtime/ui/coop_overlay.mm)
 #define T_ITEM_TABLE 0x164a534
+#define T_STORY_TABLE 0x1649bd0
 #define TOAST_MS 5000
 #define TOAST_MAX 4
 #define QUIET_MS 5000  // after a save loads or someone joins: catching up on old progress isn't news
@@ -564,6 +570,77 @@ static void enemy_remove_live(uint16_t flag) {
     if (!w.removed && g_test) LOG("[coop] no enemy with flag %#x here\n", flag);
 }
 
+// ---- a joining player gets a copy of the host's inventory and progress: once, when they first have a save in play while
+// connected. Field by field through the game's own flag tables, each to the larger of theirs and the host's: so a flag is
+// set if either had it, and rupees, ammo, treasures, bugs and the rest are the host's amounts unless theirs were larger.
+// After that, those amounts are each player's own again (the sharing rules). Heart capacity likewise. Pouch contents
+// aren't in these tables, and aren't copied.
+#define COOP_EV_COPY 11      // a: COPY_ITEM / COPY_STORY / COPY_CAPACITY, b: word, c: the host's value
+#define COOP_EV_COPY_END 12
+enum { COPY_ITEM, COPY_STORY, COPY_CAPACITY };
+#define ITEM_IDS 512         // (the table goes on into other data after the items)
+#define STORY_IDS 1088
+static bool g_copy_done;     // a joining player: this connection's copy is in
+
+// The game's fields in a region's word: their shift and width, from its flag table (word, shift << 4 | width - 1).
+static int word_fields(int copy, int word, uint8_t shift[16], uint8_t bits[16]) {
+    const uint8_t *t = (const uint8_t *)(uintptr_t)(MAIN_BASE + (copy == COPY_ITEM ? T_ITEM_TABLE : T_STORY_TABLE));
+    int ids = copy == COPY_ITEM ? ITEM_IDS : STORY_IDS, n = 0;
+    uint16_t covered = 0;
+    for (int id = 0; id < ids && n < 16; id++) {
+        if (t[id * 2] != word) continue;
+        int sh = t[id * 2 + 1] >> 4, b = (t[id * 2 + 1] & 15) + 1;
+        uint16_t m = (uint16_t)(((1u << b) - 1) << sh);
+        if (sh + b > 16 || (covered & m)) continue;  // (a field seen already, or not one)
+        covered |= m;
+        shift[n] = (uint8_t)sh, bits[n] = (uint8_t)b, n++;
+    }
+    return n;
+}
+
+static void copy_send(void) {  // (the host, to the player just arrived or just in play)
+    for (int copy = COPY_ITEM; copy <= COPY_STORY; copy++) {
+        const CoopRegion *r = &g_core.region[copy == COPY_ITEM ? COOP_R_ITEM : COOP_R_STORY];
+        for (int w = 0; w < r->words; w++) {
+            if (!r->live[w]) continue;
+            CoopEvent ev = {COOP_EV_COPY, (uint8_t)copy, (uint16_t)w, r->live[w], 0};
+            coop_net_reply(&ev);
+        }
+    }
+    CoopEvent cap = {COOP_EV_COPY, COPY_CAPACITY, 0, *g_core.capacity, 0}, end = {COOP_EV_COPY_END, 0, 0, 0, 0};
+    coop_net_reply(&cap);
+    coop_net_reply(&end);
+}
+
+static void copy_received(const CoopEvent *ev) {  // (a joining player)
+    if (g_mode != 2 || g_copy_done) return;
+    if (ev->a == COPY_CAPACITY) {
+        if (ev->c > *g_core.capacity && ev->c <= 80 && ev->c % 4 == 0) *g_core.capacity = ev->c;
+        return;
+    }
+    if (ev->a > COPY_STORY) return;
+    CoopRegion *r = &g_core.region[ev->a == COPY_ITEM ? COOP_R_ITEM : COOP_R_STORY];
+    if (ev->b >= r->words) return;
+    uint8_t shift[16], bits[16];
+    int n = word_fields(ev->a, ev->b, shift, bits);
+    uint16_t v = r->live[ev->b];
+    for (int i = 0; i < n; i++) {
+        uint16_t m = (uint16_t)((1u << bits[i]) - 1);
+        uint16_t mine = (uint16_t)(v >> shift[i] & m), theirs = (uint16_t)(ev->c >> shift[i] & m);
+        if (theirs > mine) v = (uint16_t)((v & ~(m << shift[i])) | theirs << shift[i]);
+    }
+    if (v == r->live[ev->b]) return;
+    r->live[ev->b] = v;
+    if (r->mirror) r->mirror[ev->b] = v;
+}
+
+static void copy_end(void) {
+    if (g_mode != 2 || g_copy_done) return;
+    g_copy_done = true;
+    coop_core_baseline(&g_core);  // (what came is the host's already: nothing in it to send back)
+    if (g_test) LOG("[coop] got the host's inventory and progress\n");
+}
+
 static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
@@ -571,7 +648,13 @@ static void on_event(const CoopEvent *ev, void *user) {
     if (ev->type == COOP_EV_LOOK) { look_received(ev); return; }
     if (ev->type == COOP_EV_NAME) { name_received(ev); return; }
     log_event("got", ev);
-    if (ev->type == COOP_EV_SYNC) { coop_core_snapshot(&g_core); return; }
+    if (ev->type == COOP_EV_SYNC) {
+        coop_core_snapshot(&g_core);
+        if (g_mode == 1) copy_send();
+        return;
+    }
+    if (ev->type == COOP_EV_COPY) { copy_received(ev); return; }
+    if (ev->type == COOP_EV_COPY_END) { copy_end(); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
     uint16_t had = 0, hp = *g_core.health;
     bool flags = ev->type == COOP_EV_OR && ev->a < COOP_NREGIONS && ev->b < g_core.region[ev->a].words;
@@ -600,7 +683,9 @@ static void on_event(const CoopEvent *ev, void *user) {
 static void on_joined(void *user) {
     (void)user;
     g_quiet_until = SDL_GetTicks() + QUIET_MS;
+    if (g_mode == 2) g_copy_done = false;     // (a new connection: a copy to come)
     coop_core_snapshot(&g_core);  // (nothing, without a save in play)
+    if (g_mode == 1 && g_core.baselined) copy_send();
 }
 
 static bool save_in_play(void) {
@@ -642,10 +727,11 @@ static void setup_core(void) {
     s->emit = emit;
 }
 
-static void start(void) {
+static void start(bool use_env) {
     char mode[16] = "", addr[256] = "", key[64] = "";
     int port = 0;
-    const char *env = getenv("LARECOMP_COOP");
+    const char *env = use_env ? getenv("LARECOMP_COOP") : NULL;
+    g_from_env = env != NULL;
     if (env) {
         if (!strncmp(env, "host:", 5)) {
             strcpy(mode, "host");
@@ -661,16 +747,44 @@ static void start(void) {
         port = g_settings.coop_port;
     }
     bool host = !strcmp(mode, "host"), join = !strcmp(mode, "join");
-    if ((!host && !join) || (join && !addr[0])) { g_state = -1; return; }
-    if (!key[0]) LOG("[coop] no coop_key set: anyone who can reach this port can join\n");
+    char *colon = strchr(addr, ':');  // (an address copied with its port: "203.0.113.7:27183"; one colon, so not IPv6)
+    if (join && colon && !strchr(colon + 1, ':') && atoi(colon + 1) > 0) port = atoi(colon + 1), *colon = 0;
+    g_mode = host ? 1 : join ? 2 : 0;
+    g_port = port > 0 ? port : COOP_DEFAULT_PORT;
+    if ((!host && !join) || (join && !addr[0])) { g_state = -1, g_mode = 0; return; }
+    if (!key[0]) LOG("[coop] no password set: anyone who can reach this port can join\n");
     setup_core();
     g_state = coop_net_start(mode, addr, port, key, on_event, on_joined, NULL) ? 1 : -1;
     coop_net_set_blob(pose_received);
+    // The router's port: hosting from the settings, if wanted (the test launcher's copies talk over this computer)
+    g_upnp_on = g_state == 1 && host && !env && g_settings.coop_upnp;
+    if (g_upnp_on) coop_upnp_open(g_port);
+}
+
+static void stop(void) {
+    if (g_state == 1) coop_net_stop();
+    if (g_upnp_on) coop_upnp_close();
+    g_upnp_on = false;
+    g_state = -1, g_mode = 0;
+    pthread_mutex_lock(&g_pos_lock);
+    g_other_at = 0;  // (their marker and Link go with them)
+    pthread_mutex_unlock(&g_pos_lock);
+}
+
+void coop_apply_settings(void) { g_apply = 1; }
+
+void coop_status(CoopStatus *out) {
+    memset(out, 0, sizeof *out);
+    out->mode = g_mode, out->from_env = g_from_env, out->port = g_port;
+    CoopNetStatus n;
+    coop_net_status(&n);
+    if (g_mode) out->peers = n.peers, out->joining = n.joining;
+    snprintf(out->error, sizeof out->error, "%s", n.error);
+    out->upnp = g_upnp_on ? (int)coop_upnp_state(out->address, sizeof out->address, out->upnp_note, sizeof out->upnp_note) : UPNP_OFF;
 }
 
 // ---- test keys (LARECOMP_COOP_TEST), for trying sync without playing up to each item. They change the same memory a
 // real pickup does, so the normal polling sends them. The focused window only: SDL's key state follows focus.
-#define T_STORY_TABLE 0x1649bd0
 
 static void test_set_flag(uint64_t table, int id, uint64_t save, uint64_t mirror) {
     const uint8_t *e = (const uint8_t *)(uintptr_t)(MAIN_BASE + table + 2 * (uint64_t)id);  // (word, shift << 4 | bits - 1)
@@ -723,7 +837,13 @@ static void test_keys(void) {
 void coop_tick(void) {
     if (g_state == 0) {
         g_test = getenv("LARECOMP_COOP_TEST") != NULL;
-        start();
+        start(true);
+    }
+    if (g_apply) {
+        g_apply = 0;
+        stop();
+        start(false);
+        LOG("[coop] settings applied: %s\n", g_mode == 1 ? "hosting" : g_mode == 2 ? "joining" : "off");
     }
     if (g_state != 1) return;
     coop_net_poll();
