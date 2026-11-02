@@ -1000,7 +1000,9 @@ static bool link_carried(uint32_t vertices, uint64_t vb, const float m[12], cons
     if (known < 0) known = getenv("LARECOMP_CARRY_TEST") == NULL;
     if (known && link_equipment(vertices)) return true;
     enum { N = 64 };
-    static struct { uint64_t vb, seen; float start_me[3], start_off[3]; int8_t state; } tab[N];  // state: 0 deciding, 1 his, -1 not
+    // Kept however long it's out of sight (menus hide him): named by its vertices' place and count, which another model loaded
+    // there later won't share. The least recently seen goes when it's full.
+    static struct { uint64_t vb, seen; uint32_t vertices; float start_me[3], start_off[3]; int8_t state; } tab[N];  // state: 0 deciding, 1 his, -1 not
     const uint64_t frame = renderer_present_count();
     float off[3];  // where it is in the world, from his feet (the view's rotation is orthonormal: its transpose undoes it)
     for (int c = 0; c < 3; c++) {
@@ -1010,13 +1012,12 @@ static bool link_carried(uint32_t vertices, uint64_t vb, const float m[12], cons
     }
     int at = -1, oldest = 0;
     for (int i = 0; i < N; i++) {
-        if (tab[i].vb && tab[i].seen + 300 < frame) tab[i].vb = 0;  // (not drawn for 5 s: a loading screen, maybe another stage)
-        if (tab[i].vb == vb) at = i;
+        if (tab[i].vb == vb && tab[i].vertices == vertices) at = i;
         if (tab[i].seen < tab[oldest].seen) oldest = i;
     }
     if (at < 0) {
         at = oldest;
-        tab[at].vb = vb, tab[at].state = 0;
+        tab[at].vb = vb, tab[at].vertices = vertices, tab[at].state = 0;
         memcpy(tab[at].start_me, me, sizeof tab[at].start_me), memcpy(tab[at].start_off, off, sizeof tab[at].start_off);
     }
     tab[at].seen = frame;
