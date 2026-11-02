@@ -976,10 +976,28 @@ static VkPipeline figure_pipeline(void) {
 #define LINK_BONES_NEAR 250.0f // the first bone of a mesh of Link's is within this of him
 #define LINK_BIG_MESH_BYTES 8000      // bone buffers this big are his
 #define LINK_MODEL_SLACK 0x100000ull  // how far from his big meshes in memory the rest of his model is
-#define DUP_BUF_SIZE (4u << 20)
-static uint64_t dup_seen_frame = ~0ull;
-extern bool coop_my_position(float out[3]);
 #include "../../hle/coop_pose.h"
+#define DUP_BUF_SIZE (4u << 20)
+#define LINK_RIGID_ROT 24  // floats into a rigid piece's buffer 1 before its rotation
+// Whether a rigid piece's buffer 1 holds its rotation there (most do; not all: the eyes keep something else).
+static bool rigid_rot_copy(const float *m, const Range *b) {
+    if (b->size < (LINK_RIGID_ROT + 12) * 4) return false;
+    const float *r = (const float *)(uintptr_t)b->addr + LINK_RIGID_ROT;
+    for (int i = 0; i < 12; i++)
+        if (fabsf(r[i] - (i % 4 == 3 ? 0 : m[i])) > 1e-3f) return false;
+    return true;
+}
+// What he carries is loaded apart from his body, so it's known by its size instead: pieces fixed to one bone, with this many
+// vertices, near him. (Practice sword: blade 102, hilt 630, sheath 882, loaded together. Later swords and shields aren't known yet.)
+static bool link_equipment(uint32_t vertices) { return vertices == 882 || vertices == 102 || vertices == 630; }
+// A piece that may be drawn for another when the other player's Link has that instead: an open hand (744) and the one
+// gripping a sword (750).
+// The cull mode for a piece of the other Link: everything (3) if theirs is hidden; if this one is hidden and theirs isn't, back
+// faces, as his other pieces.
+static uint8_t link_cull(uint8_t mine, bool their_hidden) { return their_hidden ? 3 : mine == 3 ? 2 : mine; }
+static uint32_t link_stand_in(uint32_t vertices, bool rigid) { return !rigid ? 0 : vertices == 744 ? 750 : vertices == 750 ? 744 : 0; }
+static uint64_t dup_seen_frame = ~0ull, dup_copies;
+extern bool coop_my_position(float out[3]);
 
 // Once a frame: the same smoothed target for the whole frame.
 static bool figure_state(float feet[3], float *yaw, float *swing, float view[12], float *px, float *py) {
@@ -3090,13 +3108,14 @@ typedef struct {
     DrawState state;
     bool indexed, skinned;
     uint32_t vertices, nbones;
+    uint16_t tag;
 } KeptPart;
 static KeptPart *kept;
 static uint8_t *kept_data[KEEP_PARTS];
 static int kept_n;
 static uint64_t kept_frame = ~0ull;
 
-static void link_keep(const CmdRec *r, bool indexed, bool skinned, uint32_t vertices, uint32_t nbones, uint64_t frame) {
+static void link_keep(const CmdRec *r, bool indexed, bool skinned, uint32_t vertices, uint16_t tag, uint32_t nbones, uint64_t frame) {
     if (frame != kept_frame) kept_frame = frame, kept_n = 0;
     if (kept_n == KEEP_PARTS) return;
     if (!kept) kept = malloc(sizeof *kept * KEEP_PARTS);
@@ -3107,7 +3126,7 @@ static void link_keep(const CmdRec *r, bool indexed, bool skinned, uint32_t vert
     if (!to) return;
     if (r->size > KEEP_RECORD) return;
     memcpy(k->record, r, r->size);
-    k->indexed = indexed, k->skinned = skinned, k->vertices = vertices, k->nbones = nbones;
+    k->indexed = indexed, k->skinned = skinned, k->vertices = vertices, k->tag = tag, k->nbones = nbones;
     k->state = st;
     uint32_t used = 0;
     for (int stage = 0; stage < 2; stage++)
@@ -3142,7 +3161,8 @@ static void link_replay(void) {
         st.rt = saved.rt, st.rt_dirty = false;
         memcpy(st.viewport, saved.viewport, sizeof st.viewport);
         memcpy(st.scissor, saved.scissor, sizeof st.scissor);
-        Range *base = &st.ubuf[0][0], *bones = k->skinned ? &st.ubuf[0][3] : base, *rots = k->skinned ? &st.ubuf[0][4] : NULL;
+        Range *base = &st.ubuf[0][0], *bones = k->skinned ? &st.ubuf[0][3] : base, *rots = k->skinned ? &st.ubuf[0][4] : &st.ubuf[0][1];
+        const bool rots_ok = rots->addr && (k->skinned ? rots->size == bones->size : rigid_rot_copy((const float *)(uintptr_t)bones->addr + 16, rots));
         const uint32_t first = k->skinned ? 0 : 16;
         if (!bones->addr || bones->size < (first + 12) * 4) continue;
         if (base->addr && base->size >= 24) {  // (the projection, which first person changes)
@@ -3150,9 +3170,11 @@ static void link_replay(void) {
             p[0] = px, p[5] = py;
         }
         // (these are this part's own copies: nothing else reads them)
-        if (!coop_pose_apply(frame, now, k->vertices, !k->skinned, (float *)(uintptr_t)bones->addr + first,
-                             rots && rots->addr && rots->size == bones->size ? (float *)(uintptr_t)rots->addr : NULL, k->nbones, view))
+        bool their_hidden = false;
+        if (!coop_pose_apply(frame, now, k->vertices, k->tag, link_stand_in(k->vertices, !k->skinned), !k->skinned, (float *)(uintptr_t)bones->addr + first,
+                             rots_ok ? (float *)(uintptr_t)rots->addr + (k->skinned ? 0 : LINK_RIGID_ROT) : NULL, k->nbones, view, &their_hidden))
             continue;
+        st.poly[0] = link_cull(st.poly[0], their_hidden);
         guest_copy_flush();  // (same addresses as last time, different contents)
         dup_tint_for(k->vertices, !k->skinned);
         dup_drawing = true;
@@ -3219,10 +3241,11 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     if (skinned && bones->size >= LINK_BIG_MESH_BYTES) {
         if (vb < next_lo) next_lo = vb;
         if (vb > next_hi) next_hi = vb;
-    } else if (!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) {
+    } else if ((!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) && (skinned || !link_equipment(vertices))) {
         return;
     }
     dup_seen_frame = renderer_present_count();
+    dup_copies++;
     if (g_debug_frame) {  // (F9, for measuring what a pose takes to send)
         static int n;
         char path[64];
@@ -3251,19 +3274,47 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     memcpy(dst, src, bones->size);
     // The other player's own bones when they've arrived; until then, this Link's pose where they stand.
     const uint64_t frame = renderer_present_count();
-    coop_pose_capture(frame, SDL_GetTicks(), vertices, !skinned, src + first, nbones, view, me);
-    link_keep(r, indexed, skinned, vertices, nbones, frame);
-    Range *rots = skinned ? &st.ubuf[0][4] : NULL;
+    // Named by where its mesh is from his model too: both players load it alike, and his two hands are the same size.
+    const uint16_t tag = (uint16_t)(int64_t)(((int64_t)vb - (int64_t)link_lo) >> 12);
+    // Hidden: drawn with every face culled (his blade, in its sheath). Theirs is shown or hidden as theirs is, whatever this one's is.
+    const bool hidden = st.poly[0] == 3;
+    coop_pose_capture(frame, SDL_GetTicks(), vertices, tag, !skinned, hidden, src + first, nbones, view, me);
+    link_keep(r, indexed, skinned, vertices, tag, nbones, frame);
+    // Their rotations alone, for shading: a skinned mesh's in buffer 4, a rigid piece's in buffer 1 at float 24 (after two
+    // matrices that aren't his)
+    Range *rots = skinned ? &st.ubuf[0][4] : &st.ubuf[0][1];
+    const uint32_t rfirst = skinned ? 0 : LINK_RIGID_ROT;
     float *rdst = NULL;
-    if (rots && rots->addr && rots->size == bones->size) {
+    if (rots->addr && (skinned ? rots->size == bones->size : rigid_rot_copy(src + first, rots))) {
         uint32_t rsize = (rots->size + 255u) & ~255u;
         if (used + rsize > DUP_BUF_SIZE) used = 0;
         if (used + rsize <= DUP_BUF_SIZE && (float *)(buf + used) != dst) {
             rdst = (float *)(buf + used);
             used += rsize;
+            memcpy(rdst, (const void *)(uintptr_t)rots->addr, rots->size);  // (a rigid piece's has more in it)
         }
     }
-    if (!coop_pose_apply(frame, SDL_GetTicks(), vertices, !skinned, dst + first, rdst, nbones, view)) {
+    bool their_hidden = false;
+    const bool matched = coop_pose_apply(frame, SDL_GetTicks(), vertices, tag, link_stand_in(vertices, !skinned), !skinned, dst + first, rdst ? rdst + rfirst : NULL, nbones, view,
+                                         &their_hidden);
+    {
+        static int test = -1;
+        if (test < 0) test = getenv("LARECOMP_COOP_TEST") != NULL;
+        static uint64_t seen[128];
+        static int nseen;
+        const uint64_t key = (uint64_t)tag << 48 | (uint64_t)vertices << 24 | (uint64_t)nbones << 2 | (uint64_t)!skinned << 1 | matched;
+        bool known = false;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == key;
+        if (test && !known && nseen < 128 && coop_pose_have()) {  // (each of this Link's pieces, and whether theirs has it)
+            seen[nseen++] = key;
+            LOG("[coop] pose: my piece %u%s/%u@%d, first bone %.0f %.0f %.0f: %s\n", vertices, skinned ? "" : "r", nbones, (int16_t)tag, src[first + 3],
+                src[first + 7], src[first + 11], matched ? "theirs has it" : "theirs hasn't, skipped");
+        }
+    }
+    if (!matched) {
+        // A piece their Link isn't drawing (a hand gripping a sword, when theirs isn't): none. This Link's own pose only
+        // stands in for theirs until it has arrived.
+        if (coop_pose_have()) return;
         rdst = NULL;
         const float w[3] = {feet[0] - me[0], feet[1] - me[1], feet[2] - me[2]};
         for (int i = 0; i < 3; i++) {
@@ -3271,10 +3322,12 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
             for (uint32_t b = 0; b < nbones; b++) dst[first + b * 12 + i * 4 + 3] += shift;
         }
     }
-    Range saved = *bones, saved_rots = rots ? *rots : (Range){0, 0};
+    Range saved = *bones, saved_rots = *rots;
     bones->addr = (uint64_t)(uintptr_t)dst;
     if (rdst) rots->addr = (uint64_t)(uintptr_t)rdst;
     static bool active;
+    const uint8_t cull = st.poly[0];
+    if (matched) st.poly[0] = link_cull(cull, their_hidden);
     if (!active) {
         active = true;
         dup_tint_for(vertices, !skinned);
@@ -3284,13 +3337,50 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
         active = false;
     }
     *bones = saved;
-    if (rots) *rots = saved_rots;
+    *rots = saved_rots;
+    st.poly[0] = cull;
+}
+
+// (LARECOMP_COOP_TEST) Draws near this player's Link that dup_link didn't copy, once each: what a missing piece is.
+static void dup_missed_log(Prog *pr, CmdRec *r, uint64_t seen_before) {
+    static int test = -1, logged;
+    if (test < 0) test = getenv("LARECOMP_COOP_TEST") != NULL;
+    if (!test || logged >= 300 || !g_is_skyward || !in_pass || !pr || !st.rt.depth || dup_copies != seen_before || !link_hi) return;  // (once his model's place is known)
+    float me[3];
+    if (!coop_my_position(me)) return;
+    const float *view = (const float *)(uintptr_t)0x7005b30e78ull;
+    float v[3];
+    for (int i = 0; i < 3; i++) v[i] = view[i * 4] * me[0] + view[i * 4 + 1] * me[1] + view[i * 4 + 2] * me[2] + view[i * 4 + 3];
+    for (int u = 0; u < 6; u++) {
+        if (!(pr->vi->cbuf_mask >> (u + 3) & 1)) continue;  // (buffers it doesn't use hold another draw's)
+        const Range *b = &st.ubuf[0][u];
+        for (uint32_t first = 0; first <= 16; first += 16) {
+            if (!b->addr || b->size < (first + 12) * 4) continue;
+            const float *m = (const float *)(uintptr_t)b->addr + first;
+            float d2 = 0;
+            for (int i = 0; i < 3; i++) d2 += (m[i * 4 + 3] - v[i]) * (m[i * 4 + 3] - v[i]);
+            if (d2 > LINK_BONES_NEAR * LINK_BONES_NEAR) continue;
+            static uint64_t keys[300];
+            uint64_t key = (uint64_t)pr->vi->cbuf_mask << 40 | (uint64_t)r->x[2] << 8 | u << 1 | (first != 0);
+            for (int i = 0; i < logged; i++) if (keys[i] == key) return;
+            keys[logged++] = key;
+            const uint64_t vb = st.vbuf[0].addr;
+            LOG("[coop] missed near Link: mask %#x, %u vertices, matrix in buffer %d float %u (%.0f away), buffer sizes %u %u %u %u %u, ds1 %d, "
+                "vertices at %+lld KB from his model (%llx-%llx)\n", pr->vi->cbuf_mask, (uint32_t)r->x[2], u, first, sqrtf(d2),
+                (uint32_t)st.ubuf[0][0].size, (uint32_t)st.ubuf[0][1].size, (uint32_t)st.ubuf[0][2].size, (uint32_t)st.ubuf[0][3].size,
+                (uint32_t)st.ubuf[0][4].size, st.ds[1] != 0, link_hi ? (long long)(vb < link_lo ? (long long)(vb - link_lo) : vb > link_hi ? (long long)(vb - link_hi) : 0) / 1024 : 0,
+                (unsigned long long)link_lo, (unsigned long long)link_hi);
+            return;
+        }
+    }
 }
 
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
+    const uint64_t seen_before = dup_copies;
     dup_link(dup_program(), r, indexed);
+    dup_missed_log(dup_program(), r, seen_before);
     link_replay();
     linear_rt_writeback();
     PROF_ADD(prof_draw);

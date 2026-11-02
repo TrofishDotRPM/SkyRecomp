@@ -37,7 +37,7 @@ typedef int sock_t;
 // Hello: magic, protocol, 32 bytes of key (zero-padded). Replied to in kind by the host, then 8-byte events. An event of
 // type BLOB_EVENT (b c: size) is followed by that many bytes.
 #define HELLO_SIZE 40
-#define PROTOCOL 4
+#define PROTOCOL 6
 #define BLOB_EVENT 0xb0
 #define BLOB_BACKLOG (1 << 18)  // a player with this much waiting misses blobs until they catch up
 #define OUT_CAP (1 << 20)  // a full snapshot is well under this; a player who falls further behind is dropped

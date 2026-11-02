@@ -3,6 +3,8 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_BONES 1024
@@ -12,7 +14,9 @@
 #define POS_SCALE 32.0f     // 1/32 of a game unit; +-1000 units from his feet
 #define HASH_SLOTS 4096
 
-typedef struct { uint32_t vertices; uint16_t count; uint8_t rigid; uint32_t first; } Part;  // first: into slots
+// Named by its vertex count, kind and where in memory its mesh is (tag): Link has pieces of the same size, both hands.
+// hidden: drawn with all its faces culled (the game's way of hiding his blade in its sheath).
+typedef struct { uint32_t vertices; uint16_t count, tag; uint8_t rigid, hidden; uint32_t first; } Part;  // first: into slots
 
 typedef struct {
     float feet[3];
@@ -71,8 +75,8 @@ static void from_relative(float out[12], float *rot, const float m[12], const fl
     }
 }
 
-void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool rigid, const float *bones, uint32_t count, const float view[12],
-                       const float feet[3]) {
+void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, uint16_t tag, bool rigid, bool hidden, const float *bones, uint32_t count,
+                       const float view[12], const float feet[3]) {
     static int32_t table[HASH_SLOTS];  // bone index + 1, this frame
     if (frame != g_gather_frame) {
         if (g_gather_frame != ~0ull && g_gather.nparts) {
@@ -90,7 +94,7 @@ void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool 
     Pose *p = &g_gather;
     if (p->nparts == MAX_PARTS || p->nslots + count > MAX_SLOTS || count > 0xffff) return;
     Part *part = &p->parts[p->nparts++];
-    part->vertices = vertices, part->rigid = rigid, part->count = (uint16_t)count, part->first = p->nslots;
+    part->vertices = vertices, part->tag = tag, part->rigid = rigid, part->hidden = hidden, part->count = (uint16_t)count, part->first = p->nslots;
     for (uint32_t i = 0; i < count; i++) {
         float rel[12];
         to_relative(rel, bones + i * 12, view, p->feet);
@@ -112,8 +116,8 @@ void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool 
     }
 }
 
-// ---- on the wire, little-endian: time u32, feet (3 f32), nbones u16, nparts u16, parts (vertices u32, count u16, rigid u8), slots
-// (u16 each), bones (12 i16 each)
+// ---- on the wire, little-endian: time u32, feet (3 f32), nbones u16, nparts u16, parts (vertices u32, count u16, tag u16, flags u8: 1
+// rigid, 2 hidden), slots (u16 each), bones (12 i16 each)
 static void put_u16(uint8_t **w, uint16_t v) { (*w)[0] = (uint8_t)v, (*w)[1] = (uint8_t)(v >> 8), *w += 2; }
 static uint16_t get_u16(const uint8_t **r) { uint16_t v = (uint16_t)((*r)[0] | (*r)[1] << 8); *r += 2; return v; }
 
@@ -121,7 +125,7 @@ size_t coop_pose_take(uint8_t *out, size_t cap) {
     pthread_mutex_lock(&g_lock);
     if (!g_ready_new) { pthread_mutex_unlock(&g_lock); return 0; }
     const Pose *p = &g_ready;
-    size_t need = 20 + (size_t)p->nparts * 7 + (size_t)p->nslots * 2 + (size_t)p->nbones * 24;
+    size_t need = 20 + (size_t)p->nparts * 9 + (size_t)p->nslots * 2 + (size_t)p->nbones * 24;
     if (need > cap) { g_ready_new = false; pthread_mutex_unlock(&g_lock); return 0; }
     uint8_t *w = out;
     put_u16(&w, (uint16_t)p->time_ms), put_u16(&w, (uint16_t)(p->time_ms >> 16));
@@ -131,7 +135,8 @@ size_t coop_pose_take(uint8_t *out, size_t cap) {
         const Part *q = &p->parts[i];
         put_u16(&w, (uint16_t)q->vertices), put_u16(&w, (uint16_t)(q->vertices >> 16));
         put_u16(&w, q->count);
-        *w++ = q->rigid;
+        put_u16(&w, q->tag);
+        *w++ = (uint8_t)(q->rigid | q->hidden << 1);
     }
     for (uint32_t i = 0; i < p->nslots; i++) put_u16(&w, p->slots[i]);
     for (int b = 0; b < p->nbones; b++)
@@ -150,14 +155,15 @@ bool coop_pose_receive(const uint8_t *data, size_t size, uint64_t now_ms) {
     memcpy(in.feet, r, 12), r += 12;
     if (!isfinite(in.feet[0]) || !isfinite(in.feet[1]) || !isfinite(in.feet[2])) return false;
     in.nbones = get_u16(&r), in.nparts = get_u16(&r);
-    if (in.nbones > MAX_BONES || in.nparts > MAX_PARTS || (size_t)(end - r) < (size_t)in.nparts * 7) return false;
+    if (in.nbones > MAX_BONES || in.nparts > MAX_PARTS || (size_t)(end - r) < (size_t)in.nparts * 9) return false;
     in.nslots = 0;
     for (int i = 0; i < in.nparts; i++) {
         Part *q = &in.parts[i];
         uint32_t lo = get_u16(&r), hi = get_u16(&r);
         q->vertices = lo | hi << 16;
         q->count = get_u16(&r);
-        q->rigid = *r++ != 0;
+        q->tag = get_u16(&r);
+        q->rigid = *r & 1, q->hidden = *r >> 1 & 1, r++;
         q->first = in.nslots;
         if (in.nslots + q->count > MAX_SLOTS) return false;
         in.nslots += q->count;
@@ -186,15 +192,57 @@ bool coop_pose_receive(const uint8_t *data, size_t size, uint64_t now_ms) {
     g_ring[g_ring_n] = in;
     g_ring_time[g_ring_n++] = in.time_ms;
     pthread_mutex_unlock(&g_lock);
+    static int test = -1;
+    if (test < 0) test = getenv("LARECOMP_COOP_TEST") != NULL;
+    if (test) {  // (each different list of pieces the other player's Link is drawn with, once)
+        static uint32_t seen[64];
+        static int nseen;
+        uint32_t h = 2166136261u;
+        for (int i = 0; i < in.nparts; i++) h = (h ^ (in.parts[i].vertices * 4 + in.parts[i].rigid * 2)) * 16777619u ^ in.parts[i].count ^ (uint32_t)in.parts[i].tag << 16;
+        bool known = false;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == h;
+        if (!known && nseen < 64) {
+            seen[nseen++] = h;
+            fprintf(stderr, "[coop] pose: their pieces:");
+            for (int i = 0; i < in.nparts; i++) fprintf(stderr, " %u%s/%u@%d", in.parts[i].vertices, in.parts[i].rigid ? "r" : "", in.parts[i].count, (int16_t)in.parts[i].tag);
+            fprintf(stderr, "\n");
+        }
+    }
     return true;
 }
 
-static bool same_part(const Part *a, const Part *b) {
-    return a->vertices == b->vertices && a->rigid == b->rigid && a->count == b->count;
+// Whether any of the other player's poses has arrived (until then, this player's own Link stands in for theirs).
+bool coop_pose_have(void) {
+    pthread_mutex_lock(&g_lock);
+    bool have = g_ring_n > 0;
+    pthread_mutex_unlock(&g_lock);
+    return have;
 }
 
-bool coop_pose_apply(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool rigid, float *bones, float *rot, uint32_t count,
-                     const float view[12]) {
+static bool same_part(const Part *a, const Part *b) {
+    return a->vertices == b->vertices && a->rigid == b->rigid && a->count == b->count && a->tag == b->tag;
+}
+
+// The same piece in another pose: the same name, and as many of that name before it (both eyes share one).
+static const Part *same_in(const Pose *other, const Pose *p, int i) {
+    int nth = 0;
+    for (int k = 0; k < i; k++) nth += same_part(&p->parts[k], &p->parts[i]);
+    for (int k = 0; k < other->nparts; k++)
+        if (same_part(&other->parts[k], &p->parts[i]) && !nth--) return &other->parts[k];
+    return NULL;
+}
+
+// Whether this player's own Link has a piece of this name (it'll want the other player's for itself).
+static bool mine(uint32_t vertices, uint16_t tag, bool rigid, uint16_t count) {
+    for (int i = 0; i < g_ready.nparts; i++) {
+        const Part *q = &g_ready.parts[i];
+        if (q->vertices == vertices && q->tag == tag && q->rigid == rigid && q->count == count) return true;
+    }
+    return false;
+}
+
+bool coop_pose_apply(uint64_t frame, uint64_t now_ms, uint32_t vertices, uint16_t tag, uint32_t alt, bool rigid, float *bones, float *rot, uint32_t count,
+                     const float view[12], bool *hidden) {
     pthread_mutex_lock(&g_lock);
     bool ok = false;
     if (frame != g_used_frame) { g_used_frame = frame; memset(g_used, 0, sizeof g_used); }
@@ -210,13 +258,24 @@ bool coop_pose_apply(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool ri
         if (later != earlier) t = (float)(int32_t)(at - g_ring_time[earlier]) / (float)(int32_t)(g_ring_time[later] - g_ring_time[earlier]);
         if (t < 0) t = 0;
         if (t > 1) t = 1;
-        for (int i = 0; i < p->nparts && !ok; i++) {
+        // Theirs of the same name; else one of the size given as a stand-in (a gripping hand for an open one), or the same size
+        // under another name (their model elsewhere in memory), that isn't one this Link draws as itself.
+        int pick = -1;
+        for (int pass = 0; pass < 3 && pick < 0; pass++)
+            for (int i = 0; i < p->nparts && pick < 0; i++) {
+                const Part *q = &p->parts[i];
+                if (g_used[i] || q->rigid != (uint8_t)rigid || q->count != count) continue;
+                if (pass == 0 ? q->vertices == vertices && q->tag == tag
+                              : (pass == 1 ? alt && q->vertices == alt : q->vertices == vertices) && !mine(q->vertices, q->tag, q->rigid, q->count))
+                    pick = i;
+            }
+        for (int i = pick; i >= 0 && !ok; i = -1) {
             const Part *q = &p->parts[i];
-            if (g_used[i] || q->vertices != vertices || q->rigid != (uint8_t)rigid || q->count != count) continue;
             g_used[i] = 1;
+            if (hidden) *hidden = q->hidden;  // (the latest's)
             // Blended part by part, not by bone number: bones that happen to coincide are shared differently from one
             // pose to the next. A part the earlier pose hasn't got appears at once.
-            const Part *eq = i < e->nparts && same_part(&e->parts[i], q) ? &e->parts[i] : NULL;
+            const Part *eq = e != p ? same_in(e, p, i) : q;
             float feet[3];
             for (int k = 0; k < 3; k++) feet[k] = e->feet[k] + (p->feet[k] - e->feet[k]) * t;
             for (uint32_t b = 0; b < count; b++) {

@@ -10,14 +10,18 @@
 #define COOP_POSE_DELAY_MS 100  // how far behind poses are played: a late one rarely means a jump
 
 // Render thread, for each of Link's draws: its bones (`count` 3x4 matrices in view space). `frame` changes each frame; what
-// a frame gathered is ready to send once the next begins. A part is named by its vertex count and kind.
-void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool rigid, const float *bones, uint32_t count, const float view[12],
-                       const float feet[3]);
+// a frame gathered is ready to send once the next begins. A part is named by its vertex count, kind and tag (where its mesh
+// is, from his model: the same on every machine).
+// hidden: drawn with every face culled (the game hiding it, as his blade while it's put away).
+void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, uint16_t tag, bool rigid, bool hidden, const float *bones, uint32_t count,
+                       const float view[12], const float feet[3]);
 // Render thread: this draw's bones as they should be for the other player, under this camera. rot (may be NULL): the same
 // without translations. false: nothing received fits (no pose yet, or this part isn't in it). The last pose is held for as
-// long as nothing newer comes.
-bool coop_pose_apply(uint64_t frame, uint64_t now_ms, uint32_t vertices, bool rigid, float *bones, float *rot, uint32_t count,
-                     const float view[12]);
+// long as nothing newer comes. alt (0: none): the vertex count of a piece that may stand in for this one when theirs is
+// drawing that instead.
+bool coop_pose_have(void);
+bool coop_pose_apply(uint64_t frame, uint64_t now_ms, uint32_t vertices, uint16_t tag, uint32_t alt, bool rigid, float *bones, float *rot, uint32_t count,
+                     const float view[12], bool *hidden);  // hidden (may be NULL): whether theirs was hidden
 
 // Game thread: the latest finished pose, encoded. 0: none new.
 size_t coop_pose_take(uint8_t *out, size_t cap);
