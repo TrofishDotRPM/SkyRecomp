@@ -458,6 +458,112 @@ static void chest_flags_gained(int word, uint16_t gained) {
         if (gained & 1 << b) chest_open_live(word % 2 * 16 + b);
 }
 
+// ---- enemies another player killed, removed in front of you. The game only reads an enemy's defeat flag as it spawns, so
+// one already here is asked to delete itself (fBase_c's delete request: the game tears it down next frame, as one that died).
+// Actors are found on the list linked through each actor's +0x40 (next, previous, owner), starting from Link. As laid out
+// in 1.0.0: an actor's profile at +0x10 names it in the profile name table (enemies' names start E_), and an enemy's defeat
+// flag is at +0x136 (bats, chuchus: the number the game sets in the scene's enemy flags when it dies).
+#define ACTOR_PROFILE 0x10   // u16
+#define ACTOR_LIFE 0x12      // u8: 1 alive, 2 being deleted
+#define ACTOR_DELETE 0x13    // u8: fBase_c's delete request
+#define ACTOR_LIST 0x40      // list node: next node, previous node, owner
+#define ENEMY_FLAG 0x136     // u16
+#define ACTOR_POS PLAYER_POS  // 3 f32, as Link's
+#define PROFILE_NAMES (MAIN_BASE + 0x1675a40)  // char *[profile]
+#define PROFILES 0x300
+
+static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
+
+// Each actor on the list, alive or being deleted; its profile's name (NULL if out of range).
+typedef bool (*ActorFn)(uint64_t a, const char *name, void *user);  // false: stop
+static void actors_each(ActorFn fn, void *user) {
+    uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return;
+    uint64_t n = pl + ACTOR_LIST;
+    for (int i = 0; i < 8192; i++) {  // (to the list's start)
+        uint64_t prev = *(uint64_t *)(uintptr_t)(n + 8);
+        if (!guest_ptr(prev)) break;
+        n = prev;
+    }
+    for (int i = 0; i < 8192 && guest_ptr(n); i++, n = *(uint64_t *)(uintptr_t)n) {
+        uint64_t a = *(uint64_t *)(uintptr_t)(n + 16);
+        if (!guest_ptr(a)) continue;
+        uint16_t prof = *(uint16_t *)(uintptr_t)(a + ACTOR_PROFILE);
+        uint64_t name = prof < PROFILES ? *(uint64_t *)(uintptr_t)(PROFILE_NAMES + prof * 8ull) : 0;
+        if (name < MAIN_BASE || name >= MAIN_BASE + 0x2000000) name = 0;
+        if (!fn(a, (const char *)(uintptr_t)name, user)) return;
+    }
+}
+
+static bool is_enemy(const char *name) { return name && name[0] == 'E' && name[1] == '_'; }
+static bool alive(uint64_t a) { return *(uint8_t *)(uintptr_t)(a + ACTOR_LIFE) == 1; }
+static float dist2(uint64_t a, const float p[3]) {
+    const float *q = (const float *)(uintptr_t)(a + ACTOR_POS);
+    return (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]) + (q[2] - p[2]) * (q[2] - p[2]);
+}
+
+// What an enemy removed here drops (the game's teardown is its death, loot and all) belongs to whoever killed it: items
+// that turn up near it for a little while are removed too. Those already lying there are left.
+#define DROP_RADIUS 250.0f
+#define DROP_MS 2000
+#define DROP_KNOWN 64
+static struct { float pos[3]; uint64_t until, known[DROP_KNOWN]; int nknown; } g_drops[8];
+static int g_ndrops;
+
+static bool note_item(uint64_t a, const char *name, void *user) {
+    int *d = user;
+    if (name && !strcmp(name, "ITEM") && g_drops[*d].nknown < DROP_KNOWN) g_drops[*d].known[g_drops[*d].nknown++] = a;
+    return true;
+}
+
+static bool drop_check(uint64_t a, const char *name, void *user) {
+    (void)user;
+    if (!name || strcmp(name, "ITEM") || !alive(a)) return true;
+    for (int d = 0; d < g_ndrops; d++) {
+        bool known = false;
+        for (int k = 0; k < g_drops[d].nknown && !known; k++) known = g_drops[d].known[k] == a;
+        if (known || dist2(a, g_drops[d].pos) > DROP_RADIUS * DROP_RADIUS) continue;
+        *(uint8_t *)(uintptr_t)(a + ACTOR_DELETE) = 1;
+        if (g_test) LOG("[coop] its drop removed at %llx\n", (unsigned long long)a);
+        break;
+    }
+    return true;
+}
+
+// Once a frame.
+static void drops_tick(void) {
+    if (!g_ndrops) return;
+    uint64_t now = SDL_GetTicks();
+    int n = 0;
+    for (int d = 0; d < g_ndrops; d++)
+        if (now < g_drops[d].until) g_drops[n++] = g_drops[d];
+    g_ndrops = n;
+    if (n) actors_each(drop_check, NULL);
+}
+
+typedef struct { uint16_t flag; int removed; } KillWant;
+static bool remove_if_killed(uint64_t a, const char *name, void *user) {
+    KillWant *w = user;
+    if (!is_enemy(name) || !alive(a) || *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG) != w->flag) return true;
+    *(uint8_t *)(uintptr_t)(a + ACTOR_DELETE) = 1;
+    w->removed++;
+    if (g_test) LOG("[coop] enemy %s with flag %#x removed at %llx\n", name, w->flag, (unsigned long long)a);
+    if (g_ndrops < 8) {
+        int d = g_ndrops++;
+        memcpy(g_drops[d].pos, (const void *)(uintptr_t)(a + ACTOR_POS), 12);
+        g_drops[d].until = SDL_GetTicks() + DROP_MS;
+        g_drops[d].nknown = 0;
+        actors_each(note_item, &d);
+    }
+    return true;
+}
+
+static void enemy_remove_live(uint16_t flag) {
+    KillWant w = {flag, 0};
+    actors_each(remove_if_killed, &w);
+    if (!w.removed && g_test) LOG("[coop] no enemy with flag %#x here\n", flag);
+}
+
 static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
@@ -486,6 +592,8 @@ static void on_event(const CoopEvent *ev, void *user) {
         toast(text);
     } else if (ev->type == COOP_EV_HEAL && *g_core.health > hp) {
         toast("Recovery Heart");
+    } else if (ev->type == COOP_EV_KILL && g_core.scene >= 0 && ev->b == (uint16_t)g_core.scene) {
+        enemy_remove_live(ev->c);
     }
 }
 
@@ -640,6 +748,7 @@ void coop_tick(void) {
         return;
     }
     chest_lids_tick();
+    drops_tick();
     pos_send_tick();
     pose_send_tick();
     look_send_tick();

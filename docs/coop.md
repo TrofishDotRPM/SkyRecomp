@@ -2,7 +2,7 @@
 
 Each player runs their own game with their own save. Progress is shared; bodies are not: you won't see the other player, only what they did.
 
-**Status: partly confirmed in the game (2026-11-01), with two copies on one machine.** Working: connecting, items and heart pieces (given with the test keys below), recovery hearts, chest rupees, popups, small chests opening live, the player marker, and the other player's figure. Health stays private and heart containers aren't shared. Not yet tried: full-size chests opening live, both players opening a chest at once, enemy deaths, maps and keys in a dungeon, and playing over a real network.
+**Status: partly confirmed in the game (2026-11-01), with two copies on one machine.** Working: connecting, items and heart pieces (given with the test keys below), recovery hearts, chest rupees, popups, small chests opening live, the player marker, and the other player's figure. Health stays private and heart containers aren't shared. Enemy kills are shared live (bats and chuchus). Not yet tried: full-size chests opening live, both players opening a chest at once, maps and keys in a dungeon, and playing over a real network.
 
 To build on Fedora, where FFmpeg's headers and shaderc's library name differ from what the Makefile expects:
 
@@ -44,7 +44,7 @@ For testing, `LARECOMP_COOP_TEST=1` logs every event and adds keys in the focuse
 | Small keys | Differences, so finding and spending both carry over |
 | Pouch expansions, extra wallets, crystals, key pieces | Differences |
 | Chests, doors, boss-defeated and other scene flags | Grow only, which also stops the same item being collected twice |
-| Enemy deaths | Per scene (see below) |
+| Enemy deaths | Live: one another player kills vanishes in front of you, and its loot stays theirs. Per scene (see below) |
 
 Private: heart containers, damage, stamina, rupees spent or earned elsewhere, ammo, treasures, bugs, pouch contents, and all other story flags.
 
@@ -58,7 +58,8 @@ Each player can also set the name shown over their Link, and in popups, at the t
 
 - **A gripping hand stands in for an open one.** While only one of you holds a sword, the other Link's matching hand is drawn from your own: a fist where theirs is open, or an open hand around their sword.
 - **Dark earring colors look greyish.** The earrings' blue is the game's shine on a black texture; a color replaces the texture, and the shine still adds on top.
-- **Enemies die on your next visit, not in front of you.** A kill sets the game's spawn-suppression flag, so an enemy that is already loaded stays until the room reloads. Removing it live needs a walk of the actor list, whose HD layout isn't confirmed yet. Only enemies the game tracks with a valid ID can be shared. As with the game's own flags, kills are forgotten when you leave a scene.
+- **An enemy another player kills just vanishes.** It's asked to delete itself (no death effect), and hearts or rupees it drops near where it was in the next 2 seconds are removed, as loot is the killer's. Only enemies with a defeat flag are shared; bosses aren't tried. As with the game's own flags, kills are forgotten when you leave a scene.
+- **Damage isn't shared, nor where enemies are.** Each game runs its own enemies: they chase only their own player, and a hit only counts where it lands. (Bats and chuchus die in one hit, so it doesn't show yet.)
 - **A boss's heart container may be lost to the other player.** Containers aren't shared, but scene flags are, so if one player beats a boss, the other may no longer be able to fight it or collect theirs. This needs checking at the first boss.
 - **Every heart piece is shared, not only those from chests and quests.** Pieces lying in the world use shared scene flags too, so one collected by a player disappears for the other either way.
 - **Chest rupees and recovery hearts are recognised by timing and size, not by source.** After opening a chest with no rupees, the next rupees you earn within 20 seconds are shared too. If you keep a chest's text open for longer than that, its rupees aren't. Other 1-heart heals, such as sitting on a chair, count as pickups, and a heart picked up at full health isn't noticed.
