@@ -49,7 +49,7 @@ typedef int sock_t;
 #define ANSWER_SIZE 40
 #define RESULT_SIZE 8
 enum { NO_PASSWORD = 1, NO_VERSION = 2, NO_ROOM = 3 };
-#define PROTOCOL 7
+#define PROTOCOL 8
 #define BLOB_EVENT 0xb0
 #define BLOB_BACKLOG (1 << 18)  // a player with this much waiting misses blobs until they catch up
 #define OUT_CAP (1 << 20)  // a full snapshot is well under this; a player who falls further behind is dropped

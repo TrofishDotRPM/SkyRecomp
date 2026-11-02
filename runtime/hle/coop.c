@@ -21,6 +21,7 @@
 #include "../settings.h"
 #include "coop.h"
 #include "coop_core.h"
+#include "coop_enemy.h"
 #include "coop_net.h"
 #include "coop_pose.h"
 #include "coop_upnp.h"
@@ -107,19 +108,23 @@ static int16_t pos_unit(float v) {
     return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
 }
 
-static void pose_received(const uint8_t *data, int size, void *user) {
+static void blob_received(const uint8_t *data, int size, void *user) {  // (what it is: its first byte)
     (void)user;
-    if (!coop_pose_receive(data, (size_t)size, SDL_GetTicks()) && g_test) LOG("[coop] ignored a malformed pose\n");
+    if (size < 1) return;
+    if (data[0] == COOP_BLOB_ENEMIES) { coop_enemy_receive(data, size); return; }
+    if (data[0] != COOP_BLOB_POSE) return;
+    if (!coop_pose_receive(data + 1, (size_t)size - 1, SDL_GetTicks()) && g_test) LOG("[coop] ignored a malformed pose\n");
 }
 
 static void pose_send_tick(void) {
     static uint64_t last;
-    static uint8_t buf[COOP_POSE_MAX_BYTES];
+    static uint8_t buf[1 + COOP_POSE_MAX_BYTES];
     uint64_t now = SDL_GetTicks();
     if (now - last < POSE_SEND_MS) return;
-    size_t n = coop_pose_take(buf, sizeof buf);
+    buf[0] = COOP_BLOB_POSE;
+    size_t n = coop_pose_take(buf + 1, sizeof buf - 1);
     if (!n) return;
-    coop_net_send_blob(buf, (int)n);
+    coop_net_send_blob(buf, (int)n + 1);
     last = now;
     if (g_test) {
         static uint64_t since, bytes, count;
@@ -755,7 +760,8 @@ static void start(bool use_env) {
     if (!key[0]) LOG("[coop] no password set: anyone who can reach this port can join\n");
     setup_core();
     g_state = coop_net_start(mode, addr, port, key, on_event, on_joined, NULL) ? 1 : -1;
-    coop_net_set_blob(pose_received);
+    coop_net_set_blob(blob_received);
+    coop_enemy_set_puppets(g_state == 1 && join);  // (a joining player's bats follow the host's)
     // The router's port: hosting from the settings, if wanted (the test launcher's copies talk over this computer)
     g_upnp_on = g_state == 1 && host && !env && g_settings.coop_upnp;
     if (g_upnp_on) coop_upnp_open(g_port);
@@ -765,6 +771,7 @@ static void stop(void) {
     if (g_state == 1) coop_net_stop();
     if (g_upnp_on) coop_upnp_close();
     g_upnp_on = false;
+    coop_enemy_set_puppets(false);
     g_state = -1, g_mode = 0;
     pthread_mutex_lock(&g_pos_lock);
     g_other_at = 0;  // (their marker and Link go with them)
@@ -837,6 +844,7 @@ static void test_keys(void) {
 void coop_tick(void) {
     if (g_state == 0) {
         g_test = getenv("LARECOMP_COOP_TEST") != NULL;
+        coop_enemy_init(stage_hash);
         start(true);
     }
     if (g_apply) {
@@ -871,6 +879,11 @@ void coop_tick(void) {
     drops_tick();
     pos_send_tick();
     pose_send_tick();
+    if (g_mode == 1) {  // (the host: its bats, for the others' to follow)
+        static uint8_t ebuf[8192];
+        int n = coop_enemy_take(ebuf, sizeof ebuf);
+        if (n) coop_net_send_blob(ebuf, n);
+    }
     look_send_tick();
     name_send_tick();
     int changed = 0;
