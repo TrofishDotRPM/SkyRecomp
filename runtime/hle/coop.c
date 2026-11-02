@@ -254,6 +254,43 @@ static void look_received(const CoopEvent *ev) {
     g_other_look[ev->a] = ev->c >> 8 & 1 ? rgb | COOP_LOOK_SET : 0;
 }
 
+// ---- the name over each Link: COOP_EV_NAME, a the chunk (0-3), b c d six bytes of it. Sent as the colors are.
+#define COOP_EV_NAME 10
+#define NAME_MAX 20
+#define NAME_CHUNKS 4
+static char g_other_name[NAME_CHUNKS * 6 + 1];
+
+static void name_send_tick(void) {
+    static char sent[NAME_CHUNKS * 6];
+    static uint64_t last;
+    char name[NAME_CHUNKS * 6] = {0};
+    strncpy(name, g_settings.coop_name, NAME_MAX);
+    uint64_t now = SDL_GetTicks();
+    if (!memcmp(name, sent, sizeof name) && now - last < LOOK_RESEND_MS) return;
+    for (int i = 0; i < NAME_CHUNKS; i++) {
+        const uint8_t *c = (const uint8_t *)name + i * 6;
+        CoopEvent ev = {COOP_EV_NAME, (uint8_t)i, (uint16_t)(c[0] | c[1] << 8), (uint16_t)(c[2] | c[3] << 8),
+                        (uint16_t)(c[4] | c[5] << 8)};
+        coop_net_send(&ev);
+    }
+    memcpy(sent, name, sizeof name);
+    last = now;
+}
+
+static void name_received(const CoopEvent *ev) {
+    if (ev->a >= NAME_CHUNKS) return;
+    uint8_t *c = (uint8_t *)g_other_name + ev->a * 6;
+    const uint16_t v[3] = {ev->b, ev->c, ev->d};
+    for (int i = 0; i < 6; i++) {
+        uint8_t ch = (uint8_t)(v[i / 2] >> (i % 2 * 8));
+        c[i] = ch && (ch < 0x20 || ch == 0x7f) ? '?' : ch;  // (another player's text: no control characters)
+    }
+    g_other_name[NAME_MAX] = 0;
+}
+
+// The other player's name, for the marker and popups: theirs, or "Other player".
+const char *coop_other_name(void) { return g_other_name[0] ? g_other_name : "Other player"; }
+
 // A part's color, 0-1, for this player's Link or the other's. false: the game's own. Any thread.
 bool coop_look(bool other, int part, float rgb[3]) {
     if (part < 0 || part >= COOP_LOOK_PARTS) return false;
@@ -426,6 +463,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
     if (ev->type == COOP_EV_POS) { pos_received(ev); return; }
     if (ev->type == COOP_EV_LOOK) { look_received(ev); return; }
+    if (ev->type == COOP_EV_NAME) { name_received(ev); return; }
     log_event("got", ev);
     if (ev->type == COOP_EV_SYNC) { coop_core_snapshot(&g_core); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
@@ -605,6 +643,7 @@ void coop_tick(void) {
     pos_send_tick();
     pose_send_tick();
     look_send_tick();
+    name_send_tick();
     int changed = 0;
     for (int r = 0; r < COOP_NREGIONS; r++)
         for (int w = 0; w < g_core.region[r].words; w++) changed += g_core.region[r].live[w] != g_core.shadow[r][w];

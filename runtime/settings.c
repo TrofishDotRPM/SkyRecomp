@@ -197,6 +197,11 @@ void settings_load(void) {
         char key[64];
         char val[1024] = "";
         if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) < 1) continue;
+        if (!strcmp(key, "coop_name")) {
+            if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) != 2) val[0] = 0;
+            strlcpy(g_settings.coop_name, val, 21);
+            continue;
+        }
         if (!strcmp(key, "coop_mode") || !strcmp(key, "coop_addr") || !strcmp(key, "coop_key")) {
             if (sscanf(line, " %63[^= ] = %1023[^\n]", key, val) != 2) val[0] = 0;
             if (!strcmp(key, "coop_mode")) strlcpy(g_settings.coop_mode, val, sizeof g_settings.coop_mode);
@@ -205,7 +210,7 @@ void settings_load(void) {
             continue;
         }
         if (!strncmp(key, "coop_look_", 10)) {  // coop_look_<part> = #rrggbb, or original
-            static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design"};
+            static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings"};
             for (int p = 0; p < COOP_LOOK_PARTS; p++) {
                 if (strcmp(key + 10, parts[p])) continue;
                 unsigned rgb;
@@ -388,8 +393,9 @@ void settings_save(void) {
     fprintf(f, "keys_path = %s\n", g_settings.keys_path);
     fprintf(f, "coop_mode = %s\ncoop_addr = %s\ncoop_port = %d\ncoop_key = %s\n", g_settings.coop_mode, g_settings.coop_addr,
             g_settings.coop_port, g_settings.coop_key);
+    fprintf(f, "coop_name = %s\n", g_settings.coop_name);
     {
-        static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design"};
+        static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings"};
         for (int p = 0; p < COOP_LOOK_PARTS; p++) {
             if (g_settings.coop_look[p] & COOP_LOOK_SET) fprintf(f, "coop_look_%s = #%06x\n", parts[p], g_settings.coop_look[p] & 0xffffffu);
             else fprintf(f, "coop_look_%s = original\n", parts[p]);

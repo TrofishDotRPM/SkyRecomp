@@ -31,12 +31,13 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 // your Link's looks: the clothes he starts in (shirt, tabard, trousers, boots, belt), the classic tunic (tunic, hat,
 // undershirt, trousers, boots, belt), then hair and eyes (whatever he wears)
-#define COOP_LOOK_PARTS 15
+#define COOP_LOOK_PARTS 16
 #define COOP_LOOK_CLASSIC 5  // the first of the classic tunic's
 #define COOP_LOOK_HAIR 11
 #define COOP_LOOK_EYES 12
 #define COOP_LOOK_SHIRT_DETAILS 13  // the starting shirt's blue embroidery (and the hem's)
 #define COOP_LOOK_TABARD_DESIGN 14   // the pale pattern on the tabard
+#define COOP_LOOK_EARRINGS 15        // (whatever he wears, as hair and eyes)
 #define COOP_LOOK_SET 0x1000000u
 
 typedef struct {
@@ -103,6 +104,7 @@ typedef struct {
     char coop_addr[256];   // the host's address, to join
     int coop_port;         // 0 = the default
     char coop_key[64];     // shared between the players; keeps strangers out, doesn't encrypt
+    char coop_name[24];    // shown over your Link to the other players (up to 20 characters); empty: "Other player"
     uint32_t coop_look[COOP_LOOK_PARTS];  // your Link's clothes (COOP_LOOK_PARTS): 0xRRGGBB | COOP_LOOK_SET, or 0 for the
                                           // game's own color. Both players see them.
 } Settings;

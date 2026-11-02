@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "imgui.h"
+#include "osk.h"
 
 extern "C" {
 #include "../settings.h"
@@ -10,7 +11,7 @@ extern "C" {
 
 static const char *const PARTS[COOP_LOOK_PARTS] = {"Shirt", "Tabard", "Trousers", "Boots", "Belt",
                                                     "Tunic", "Hat", "Undershirt", "Trousers", "Boots", "Belt", "Hair",
-                                                    "Eyes", "Shirt details", "Tabard design"};
+                                                    "Eyes", "Shirt details", "Tabard design", "Earrings"};
 
 static const struct { const char *name; uint32_t rgb; } COMMON[] = {
     {"Red", 0xc8302c}, {"Orange", 0xe07a1f}, {"Yellow", 0xe8c43a}, {"Green", 0x3f9b3a}, {"Teal", 0x2a9d8f},
@@ -81,11 +82,17 @@ static bool part_row(int p, float scale) {
 
 extern "C" void coop_menu_draw(float scale) {
     bool changed = false;
+    // the name over your Link, for the others
+    ImGui::SeparatorText("Your name");
+    ImGui::SetNextItemWidth(-1);
+    if (ui_input_text("##name", g_settings.coop_name, 21, 0, "Shown over your Link to the other player", "Your name")) changed = true;
+    ImGui::Spacing();
+    ImGui::Spacing();
     ImGui::TextWrapped("Your Link's looks: both players see them. Pick a color for each part, or Original for the "
                        "game's own. Your Link, to the right, shows them as you pick.");
     ImGui::Spacing();
     // a tab each for Link himself and each outfit
-    static const int LINK[] = {COOP_LOOK_HAIR, COOP_LOOK_EYES, -1};
+    static const int LINK[] = {COOP_LOOK_HAIR, COOP_LOOK_EYES, COOP_LOOK_EARRINGS, -1};
     static const int SKYLOFT[] = {0, COOP_LOOK_SHIRT_DETAILS, 1, COOP_LOOK_TABARD_DESIGN, 2, 3, 4, -1};
     static const int CLASSIC[] = {5, 6, 7, 8, 9, 10, -1};
     static const struct { const char *name; const int *parts; const char *note; } PAGES[] = {

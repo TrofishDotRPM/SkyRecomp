@@ -9,6 +9,7 @@
 #include "imgui.h"
 
 extern "C" int coop_toasts(char (*text)[64], float *age, int max);
+extern "C" const char *coop_other_name(void);
 extern "C" bool coop_marker_target(float out[3]);
 extern "C" void coop_marker_view(const float world[3], float view[3], float *proj_x, float *proj_y);
 
@@ -81,9 +82,9 @@ static void marker_draw(ImVec2 display, ImFont *font, float u) {  // (font: the 
         b(sx - dir.x * h * 0.3f - side.x * w, sy - dir.y * h * 0.3f - side.y * w);
     dl->AddTriangleFilled(tip, b, a, fill);
     dl->AddTriangle(tip, b, a, line, 1.5f * u);
-    char label[48];
+    char label[64];
     float real = sqrtf(view[0] * view[0] + view[1] * view[1] + view[2] * view[2]);
-    snprintf(label, sizeof label, "Other player  %dm", (int)(real / 100));  // (the game's units are centimetres)
+    snprintf(label, sizeof label, "%s  %dm", coop_other_name(), (int)(real / 100));  // (the game's units are centimetres)
     float size = 18 * u;
     ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, label);
     float tx = sx - ts.x / 2, ty = sy - h - ts.y - 4 * u;
@@ -103,8 +104,8 @@ extern "C" void coop_overlay_draw(ImVec2 display, ImFont *font, ImFont *label_fo
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     for (int i = n - 1; i >= 0; i--) {  // (the newest at the bottom)
         float a = age[i] > 0.8f ? (1 - age[i]) / 0.2f : 1;  // the last part of its life fades
-        char line[96];
-        snprintf(line, sizeof line, "Other player found: %s", text[i]);
+        char line[128];
+        snprintf(line, sizeof line, "%s found: %s", coop_other_name(), text[i]);
         ImVec2 ts = label_font->CalcTextSizeA(size, FLT_MAX, 0, line);
         ImVec2 hi(ox + bw - 24 * u, y), lo(hi.x - ts.x - 2 * pad, y - ts.y - 2 * pad);
         // (a drop shadow, below and to the right)

@@ -2916,22 +2916,23 @@ extern bool coop_look(bool other, int part, float rgb[3]);
 extern uint8_t *vk_texture_decode(NvnTexture *t, uint32_t *w, uint32_t *h);
 extern NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, uint32_t w, uint32_t h);
 extern void vk_texture_free(NvnTexture *t);
-enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BELT, KIND_HAIR, KIND_FACE, KIND_EYES };
+enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BUCKLE, KIND_HAIR, KIND_FACE, KIND_EYES };
 
 static int link_kind(uint32_t vertices, bool rigid) {
-    if (rigid) return vertices == 216 ? KIND_BELT : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
+    if (rigid) return vertices == 216 ? KIND_BUCKLE : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
     switch (vertices) {
     case 3162: return KIND_SHIRT;              // (12: the collar band, its own small texture)
     case 684: return KIND_TABARD;
-    case 2664: case 948: return KIND_LOWER;    // trousers, boots and the shirt's hem, one texture
+    case 2664: case 948: return KIND_LOWER;    // trousers, boots, belt and the shirt's hem, one texture
     case 1476: return KIND_HAIR;
     case 2172: case 240: return KIND_FACE;     // its eyebrows go with the hair
     default: return KIND_NONE;
     }
 }
 
-// The look part a texel belongs to, -1 for none (it stays as it is).
-static int texel_part(int kind, const uint8_t px[4]) {
+// The look part a texel belongs to, -1 for none (it stays as it is). u v: where it is in the texture, 0-1.
+static int texel_part(int kind, const uint8_t px[4], float u, float v) {
+    (void)v;
     float r = px[0] / 255.0f, g = px[1] / 255.0f, b = px[2] / 255.0f;
     float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b)), d = hi - lo, s = hi > 0 ? d / hi : 0, h = 0;
     float l = 0.299f * r + 0.587f * g + 0.114f * b;
@@ -2948,15 +2949,18 @@ static int texel_part(int kind, const uint8_t px[4]) {
         return s < 0.3f && l > 0.35f ? COOP_LOOK_TABARD_DESIGN : -1;  // the pale pattern
     case KIND_LOWER:
         if (blue) return COOP_LOOK_SHIRT_DETAILS;
-        if (h >= 25 && h <= 70 && l > 0.5f && s < 0.45f) return 0;  // the hem: cream
-        if (h >= 25 && h < 45 && s >= 0.22f && s < 0.42f) return 0;  // (cream in shade)
-        if (h >= 45 && h <= 110 && s > 0.25f) return 2;              // trousers: olive
+        if (h >= 25 && h <= 70 && l > 0.5f && s < 0.45f) return u >= 0.5f ? 3 : 0;  // cream: the soles (right half), the hem
+        if (h >= 25 && h < 40 && s >= 0.22f && s < 0.42f) return u >= 0.5f ? 3 : 0;  // (cream in shade)
+        if (h >= 40 && h < 65 && s >= 0.35f) return 4;               // the belt: olive yellow
+        if (h >= 65 && h <= 110 && s > 0.25f) return 2;              // trousers: green
         if (s < 0.22f) return 3;                                     // boots: grey, their soles light grey
         if ((h < 40 || h > 340) && s > 0.25f && hi < 0.45f) return 3;  // (their dark brown trim)
         return -1;
-    case KIND_BELT: return 4;
+    case KIND_BUCKLE: return 4;  // (the belt's buckle: a small piece of its own on the trousers' texture)
     case KIND_HAIR: return COOP_LOOK_HAIR;
-    case KIND_FACE: return h >= 25 && h <= 55 && s > 0.38f && hi < 0.62f ? COOP_LOOK_HAIR : -1;
+    case KIND_FACE:
+        if (hi < 0.06f) return COOP_LOOK_EARRINGS;  // their patch is pure black (their blue is the shader's shine)
+        return h >= 25 && h <= 55 && s > 0.38f && hi < 0.62f ? COOP_LOOK_HAIR : -1;
     case KIND_EYES: return b > r + 0.05f ? COOP_LOOK_EYES : -1;
     default: return -1;
     }
@@ -2991,7 +2995,7 @@ static NvnTexture *recoloured_texture(bool other, int kind, NvnTexture *orig) {
     int8_t *part = malloc((size_t)w * h);
     bool any = false;
     for (uint64_t i = 0; part && i < (uint64_t)w * h; i++) {
-        int p = texel_part(kind, px + i * 4);
+        int p = texel_part(kind, px + i * 4, (float)(i % w + 0.5f) / w, (float)(i / w + 0.5f) / h);
         part[i] = (int8_t)p;
         if (p < 0) continue;
         sum[p] += 0.299f * px[i * 4] + 0.587f * px[i * 4 + 1] + 0.114f * px[i * 4 + 2];
@@ -2999,6 +3003,11 @@ static NvnTexture *recoloured_texture(bool other, int kind, NvnTexture *orig) {
         any |= set[p];
     }
     NvnTexture *copy = NULL;
+    if (getenv("LARECOMP_COOP_TEST")) {  // (what each texture of his is made of)
+        LOG("[coop] look: %s kind %d texture %p %ux%u, texels per part:", other ? "other" : "own", kind, (void *)orig, w, h);
+        for (int p = 0; p < COOP_LOOK_PARTS; p++) if (n[p]) LOG(" %d:%u%s", p, n[p], set[p] ? "*" : "");
+        LOG("\n");
+    }
     if (part && any) {
         for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
             int p = part[i];
@@ -3020,6 +3029,7 @@ static NvnTexture *recoloured_texture(bool other, int kind, NvnTexture *orig) {
 
 // The draw about to happen samples its recoloured texture, if it's one of a Link's parts with colors (other: the second
 // Link's, else this player's own).
+static uint64_t st_vertices;  // (the draw's vertex count, for the log)
 static void look_texture_swap(Prog *pr, bool other, int kind) {
     if (kind < 0) return;
     NvnTexture *best = NULL;
@@ -3031,6 +3041,15 @@ static void look_texture_swap(Prog *pr, bool other, int kind) {
     if (!best) return;
     NvnTexture *copy = recoloured_texture(other, kind, best);
     if (copy) swap_from = best, swap_to = copy;
+    if (getenv("LARECOMP_COOP_TEST")) {  // (once a part kind, each way: recognised, and whether it got its colors)
+        static uint64_t seen;
+        uint64_t bit = 1ull << ((other ? 16 : 0) + kind * 2 + (copy != NULL));
+        if (!(seen & bit)) {
+            seen |= bit;
+            LOG("[coop] look: %s kind %d (%u vertices) texture %p %ux%u: %s\n", other ? "other" : "own", kind, (uint32_t)st_vertices,
+                (void *)best, best->width, best->height, copy ? "recolored" : "no colors for it");
+        }
+    }
 }
 
 // LARECOMP_DUP_TINT_TEST: each of his parts its own colour, named in the log, to see which part is what
@@ -3548,6 +3567,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     // a co-op Link's part: its texture in its owner's colors (the second Link's, or this player's own)
     swap_from = swap_to = NULL;
+    st_vertices = r->x[2];
     if (dup_drawing) look_texture_swap(pr, true, link_kind((uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS));
     else look_texture_swap(pr, false, own_link_kind(pr, r));
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
@@ -3780,7 +3800,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             if (c < 3 || !((pr->vi->cbuf_mask >> c) & 1) || !st.ubuf[0][c - 3].addr) continue;  // (the mask counts from cbuf_base)
             const float *u = (const float *)(uintptr_t)st.ubuf[0][c - 3].addr;
             LOG("[draw]   vcb%d %llx size %u:", c - 3, (unsigned long long)st.ubuf[0][c - 3].addr, (unsigned)st.ubuf[0][c - 3].size);
-            for (int k = 0; k < 24 && k * 4 < (int)st.ubuf[0][c - 3].size; k++) LOG(" %.5g", u[k]);
+            for (int k = 0; k < 28 && k * 4 < (int)st.ubuf[0][c - 3].size; k++) LOG(" %.5g", u[k]);  // (a piece's matrix: 16-27)
             LOG("\n");
         }
         for (int b = 0; b < 3; b++) {  // the vertices themselves, for pieces the game may transform on the CPU
