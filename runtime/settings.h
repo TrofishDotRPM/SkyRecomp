@@ -1,6 +1,7 @@
 // User settings (larecomp.ini next to the executable's working directory), edited from the in-game menu.
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 
 enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
@@ -27,6 +28,16 @@ enum { GAME_BUILD_FAST = 0, GAME_BUILD_OPTIMIZED = 1 };  // the start screen's g
 enum { LANG_AUTO = 0, N_LANGUAGES = 15 };
 extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
+
+// your Link's looks: the clothes he starts in (shirt, tabard, trousers, boots, belt), the classic tunic (tunic, hat,
+// undershirt, trousers, boots, belt), then hair and eyes (whatever he wears)
+#define COOP_LOOK_PARTS 15
+#define COOP_LOOK_CLASSIC 5  // the first of the classic tunic's
+#define COOP_LOOK_HAIR 11
+#define COOP_LOOK_EYES 12
+#define COOP_LOOK_SHIRT_DETAILS 13  // the starting shirt's blue embroidery (and the hem's)
+#define COOP_LOOK_TABARD_DESIGN 14   // the pale pattern on the tabard
+#define COOP_LOOK_SET 0x1000000u
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
@@ -92,6 +103,8 @@ typedef struct {
     char coop_addr[256];   // the host's address, to join
     int coop_port;         // 0 = the default
     char coop_key[64];     // shared between the players; keeps strangers out, doesn't encrypt
+    uint32_t coop_look[COOP_LOOK_PARTS];  // your Link's clothes (COOP_LOOK_PARTS): 0xRRGGBB | COOP_LOOK_SET, or 0 for the
+                                          // game's own color. Both players see them.
 } Settings;
 
 enum { N_TUNIC_COLOURS = 13, N_HEART_COLOURS = 9 };

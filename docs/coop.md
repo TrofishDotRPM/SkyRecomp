@@ -52,6 +52,8 @@ A popup at the bottom right names what another player's progress gave you: items
 
 The other player appears as a second real Link when you're both in the same stage, with their own animations. The renderer draws your Link's model again using their bones (`runtime/hle/coop_pose.c`), about 100 ms behind, so it's hidden by walls but can't interact with anything, and has no shadow. Their equipment isn't sent: pieces your own Link isn't drawing can't appear on theirs. Until your Link has been drawn once, a simple box figure stands in. A marker shows where they are, with their distance. When they're off-screen, an arrow at the screen edge points their way. It's drawn over the picture, so it shows through walls, and it supports two players: with more, it would jump between them.
 
+Each player can color their own Link in the Co-op tab of the menu (F1): hair, eyes, and each part of the clothes he starts in, from a color wheel or common colors. Both players see them. The renderer makes copies of Link's own textures with each part recolored (told apart by their unlit colors), so shading and detail stay as they were. The classic tunic's parts aren't known yet: its colors are saved but only take effect once its textures have been mapped.
+
 ## Known gaps
 
 - **Enemies die on your next visit, not in front of you.** A kill sets the game's spawn-suppression flag, so an enemy that is already loaded stays until the room reloads. Removing it live needs a walk of the actor list, whose HD layout isn't confirmed yet. Only enemies the game tracks with a valid ID can be shared. As with the game's own flags, kills are forgotten when you leave a scene.

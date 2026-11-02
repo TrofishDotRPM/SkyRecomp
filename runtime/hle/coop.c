@@ -226,6 +226,43 @@ bool coop_my_position(float out[3]) {
     return true;
 }
 
+// ---- what each Link wears: COOP_EV_LOOK, a the part, b red | green << 8, c blue | set << 8. Sent when it changes, and
+// every few seconds for whoever joined since.
+#define COOP_EV_LOOK 9
+#define LOOK_RESEND_MS 3000
+static uint32_t g_other_look[COOP_LOOK_PARTS];
+
+static void look_send_tick(void) {
+    static uint32_t sent[COOP_LOOK_PARTS];
+    static uint64_t last;
+    uint64_t now = SDL_GetTicks();
+    bool due = now - last > LOOK_RESEND_MS;
+    for (int p = 0; p < COOP_LOOK_PARTS; p++) {
+        uint32_t v = g_settings.coop_look[p];
+        if (!due && v == sent[p]) continue;
+        CoopEvent ev = {COOP_EV_LOOK, (uint8_t)p, (uint16_t)((v >> 16 & 255) | (v >> 8 & 255) << 8),
+                        (uint16_t)((v & 255) | (v & COOP_LOOK_SET ? 1u << 8 : 0)), 0};
+        coop_net_send(&ev);
+        sent[p] = v;
+    }
+    if (due) last = now;
+}
+
+static void look_received(const CoopEvent *ev) {
+    if (ev->a >= COOP_LOOK_PARTS) return;
+    uint32_t rgb = (uint32_t)(ev->b & 255) << 16 | (uint32_t)(ev->b >> 8) << 8 | (ev->c & 255);
+    g_other_look[ev->a] = ev->c >> 8 & 1 ? rgb | COOP_LOOK_SET : 0;
+}
+
+// A part's color, 0-1, for this player's Link or the other's. false: the game's own. Any thread.
+bool coop_look(bool other, int part, float rgb[3]) {
+    if (part < 0 || part >= COOP_LOOK_PARTS) return false;
+    uint32_t v = other ? g_other_look[part] : g_settings.coop_look[part];
+    if (!(v & COOP_LOOK_SET)) return false;
+    rgb[0] = (v >> 16 & 255) / 255.0f, rgb[1] = (v >> 8 & 255) / 255.0f, rgb[2] = (v & 255) / 255.0f;
+    return true;
+}
+
 // ---- popups: what another player's progress just gave this one (drawn by runtime/ui/coop_overlay.mm)
 #define T_ITEM_TABLE 0x164a534
 #define TOAST_MS 5000
@@ -388,6 +425,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
     if (ev->type == COOP_EV_POS) { pos_received(ev); return; }
+    if (ev->type == COOP_EV_LOOK) { look_received(ev); return; }
     log_event("got", ev);
     if (ev->type == COOP_EV_SYNC) { coop_core_snapshot(&g_core); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
@@ -566,6 +604,7 @@ void coop_tick(void) {
     chest_lids_tick();
     pos_send_tick();
     pose_send_tick();
+    look_send_tick();
     int changed = 0;
     for (int r = 0; r < COOP_NREGIONS; r++)
         for (int w = 0; w < g_core.region[r].words; w++) changed += g_core.region[r].live[w] != g_core.shadow[r][w];

@@ -499,9 +499,9 @@ static void upload_pending(NvnTexture *t, TexBackend *b) {
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
-static bool upload_custom(NvnTexture *t, TexBackend *b) {
-    SDL_Surface *s = custom_tex_load(t);
-    if (!s) return false;
+// A texture's image from host pixels (RGBA8, w x h, pitch bytes a row), with mip levels made from them if it has any.
+static bool upload_pixels(NvnTexture *t, TexBackend *b, const uint8_t *pixels, int w, int h, int pitch) {
+    struct { int w, h, pitch; const void *pixels; } s_ = {w, h, pitch, pixels}, *s = &s_;
     bool srgb = (t->format >= 0x87 && t->format <= 0x94) ||
                 (t->format >= 0x45 && t->format <= 0x48) || t->format == 0x4e || t->format == 0x9b;
     VkFormat format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
@@ -520,7 +520,7 @@ static bool upload_custom(NvnTexture *t, TexBackend *b) {
     }
     if (result != VK_SUCCESS) {
         LOG("[custom_tex] GPU allocation failed (%d), keeping original %ux%u texture\n", result, t->width, t->height);
-        SDL_DestroySurface(s); return false;
+        return false;
     }
     VkSpan span = vk_transient((uint64_t)s->w * s->h * 4, 16);
     for (int y = 0; y < s->h; y++) memcpy((uint8_t *)span.ptr + (size_t)y * s->w * 4, (uint8_t *)s->pixels + (size_t)y * s->pitch, (size_t)s->w * 4);
@@ -548,8 +548,64 @@ static bool upload_custom(NvnTexture *t, TexBackend *b) {
         vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
     }
     vkCmdPipelineBarrier2(cb, &dep);
-    SDL_DestroySurface(s);
     return true;
+}
+
+static bool upload_custom(NvnTexture *t, TexBackend *b) {
+    SDL_Surface *s = custom_tex_load(t);
+    if (!s) return false;
+    bool ok = upload_pixels(t, b, (const uint8_t *)s->pixels, s->w, s->h, s->pitch);
+    SDL_DestroySurface(s);
+    return ok;
+}
+
+// ---- for co-op (exec.c): a game texture's first level as RGBA8, and a texture of the renderer's own from RGBA8 (another
+// player's Link in his own colors). ASTC (as Link's are) and plain RGBA8 only.
+uint8_t *vk_texture_decode(NvnTexture *t, uint32_t *w, uint32_t *h) {
+    if (!t || !t->addr || !t->width || !t->height) return NULL;
+    const FormatInfo *fi = nvn_format_info(t->format);
+    if (!fi) return NULL;
+    TexLayout layout = t->layout;
+    layout.fmt = fi;
+    LevelLayout l = tegra_level(&layout, 0);
+    const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + l.offset;
+    uint8_t *rgba = malloc((uint64_t)l.w * l.h * 4);
+    if (!rgba) return NULL;
+    bool linear = (t->flags & 0x10) != 0;
+    if (fi->bpb == 16 && fi->bw > 1) {  // ASTC
+        uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
+        if (!blocks) { free(rgba); return NULL; }
+        if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, (size_t)l.wb * 16);
+        else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+        astc_decode_ldr(blocks, l.w, l.h, fi->bw, fi->bh, false, rgba);
+        free(blocks);
+    } else if (fi->bpb == 4 && fi->bw == 1) {
+        if (linear) for (uint32_t y = 0; y < l.h; y++) memcpy(rgba + (uint64_t)y * l.w * 4, src + (uint64_t)y * t->stride, (size_t)l.w * 4);
+        else tegra_deswizzle(src, rgba, l.w, l.h, 1, 4, l.block_height_log2, l.block_depth_log2);
+    } else {
+        free(rgba);
+        return NULL;
+    }
+    *w = l.w, *h = l.h;
+    return rgba;
+}
+
+NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    NvnTexture *t = calloc(1, sizeof *t);
+    TexBackend *b = calloc(1, sizeof *b);
+    if (!t || !b) { free(t); free(b); return NULL; }
+    *t = *like;
+    t->backend = b, t->pending_rgba = NULL, t->video_uploaded = false;
+    b->gpu_owned = true, b->uploaded = true;  // (never read from game memory: what's uploaded here stays)
+    if (!upload_pixels(t, b, rgba, (int)w, (int)h, (int)w * 4)) { free(b); free(t); return NULL; }
+    return t;
+}
+
+void vk_texture_free(NvnTexture *t) {
+    if (!t) return;
+    TexBackend *b = t->backend;
+    if (b) { destroy_image(b); free(b); }  // (its views go with it, deferred)
+    free(t);
 }
 
 static void upload_texture(NvnTexture *t, TexBackend *b) {

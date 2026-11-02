@@ -828,6 +828,7 @@ extern "C" void tracker_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" bool chaos_overlay_wanted(void);
 extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" void coop_overlay_draw(ImVec2 display, ImFont *font, ImFont *label_font);
+extern "C" void coop_menu_draw(float scale);  // runtime/ui/coop_menu.mm
 extern "C" bool coop_overlay_wanted(void);
 extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
 
@@ -903,12 +904,12 @@ extern void tab_mods(float scale);
 static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     // (id: the page; -1 = Prelaunch)
     struct Tab { const char *name; int id; bool on; };
-    Tab tabs[12];
+    Tab tabs[13];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
-                                  "Cosmetics", "Controls", "Quit", "Mods"};
-    static const int order[] = {8, 0, 1, 6, 5, 9};  // Controls, Video, Audio, Gameplay, Cheats, Quit (Mods: hidden for now)
+                                  "Cosmetics", "Controls", "Quit", "Mods", "Co-op"};
+    static const int order[] = {8, 0, 1, 6, 11, 5, 9};  // Controls, Video, Audio, Gameplay, Co-op, Cheats, Quit (Mods: hidden for now)
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -991,6 +992,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 5: cheats_draw(scale); break;
                 case 8: tab_about(); break;
                 case 10: tab_mods(scale); break;
+                case 11: coop_menu_draw(scale); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
@@ -1100,10 +1102,17 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (open) {
-        // dim the game behind the menu
-        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
+        // dim the game behind the menu. The Co-op page instead keeps to the left, undimmed: Link, in the middle of the
+        // picture, shows the colors being picked for him.
+        const bool preview = g_tab == 11;
+        if (!preview) ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
         float w = fminf(io.DisplaySize.x * 0.9f, 1500 * scale), h = io.DisplaySize.y - 2 * 18 * scale;  // (all the height: a slim margin)
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        if (preview) {
+            w = fmaxf(io.DisplaySize.x * 0.40f, fminf(io.DisplaySize.x - 80 * scale, 620 * scale));
+            ImGui::SetNextWindowPos(ImVec2(40 * scale, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0, 0.5f));
+        } else {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        }
         ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
         ImGui::Begin("##menu", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
         ImFont *keep_big = g_font_big;  // (the window in the menu's font; header() uses g_font_big)

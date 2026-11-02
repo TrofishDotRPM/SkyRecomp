@@ -1788,12 +1788,15 @@ typedef struct { NvnTexture *key; TexBackend copy; } Snap;
 static Snap snaps[16];
 static int nsnaps;
 
+static NvnTexture *swap_from, *swap_to;  // (see look_texture_swap)
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    if (stage == 1 && t && t == swap_from) return swap_to;  // (a co-op Link in his own colors: look_texture_swap)
+    return t;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -2663,6 +2666,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             // contents within the same frame. Cache the resolved source, not
             // the destination object (otherwise a shadow lookup can reuse old depth).
             NvnTexture *read_tex = naliases ? alias_read(e->tex) : e->tex;
+            if (stage == 1 && swap_to && read_tex == swap_from) read_tex = swap_to;  // (a co-op Link's colors: look_texture_swap)
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)read_tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == read_tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
@@ -2897,6 +2901,164 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 static void draw_(CmdRec *r, bool indexed);
 static void linear_rt_writeback(void);
 static Prog *dup_program(void);
+// ---- the second Link's colours: the renderer's per-draw tint (shaders that write colour read it: maxwell/translate.c),
+// colour.rgb and strength, then glow.rgb and the power the brightness is raised to. Set only while one of his parts draws.
+static float dup_tint[8];
+static bool dup_tint_on;
+static bool dup_drawing;  // a draw of the second Link: never this player's own colors, even in his parts it leaves as they are
+
+extern bool coop_look(bool other, int part, float rgb[3]);
+
+// ---- Link's looks by his textures: each of his parts samples one main texture (ASTC); a copy of it is made with each
+// part of it in its owner's color (the clothes he starts in, a capture 2026-11-02: what of each texture is which part,
+// told by its unlit color). The draw then samples the copy (shader_texture_object). Recoloured relative to each part's own
+// average brightness in the texture, so the painted shading and detail stay as they were.
+extern uint8_t *vk_texture_decode(NvnTexture *t, uint32_t *w, uint32_t *h);
+extern NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, uint32_t w, uint32_t h);
+extern void vk_texture_free(NvnTexture *t);
+enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BELT, KIND_HAIR, KIND_FACE, KIND_EYES };
+
+static int link_kind(uint32_t vertices, bool rigid) {
+    if (rigid) return vertices == 216 ? KIND_BELT : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
+    switch (vertices) {
+    case 3162: return KIND_SHIRT;              // (12: the collar band, its own small texture)
+    case 684: return KIND_TABARD;
+    case 2664: case 948: return KIND_LOWER;    // trousers, boots and the shirt's hem, one texture
+    case 1476: return KIND_HAIR;
+    case 2172: case 240: return KIND_FACE;     // its eyebrows go with the hair
+    default: return KIND_NONE;
+    }
+}
+
+// The look part a texel belongs to, -1 for none (it stays as it is).
+static int texel_part(int kind, const uint8_t px[4]) {
+    float r = px[0] / 255.0f, g = px[1] / 255.0f, b = px[2] / 255.0f;
+    float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b)), d = hi - lo, s = hi > 0 ? d / hi : 0, h = 0;
+    float l = 0.299f * r + 0.587f * g + 0.114f * b;
+    if (d > 0) {
+        h = hi == r ? fmodf((g - b) / d, 6) : hi == g ? (b - r) / d + 2 : (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+    }
+    bool blue = h >= 170 && h <= 250 && s > 0.3f;
+    switch (kind) {
+    case KIND_SHIRT: return blue ? COOP_LOOK_SHIRT_DETAILS : 0;
+    case KIND_TABARD:
+        if ((h < 25 || h > 330) && s > 0.35f) return 1;            // its red
+        return s < 0.3f && l > 0.35f ? COOP_LOOK_TABARD_DESIGN : -1;  // the pale pattern
+    case KIND_LOWER:
+        if (blue) return COOP_LOOK_SHIRT_DETAILS;
+        if (h >= 25 && h <= 70 && l > 0.5f && s < 0.45f) return 0;  // the hem: cream
+        if (h >= 25 && h < 45 && s >= 0.22f && s < 0.42f) return 0;  // (cream in shade)
+        if (h >= 45 && h <= 110 && s > 0.25f) return 2;              // trousers: olive
+        if (s < 0.22f) return 3;                                     // boots: grey, their soles light grey
+        if ((h < 40 || h > 340) && s > 0.25f && hi < 0.45f) return 3;  // (their dark brown trim)
+        return -1;
+    case KIND_BELT: return 4;
+    case KIND_HAIR: return COOP_LOOK_HAIR;
+    case KIND_FACE: return h >= 25 && h <= 55 && s > 0.38f && hi < 0.62f ? COOP_LOOK_HAIR : -1;
+    case KIND_EYES: return b > r + 0.05f ? COOP_LOOK_EYES : -1;
+    default: return -1;
+    }
+}
+
+typedef struct { NvnTexture *orig, *copy; uint64_t addr, key, used; } Recoloured;
+#define RECOLOURED 32
+static Recoloured recoloured[RECOLOURED];
+
+// This texture of Link's, in one player's colors: NULL if none of its parts has a color of theirs.
+static NvnTexture *recoloured_texture(bool other, int kind, NvnTexture *orig) {
+    float rgb[COOP_LOOK_PARTS][3];
+    bool set[COOP_LOOK_PARTS];
+    uint64_t key = 1469598103934665603ull ^ (uint64_t)kind;
+    for (int p = 0; p < COOP_LOOK_PARTS; p++) {
+        set[p] = coop_look(other, p, rgb[p]);
+        uint32_t v = set[p] ? (uint32_t)(rgb[p][0] * 255) << 16 | (uint32_t)(rgb[p][1] * 255) << 8 | (uint32_t)(rgb[p][2] * 255) | 1u << 24 : 0;
+        key = (key ^ v) * 1099511628211ull;
+    }
+    const uint64_t frame = renderer_present_count();
+    int slot = -1;
+    for (int i = 0; i < RECOLOURED; i++) {
+        Recoloured *e = &recoloured[i];
+        if (e->orig == orig && e->addr == orig->addr && e->key == key) { e->used = frame; return e->copy; }
+        if (slot < 0 || e->used < recoloured[slot].used) slot = i;
+    }
+    uint32_t w, h;
+    uint8_t *px = vk_texture_decode(orig, &w, &h);
+    if (!px) return NULL;
+    double sum[COOP_LOOK_PARTS] = {0};
+    uint32_t n[COOP_LOOK_PARTS] = {0};
+    int8_t *part = malloc((size_t)w * h);
+    bool any = false;
+    for (uint64_t i = 0; part && i < (uint64_t)w * h; i++) {
+        int p = texel_part(kind, px + i * 4);
+        part[i] = (int8_t)p;
+        if (p < 0) continue;
+        sum[p] += 0.299f * px[i * 4] + 0.587f * px[i * 4 + 1] + 0.114f * px[i * 4 + 2];
+        n[p]++;
+        any |= set[p];
+    }
+    NvnTexture *copy = NULL;
+    if (part && any) {
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+            int p = part[i];
+            if (p < 0 || !set[p] || !n[p]) continue;
+            uint8_t *q = px + i * 4;
+            float mean = (float)(sum[p] / n[p]), l = 0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2];
+            float k = mean > 1 ? fminf(l / mean, 2.5f) : 1;
+            for (int c = 0; c < 3; c++) q[c] = (uint8_t)fminf(255, rgb[p][c] * 255 * k + 0.5f);
+        }
+        copy = vk_texture_from_rgba(orig, px, w, h);
+    }
+    free(part);
+    free(px);
+    Recoloured *e = &recoloured[slot];
+    vk_texture_free(e->copy);
+    *e = (Recoloured){orig, copy, orig->addr, key, frame};
+    return copy;
+}
+
+// The draw about to happen samples its recoloured texture, if it's one of a Link's parts with colors (other: the second
+// Link's, else this player's own).
+static void look_texture_swap(Prog *pr, bool other, int kind) {
+    if (kind < 0) return;
+    NvnTexture *best = NULL;
+    for (int i = 0; i < pr->fi->ntex; i++) {  // his main texture: the largest ASTC one
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->format < 0x79 || t->format > 0x84) continue;
+        if (!best || (uint64_t)t->width * t->height > (uint64_t)best->width * best->height) best = t;
+    }
+    if (!best) return;
+    NvnTexture *copy = recoloured_texture(other, kind, best);
+    if (copy) swap_from = best, swap_to = copy;
+}
+
+// LARECOMP_DUP_TINT_TEST: each of his parts its own colour, named in the log, to see which part is what
+static void dup_tint_for(uint32_t vertices, bool rigid) {
+    static int test = -1;
+    if (test < 0) test = getenv("LARECOMP_DUP_TINT_TEST") != NULL;
+    dup_tint_on = false;
+    if (!test) return;  // (his colors: his textures, look_texture_swap)
+    static const struct { const char *name; float rgb[3]; } COLOURS[] = {
+        {"red", {1, 0.1f, 0.1f}}, {"green", {0.1f, 1, 0.1f}}, {"blue", {0.15f, 0.3f, 1}}, {"yellow", {1, 0.9f, 0.1f}},
+        {"magenta", {1, 0.1f, 0.9f}}, {"cyan", {0.1f, 1, 1}}, {"orange", {1, 0.5f, 0.05f}}, {"purple", {0.5f, 0.1f, 1}},
+        {"black", {0, 0, 0}}, {"white", {1, 1, 1}}};
+    const int n = (int)(sizeof COLOURS / sizeof *COLOURS);
+    static uint32_t seen[64];
+    static int nseen;
+    uint32_t key = vertices * 2 + rigid;
+    int i = 0;
+    while (i < nseen && seen[i] != key) i++;
+    if (i == nseen && nseen < 64) {
+        seen[nseen++] = key;
+        LOG("[coop] tint test: %s part of %u vertices is %s\n", rigid ? "rigid" : "skinned", vertices, COLOURS[i % n].name);
+    }
+    const float *c = COLOURS[i % n].rgb;
+    const float t[8] = {c[0], c[1], c[2], 1, 0, 0, 0, 1};
+    memcpy(dup_tint, t, sizeof t);
+    dup_tint_on = true;
+}
+
 // ---- Link as last seen. The game doesn't draw him in first person, or in some scenes, and then there'd be nothing to
 // repeat: each of his draws is kept, with all its state and a copy of the buffers it reads, to draw from instead.
 #define KEEP_PARTS 48
@@ -2973,11 +3135,39 @@ static void link_replay(void) {
                              rots && rots->addr && rots->size == bones->size ? (float *)(uintptr_t)rots->addr : NULL, k->nbones, view))
             continue;
         guest_copy_flush();  // (same addresses as last time, different contents)
+        dup_tint_for(k->vertices, !k->skinned);
+        dup_drawing = true;
         draw_((CmdRec *)k->record, k->indexed);
+        dup_drawing = dup_tint_on = false;
     }
     st = saved;
     ss_forget();
     active = false;
+}
+
+// Where in memory Link's model is (dup_link), and whether a draw about to happen is one of his parts: the same tests as
+// dup_link, before the draw, to paint his clothes. (This player's own Link: the camera's, no duplicate involved.)
+static uint64_t link_lo = ~0ull, link_hi;
+static int own_link_kind(Prog *pr, CmdRec *r) {
+    if (!g_is_skyward || !in_pass || !pr || !st.rt.depth) return KIND_NONE;
+    bool skinned = pr->vi->cbuf_mask == LINK_CBUFS;
+    if (!skinned && !(pr->vi->cbuf_mask == LINK_RIGID_CBUFS && st.ds[1])) return KIND_NONE;
+    uint32_t vertices = (uint32_t)r->x[2];
+    int kind = link_kind(vertices, !skinned);
+    if (kind < 0) return KIND_NONE;
+    const Range *bones = &st.ubuf[0][skinned ? 3 : 0];
+    const uint32_t first = skinned ? 0 : 16;
+    if (!bones->addr || bones->size < (first + 12) * 4) return KIND_NONE;
+    if (!skinned && (!link_hi || st.vbuf[0].addr + LINK_MODEL_SLACK < link_lo || st.vbuf[0].addr > link_hi + LINK_MODEL_SLACK)) return KIND_NONE;
+    float me[3];
+    if (!coop_my_position(me)) return KIND_NONE;
+    const float *src = (const float *)(uintptr_t)bones->addr + first, *view = (const float *)(uintptr_t)0x7005b30e78ull;
+    float d2 = 0;
+    for (int i = 0; i < 3; i++) {
+        float d = src[i * 4 + 3] - (view[i * 4] * me[0] + view[i * 4 + 1] * me[1] + view[i * 4 + 2] * me[2] + view[i * 4 + 3]);
+        d2 += d * d;
+    }
+    return d2 <= LINK_BONES_NEAR * LINK_BONES_NEAR ? kind : KIND_NONE;
 }
 
 static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
@@ -2999,18 +3189,18 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > LINK_BONES_NEAR * LINK_BONES_NEAR) return;  // not Link
     // Near him isn't enough: save statues, villagers. His model is loaded in one place, so what else is his has its vertices
     // close to those of his big meshes, which nothing else has this many bones for. (Last frame's: pieces can come first.)
-    static uint64_t range_frame = ~0ull, lo = ~0ull, hi, next_lo = ~0ull, next_hi;
+    static uint64_t range_frame = ~0ull, next_lo = ~0ull, next_hi;
     uint64_t this_frame = renderer_present_count();
     if (this_frame != range_frame) {
         range_frame = this_frame;
-        if (next_hi) lo = next_lo, hi = next_hi;
+        if (next_hi) link_lo = next_lo, link_hi = next_hi;
         next_lo = ~0ull, next_hi = 0;
     }
     const uint64_t vb = st.vbuf[0].addr;
     if (skinned && bones->size >= LINK_BIG_MESH_BYTES) {
         if (vb < next_lo) next_lo = vb;
         if (vb > next_hi) next_hi = vb;
-    } else if (!hi || vb + LINK_MODEL_SLACK < lo || vb > hi + LINK_MODEL_SLACK) {
+    } else if (!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) {
         return;
     }
     dup_seen_frame = renderer_present_count();
@@ -3068,7 +3258,10 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     static bool active;
     if (!active) {
         active = true;
+        dup_tint_for(vertices, !skinned);
+        dup_drawing = true;
         draw_(r, indexed);
+        dup_drawing = dup_tint_on = false;
         active = false;
     }
     *bones = saved;
@@ -3351,7 +3544,12 @@ static void draw_(CmdRec *r, bool indexed) {
             int u = bottle == 3 ? 3 : 0;  // (the fairy model: its bone matrices, for where it stands - souls.c)
             escape_bottle_tint(bottle, (const float *)(uintptr_t)st.ubuf[0][u].addr, (uint32_t)st.ubuf[0][u].size, tint);
         }
+        if (dup_tint_on) memcpy(tint, dup_tint, sizeof tint);  // (LARECOMP_DUP_TINT_TEST)
     }
+    // a co-op Link's part: its texture in its owner's colors (the second Link's, or this player's own)
+    swap_from = swap_to = NULL;
+    if (dup_drawing) look_texture_swap(pr, true, link_kind((uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS));
+    else look_texture_swap(pr, false, own_link_kind(pr, r));
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
