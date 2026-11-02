@@ -1,11 +1,12 @@
-// Co-op enemies driven by the host (bats so far). The host sends, for each live bat, where it is, which way it faces, its
-// AI state and its animation; a joining player's bats take those just before each of their updates, so they fly where the
-// host's fly, doing what they do. Their own update still runs after (it places their model), from the host's state.
+// Co-op enemies driven by the host (bats and chuchus so far). The host sends, for each live one, where it is, which way it
+// faces, its size, its AI state and its animation; a joining player's take those just before each of their updates, so
+// they move where the host's move, doing what they do. Their own update still runs after (it places their model), from the
+// host's state.
 //
-// dAcEKs_c as laid out in 1.0.0, found by watching bats wake and fly: its update is vtable slot 20 (skipped, the bat isn't
-// even drawn); rotation 3 x s16 at +0x13c, position at +0x144; its state machine's state pointers at +0xcd8 / +0xd00 /
-// +0xd08 / +0xd10 (StateID objects, the same in every copy of the game); its animation's resource at +0x548 and frame at
-// +0x538 (loaded at the same address in every copy so far). An enemy is known by its profile and defeat flag (+0x136).
+// As laid out in 1.0.0, found by watching them wake, rise and move (TYPES below): the update is vtable slot 20 (skipped, one
+// isn't even drawn); rotation 3 x s16 at +0x13c, position at +0x144, scale at +0x150; the state machine's state pointers
+// (StateID objects, the same in every copy of the game); the animation's last and first frame, frame, mode and resource
+// (loaded at the same address in every copy so far). An enemy is known by its profile and defeat flag (+0x136).
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <pthread.h>
@@ -16,9 +17,21 @@
 #include "../hle.h"
 #include "coop_enemy.h"
 
-#define BAT_VTABLE 0x700157de18ull
-#define BAT_PROFILE 0x16d
-#define BAT_UPDATE_SLOT 20
+#define UPDATE_SLOT 20
+typedef struct {
+    const char *name;
+    uint16_t profile;
+    uint64_t vtable;
+    int state[4];  // its state machine's state pointers
+    int anim;      // its animation: last frame f32, first frame f32, frame f32, mode u32, then (+0x18) its resource
+    int extra;     // another animation resource it changes (0: none)
+    int words[3];  // u32s copied as they are (0: none): a chuchu's are whether it's shown, once risen out of the ground
+} EnemyType;
+static const EnemyType TYPES[] = {
+    {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}},
+    {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}},
+};
+#define NTYPES (int)(sizeof TYPES / sizeof *TYPES)
 #define PLAYER_PTR 0x7001826AD0ull
 #define PLAYER_VTABLE 0x7001637D28ull
 #define ACTOR_PROFILE 0x10
@@ -27,12 +40,12 @@
 #define ENEMY_FLAG 0x136
 #define ACTOR_ROT 0x13c
 #define ACTOR_POS 0x144
-static const int STATE_OFFS[4] = {0xcd8, 0xd00, 0xd08, 0xd10};
-#define ANIM_RES 0x548
-#define ANIM_END 0x530    // f32: the animation's last frame
-#define ANIM_START 0x534  // f32
-#define ANIM_FRAME 0x538
-#define ANIM_MODE 0x53c   // u32 (once or looping, as the animation was set)
+#define ACTOR_SCALE 0x150
+#define ANIM_END 0x0      // (from the type's anim) f32: the animation's last frame
+#define ANIM_START 0x4    // f32
+#define ANIM_FRAME 0x8
+#define ANIM_MODE 0xc     // u32 (once or looping, as the animation was set)
+#define ANIM_RES 0x18
 
 #define MAX_ENEMIES 64
 #define SEND_MS 33
@@ -41,15 +54,15 @@ static const int STATE_OFFS[4] = {0xcd8, 0xd00, 0xd08, 0xd10};
 
 typedef struct {
     uint16_t profile, flag;
-    float pos[3];
+    float pos[3], scale[3];
     int16_t rot[3];
-    uint64_t state[4], anim;
+    uint64_t state[4], anim, extra;
     float frame, end, start;
-    uint32_t mode;
+    uint32_t mode, words[3];
 } Snap;
 
 // ---- wire: kind byte (COOP_BLOB_ENEMIES), stage u8, count u8, then count Snaps packed little-endian
-#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12)
+#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12)
 
 typedef struct { uint64_t at; uint8_t stage; int n; Snap s[MAX_ENEMIES]; } Frame;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -58,7 +71,29 @@ static Frame g_frames[RING];  // the latest from the host, oldest first
 static int g_nframes;
 static bool g_puppets;     // this player's bats follow the host's
 static uint8_t (*g_stage)(void);
-static GuestFn g_bat_update;
+static GuestFn g_update[NTYPES];
+// Enemies this player hurt: let go, so they're hurt and die here as the game has them (then their defeat flag goes to the
+// host as any kill does, and theirs is removed). Until this player's enemies are set to follow again.
+#define MAX_RELEASED 64
+static struct { uint16_t profile, flag; } g_released[MAX_RELEASED];
+static int g_nreleased;
+
+static bool released(uint16_t profile, uint16_t flag) {
+    for (int i = 0; i < g_nreleased; i++)
+        if (g_released[i].profile == profile && g_released[i].flag == flag) return true;
+    return false;
+}
+
+// Whether a state is one of being hurt or dying, by its name (dAcEKs_c::StateID_Damage, ...).
+static bool hurt_state(uint64_t st) {
+    if (st < 0x7001000000ull || st >= 0x7002000000ull) return false;
+    uint64_t name = *(uint64_t *)(uintptr_t)(st + 8);
+    if (name < 0x7001000000ull || name >= 0x7002000000ull) return false;
+    const char *n = strstr((const char *)(uintptr_t)name, "StateID_");
+    if (!n) return false;
+    n += 8;
+    return strstr(n, "Damage") || strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill");
+}
 
 static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
 
@@ -70,11 +105,13 @@ static const Snap *find(const Frame *f, uint16_t profile, uint16_t flag) {
 
 static int16_t lerp_angle(int16_t a, int16_t b, float t) { return (int16_t)(a + (int16_t)(b - a) * t); }
 
-// A bat's update, on a player whose bats follow the host's: the host's where, which way, state and animation first.
-static void bat_update(Cpu *c) {
+// An enemy's update, on a player whose enemies follow the host's: the host's where, which way, size, state and animation first.
+static void puppet_update(int ty, Cpu *c) {
+    const EnemyType *T = &TYPES[ty];
     uint64_t self = c->x[0];
-    if (g_puppets && guest_ptr(self) && *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) == BAT_PROFILE) {
-        uint16_t flag = *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG);
+    bool driven = false, host_hurt = false;
+    uint16_t flag = guest_ptr(self) ? *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG) : 0;
+    if (g_puppets && guest_ptr(self) && *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) == T->profile && !released(T->profile, flag)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
         // The two either side of the moment shown (DELAY_MS ago); before the first or past the last, that one alone
@@ -82,45 +119,75 @@ static void bat_update(Cpu *c) {
         int later = g_nframes - 1, earlier = g_nframes - 1;
         for (int i = 0; i < g_nframes; i++)
             if (g_frames[i].at >= now - DELAY_MS) { later = i, earlier = i ? i - 1 : i; break; }
-        const Snap *b = last ? find(&g_frames[later], BAT_PROFILE, flag) : NULL, *a = NULL;
+        const Snap *b = last ? find(&g_frames[later], T->profile, flag) : NULL, *a = NULL;
         bool ok = b && now - last->at < STALE_MS && g_stage && last->stage == g_stage();
         if (ok) {
             float t = 1;
-            if (earlier != later && (a = find(&g_frames[earlier], BAT_PROFILE, flag))) {
+            if (earlier != later && (a = find(&g_frames[earlier], T->profile, flag))) {
                 t = (float)((int64_t)(now - DELAY_MS) - (int64_t)g_frames[earlier].at) / (float)(g_frames[later].at - g_frames[earlier].at);
                 t = t < 0 ? 0 : t > 1 ? 1 : t;
             } else {
                 a = b;
             }
-            float *pos = (float *)(uintptr_t)(self + ACTOR_POS);
+            float *pos = (float *)(uintptr_t)(self + ACTOR_POS), *scale = (float *)(uintptr_t)(self + ACTOR_SCALE);
             int16_t *rot = (int16_t *)(uintptr_t)(self + ACTOR_ROT);
-            for (int k = 0; k < 3; k++) pos[k] = a->pos[k] + (b->pos[k] - a->pos[k]) * t, rot[k] = lerp_angle(a->rot[k], b->rot[k], t);
-            for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + STATE_OFFS[k]) = b->state[k];
-            if (b->anim == 0 || guest_ptr(b->anim)) *(uint64_t *)(uintptr_t)(self + ANIM_RES) = b->anim;
+            for (int k = 0; k < 3; k++) {
+                pos[k] = a->pos[k] + (b->pos[k] - a->pos[k]) * t, rot[k] = lerp_angle(a->rot[k], b->rot[k], t);
+                scale[k] = a->scale[k] + (b->scale[k] - a->scale[k]) * t;
+            }
+            for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
+            uint64_t an = self + T->anim;
+            if (b->anim == 0 || guest_ptr(b->anim)) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
+            if (T->extra && (b->extra == 0 || guest_ptr(b->extra))) *(uint64_t *)(uintptr_t)(self + T->extra) = b->extra;
             // (its length and mode with it: played with the last one's, the new one stops at the old end)
-            *(float *)(uintptr_t)(self + ANIM_END) = b->end;
-            *(float *)(uintptr_t)(self + ANIM_START) = b->start;
-            *(uint32_t *)(uintptr_t)(self + ANIM_MODE) = b->mode;
+            *(float *)(uintptr_t)(an + ANIM_END) = b->end;
+            *(float *)(uintptr_t)(an + ANIM_START) = b->start;
+            *(uint32_t *)(uintptr_t)(an + ANIM_MODE) = b->mode;
+            for (int k = 0; k < 3; k++)
+                if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = b->words[k];
             bool same = a->anim == b->anim && a->end == b->end && b->frame >= a->frame;  // (not across a change or a wrap)
-            *(float *)(uintptr_t)(self + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+            *(float *)(uintptr_t)(an + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+            driven = true;
+            host_hurt = hurt_state(b->state[1]);
         }
         pthread_mutex_unlock(&g_lock);
     }
-    g_bat_update(c);
+    // Its own update, with Link where the host's Link is: what it reacts to (waking, chasing) is then what the host's did, and
+    // it doesn't start reacting to this player's Link only to be put back next frame (stuck on the first frame of waking).
+    float other[3], saved[3];
+    uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    bool swap = driven && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE && coop_other_feet(other);
+    if (swap) memcpy(saved, (const void *)(uintptr_t)(pl + ACTOR_POS), 12), memcpy((void *)(uintptr_t)(pl + ACTOR_POS), other, 12);
+    g_update[ty](c);
+    if (swap) memcpy((void *)(uintptr_t)(pl + ACTOR_POS), saved, 12);
+    // Hurt here (this player's sword, not the host's state): from now on it's this player's to finish off
+    if (driven && !host_hurt && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_nreleased < MAX_RELEASED) {
+        pthread_mutex_lock(&g_lock);
+        g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = flag;
+        g_nreleased++;
+        pthread_mutex_unlock(&g_lock);
+        LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now\n", T->name, flag);
+    }
 }
+static void update_0(Cpu *c) { puppet_update(0, c); }
+static void update_1(Cpu *c) { puppet_update(1, c); }
+static const HostFn UPDATES[NTYPES] = {update_0, update_1};
 
 void coop_enemy_init(uint8_t (*stage)(void)) {
     g_stage = stage;
-    uint64_t fn = ((const uint64_t *)(uintptr_t)BAT_VTABLE)[BAT_UPDATE_SLOT];
-    g_bat_update = dispatch_lookup(fn);
-    if (!g_bat_update) { LOG("[coop] enemies: the bat's update isn't where it was (%llx)\n", (unsigned long long)fn); return; }
-    hle_override(fn, bat_update, "coop bat update");
+    for (int ty = 0; ty < NTYPES; ty++) {
+        uint64_t fn = ((const uint64_t *)(uintptr_t)TYPES[ty].vtable)[UPDATE_SLOT];
+        g_update[ty] = dispatch_lookup(fn);
+        if (!g_update[ty]) { LOG("[coop] enemies: the %s's update isn't where it was (%llx)\n", TYPES[ty].name, (unsigned long long)fn); continue; }
+        hle_override(fn, UPDATES[ty], "coop enemy update");
+    }
 }
 
 void coop_enemy_set_puppets(bool on) {
     pthread_mutex_lock(&g_lock);
     g_puppets = on;
     g_nframes = 0;
+    g_nreleased = 0;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -144,18 +211,28 @@ int coop_enemy_take(uint8_t *out, int cap) {
     int count = 0;
     for (int i = 0; i < 8192 && guest_ptr(n) && count < MAX_ENEMIES; i++, n = *(uint64_t *)(uintptr_t)n) {
         uint64_t a = *(uint64_t *)(uintptr_t)(n + 16);
-        if (!guest_ptr(a) || *(uint16_t *)(uintptr_t)(a + ACTOR_PROFILE) != BAT_PROFILE || *(uint8_t *)(uintptr_t)(a + ACTOR_LIFE) != 1) continue;
+        if (!guest_ptr(a) || *(uint8_t *)(uintptr_t)(a + ACTOR_LIFE) != 1) continue;
+        uint16_t prof = *(uint16_t *)(uintptr_t)(a + ACTOR_PROFILE);
+        const EnemyType *T = NULL;
+        for (int ty = 0; ty < NTYPES && !T; ty++)
+            if (TYPES[ty].profile == prof) T = &TYPES[ty];
+        if (!T) continue;
         Snap s;
-        s.profile = BAT_PROFILE, s.flag = *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG);
+        s.profile = prof, s.flag = *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG);
         memcpy(s.pos, (const void *)(uintptr_t)(a + ACTOR_POS), 12);
+        memcpy(s.scale, (const void *)(uintptr_t)(a + ACTOR_SCALE), 12);
         memcpy(s.rot, (const void *)(uintptr_t)(a + ACTOR_ROT), 6);
-        for (int k = 0; k < 4; k++) s.state[k] = *(uint64_t *)(uintptr_t)(a + STATE_OFFS[k]);
-        s.anim = *(uint64_t *)(uintptr_t)(a + ANIM_RES);
-        s.frame = *(float *)(uintptr_t)(a + ANIM_FRAME);
-        s.end = *(float *)(uintptr_t)(a + ANIM_END), s.start = *(float *)(uintptr_t)(a + ANIM_START);
-        s.mode = *(uint32_t *)(uintptr_t)(a + ANIM_MODE);
+        for (int k = 0; k < 4; k++) s.state[k] = *(uint64_t *)(uintptr_t)(a + T->state[k]);
+        uint64_t an = a + T->anim;
+        s.anim = *(uint64_t *)(uintptr_t)(an + ANIM_RES);
+        s.extra = T->extra ? *(uint64_t *)(uintptr_t)(a + T->extra) : 0;
+        s.frame = *(float *)(uintptr_t)(an + ANIM_FRAME);
+        s.end = *(float *)(uintptr_t)(an + ANIM_END), s.start = *(float *)(uintptr_t)(an + ANIM_START);
+        s.mode = *(uint32_t *)(uintptr_t)(an + ANIM_MODE);
+        for (int k = 0; k < 3; k++) s.words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(a + T->words[k]) : 0;
         put(&w, &s.profile, 2), put(&w, &s.flag, 2), put(&w, s.pos, 12), put(&w, s.rot, 6), put(&w, s.state, 32);
         put(&w, &s.anim, 8), put(&w, &s.frame, 4), put(&w, &s.end, 4), put(&w, &s.start, 4), put(&w, &s.mode, 4);
+        put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12);
         count++;
     }
     if (!count) return 0;
@@ -177,9 +254,12 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         memcpy(&s.profile, r, 2), memcpy(&s.flag, r + 2, 2), memcpy(s.pos, r + 4, 12), memcpy(s.rot, r + 16, 6);
         memcpy(s.state, r + 22, 32), memcpy(&s.anim, r + 54, 8), memcpy(&s.frame, r + 62, 4);
         memcpy(&s.end, r + 66, 4), memcpy(&s.start, r + 70, 4), memcpy(&s.mode, r + 74, 4);
+        memcpy(s.scale, r + 78, 12), memcpy(&s.extra, r + 90, 8), memcpy(s.words, r + 98, 12);
         r += SNAP_BYTES;
-        bool sane = isfinite(s.pos[0]) && isfinite(s.pos[1]) && isfinite(s.pos[2]) && isfinite(s.frame) && isfinite(s.end) &&
-                    isfinite(s.start) && s.mode <= 1 && s.profile == BAT_PROFILE;
+        bool known = false;
+        for (int ty = 0; ty < NTYPES; ty++) known |= TYPES[ty].profile == s.profile;
+        bool sane = known && s.mode <= 1 && isfinite(s.frame) && isfinite(s.end) && isfinite(s.start);
+        for (int k = 0; k < 3; k++) sane &= isfinite(s.pos[k]) && isfinite(s.scale[k]) && fabsf(s.scale[k]) < 100;
         for (int k = 0; k < 4; k++) sane &= s.state[k] >= 0x7001500000ull && s.state[k] < 0x7001700000ull;
         if (sane) f.s[f.n++] = s;
     }

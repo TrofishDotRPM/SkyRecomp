@@ -10,3 +10,5 @@ void coop_enemy_init(uint8_t (*stage)(void));  // once, before the game's first 
 void coop_enemy_set_puppets(bool on);          // this player's bats follow the host's (a joining player)
 int coop_enemy_take(uint8_t *out, int cap);    // the host, once a frame: a message to send, or 0
 void coop_enemy_receive(const uint8_t *d, int size);
+// (runtime/hle/coop.c) where the other player's Link stands, if they're in this player's stage
+bool coop_other_feet(float out[3]);

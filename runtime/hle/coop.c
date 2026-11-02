@@ -164,6 +164,14 @@ static void pos_received(const CoopEvent *ev) {
     pthread_mutex_unlock(&g_pos_lock);
 }
 
+bool coop_other_feet(float out[3]) {
+    pthread_mutex_lock(&g_pos_lock);
+    bool ok = g_in_play && g_other_at && SDL_GetTicks() - g_other_at < POS_STALE_MS && g_other_stage == g_my_stage;
+    if (ok) memcpy(out, g_other, sizeof g_other);
+    pthread_mutex_unlock(&g_pos_lock);
+    return ok;
+}
+
 // The other player's latest position, when they're in this player's stage. Any thread.
 bool coop_marker_target(float out[3]) {
     pthread_mutex_lock(&g_pos_lock);
@@ -508,49 +516,6 @@ static void actors_each(ActorFn fn, void *user) {
 
 static bool is_enemy(const char *name) { return name && name[0] == 'E' && name[1] == '_'; }
 static bool alive(uint64_t a) { return *(uint8_t *)(uintptr_t)(a + ACTOR_LIFE) == 1; }
-static float dist2(uint64_t a, const float p[3]) {
-    const float *q = (const float *)(uintptr_t)(a + ACTOR_POS);
-    return (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]) + (q[2] - p[2]) * (q[2] - p[2]);
-}
-
-// What an enemy removed here drops (the game's teardown is its death, loot and all) belongs to whoever killed it: items
-// that turn up near it for a little while are removed too. Those already lying there are left.
-#define DROP_RADIUS 250.0f
-#define DROP_MS 2000
-#define DROP_KNOWN 64
-static struct { float pos[3]; uint64_t until, known[DROP_KNOWN]; int nknown; } g_drops[8];
-static int g_ndrops;
-
-static bool note_item(uint64_t a, const char *name, void *user) {
-    int *d = user;
-    if (name && !strcmp(name, "ITEM") && g_drops[*d].nknown < DROP_KNOWN) g_drops[*d].known[g_drops[*d].nknown++] = a;
-    return true;
-}
-
-static bool drop_check(uint64_t a, const char *name, void *user) {
-    (void)user;
-    if (!name || strcmp(name, "ITEM") || !alive(a)) return true;
-    for (int d = 0; d < g_ndrops; d++) {
-        bool known = false;
-        for (int k = 0; k < g_drops[d].nknown && !known; k++) known = g_drops[d].known[k] == a;
-        if (known || dist2(a, g_drops[d].pos) > DROP_RADIUS * DROP_RADIUS) continue;
-        *(uint8_t *)(uintptr_t)(a + ACTOR_DELETE) = 1;
-        if (g_test) LOG("[coop] its drop removed at %llx\n", (unsigned long long)a);
-        break;
-    }
-    return true;
-}
-
-// Once a frame.
-static void drops_tick(void) {
-    if (!g_ndrops) return;
-    uint64_t now = SDL_GetTicks();
-    int n = 0;
-    for (int d = 0; d < g_ndrops; d++)
-        if (now < g_drops[d].until) g_drops[n++] = g_drops[d];
-    g_ndrops = n;
-    if (n) actors_each(drop_check, NULL);
-}
 
 typedef struct { uint16_t flag; int removed; } KillWant;
 static bool remove_if_killed(uint64_t a, const char *name, void *user) {
@@ -559,14 +524,7 @@ static bool remove_if_killed(uint64_t a, const char *name, void *user) {
     *(uint8_t *)(uintptr_t)(a + ACTOR_DELETE) = 1;
     w->removed++;
     if (g_test) LOG("[coop] enemy %s with flag %#x removed at %llx\n", name, w->flag, (unsigned long long)a);
-    if (g_ndrops < 8) {
-        int d = g_ndrops++;
-        memcpy(g_drops[d].pos, (const void *)(uintptr_t)(a + ACTOR_POS), 12);
-        g_drops[d].until = SDL_GetTicks() + DROP_MS;
-        g_drops[d].nknown = 0;
-        actors_each(note_item, &d);
-    }
-    return true;
+    return true;  // (its teardown is its death: it drops its loot here too, as the killer's did)
 }
 
 static void enemy_remove_live(uint16_t flag) {
@@ -876,7 +834,6 @@ void coop_tick(void) {
         return;
     }
     chest_lids_tick();
-    drops_tick();
     pos_send_tick();
     pose_send_tick();
     if (g_mode == 1) {  // (the host: its bats, for the others' to follow)

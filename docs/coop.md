@@ -43,7 +43,7 @@ For testing, `LARECOMP_COOP_TEST=1` logs every event and adds keys in the focuse
 | Small keys | Differences, so finding and spending both carry over |
 | Pouch expansions, extra wallets, crystals, key pieces | Differences |
 | Chests, doors, boss-defeated and other scene flags | Grow only, which also stops the same item being collected twice |
-| Enemy deaths | Live: one another player kills vanishes in front of you, and its loot stays theirs. Per scene (see below) |
+| Enemy deaths | Live: one another player kills vanishes in front of you, dropping its loot for you too. Per scene (see below) |
 
 Private: heart containers, damage, stamina, rupees spent or earned elsewhere, ammo, treasures, bugs, pouch contents, and all other story flags.
 
@@ -57,8 +57,8 @@ Each player can also set the name shown over their Link, and in popups, at the t
 
 - **A gripping hand stands in for an open one.** While only one of you holds a sword, the other Link's matching hand is drawn from your own: a fist where theirs is open, or an open hand around their sword.
 - **Dark earring colors look greyish.** The earrings' blue is the game's shine on a black texture; a color replaces the texture, and the shine still adds on top.
-- **An enemy another player kills just vanishes.** It's asked to delete itself (no death effect), and hearts or rupees it drops near where it was in the next 2 seconds are removed, as loot is the killer's. Only enemies with a defeat flag are shared; bosses aren't tried. As with the game's own flags, kills are forgotten when you leave a scene.
-- **Only bats follow the host, and they only chase the host.** A joining player's bats fly where the host's do, with their animations (`runtime/hle/coop_enemy.c`): the host sends where each is, which way it faces, its AI state and its animation, and each bat takes those just before its own update. Its update still runs, so it can still hit the joining player when it passes them, but the bats go after the host's Link, since the game knows of no other. When the host is somewhere else, the joining player's bats run on their own again. Other enemies still run on their own in each game.
+- **An enemy another player kills just vanishes.** It's asked to delete itself (no death effect), and drops its loot as it does: each player gets their own. Only enemies with a defeat flag are shared; bosses aren't tried. As with the game's own flags, kills are forgotten when you leave a scene.
+- **Only bats and chuchus follow the host, and they only chase the host.** A joining player's bats and chuchus move where the host's do, with their animations (`runtime/hle/coop_enemy.c`): the host sends where each is, which way it faces, its size, its AI state, its animation and (chuchus) whether it has risen, and each takes those just before its own update, run as if Link stood where the host's Link is. They go after the host's Link, since the game knows of no other. One the joining player hits is theirs from then on: it's hurt and dies in their game, and its kill reaches the host as any does. When the host is somewhere else, the joining player's run on their own again. Now and then a bat still sticks on one frame of its animation for a moment. Other enemies still run on their own in each game.
 - **Damage isn't shared.** A hit only counts where it lands. (Bats and chuchus die in one hit, so it doesn't show yet.)
 - **A boss's heart container may be lost to the other player.** Containers aren't shared, but scene flags are, so if one player beats a boss, the other may no longer be able to fight it or collect theirs. This needs checking at the first boss.
 - **Every heart piece is shared, not only those from chests and quests.** Pieces lying in the world use shared scene flags too, so one collected by a player disappears for the other either way.
