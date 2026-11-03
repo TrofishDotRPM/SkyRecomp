@@ -31,10 +31,15 @@ typedef struct {
     const char *cls, *sleep, *wake;
     int sm;
     float wake_radius;
+    // States it holds a Link in (by name), and a harmless one to run its update in instead while the Link it holds is the
+    // other player's: those states act on the game's one Link (a chuchu's Absorption slows him and shows "Shake").
+    const char *grab[2], *idle;
 } EnemyType;
 static const EnemyType TYPES[] = {
-    {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350},
-    {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, NULL, NULL, NULL, 0, 0},
+    {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
+    // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
+    {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
+     0xd28, 0, {"Absorption", "Shake"}, "Wait"},
 };
 #define NTYPES (int)(sizeof TYPES / sizeof *TYPES)
 #define PLAYER_PTR 0x7001826AD0ull
@@ -60,6 +65,7 @@ static const EnemyType TYPES[] = {
 
 typedef struct {
     uint16_t profile, flag;
+    uint32_t id;  // the host's own for it (its address, low half): a flag can be shared (enemies without one of their own)
     float pos[3], scale[3];
     int16_t rot[3];
     uint64_t state[4], anim, extra;
@@ -68,7 +74,7 @@ typedef struct {
 } Snap;
 
 // ---- wire: kind byte (COOP_BLOB_ENEMIES), stage u8, count u8, then count Snaps packed little-endian
-#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12)
+#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12 + 4)
 
 typedef struct { uint64_t at; uint8_t stage; int n; Snap s[MAX_ENEMIES]; } Frame;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -82,10 +88,10 @@ static GuestFn g_update[NTYPES];
 // Enemies this player hurt: let go while they're hurt, so they're hurt and die here as the game has them (then their defeat
 // flag goes to the host as any kill does, and theirs is removed). One that gets over it follows the host's again.
 #define MAX_RELEASED 64
-static struct { uint16_t profile, flag; } g_released[MAX_RELEASED];
+static struct { uint16_t profile; uint32_t flag; } g_released[MAX_RELEASED];  // (flag: the host's id for it)
 static int g_nreleased;
 
-static bool released(uint16_t profile, uint16_t flag) {
+static bool released(uint16_t profile, uint32_t flag) {
     for (int i = 0; i < g_nreleased; i++)
         if (g_released[i].profile == profile && g_released[i].flag == flag) return true;
     return false;
@@ -104,16 +110,71 @@ static bool hurt_state(uint64_t st) {
 
 static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
 
-static const Snap *find(const Frame *f, uint16_t profile, uint16_t flag) {
+static const Snap *find(const Frame *f, uint16_t profile, uint32_t id) {
     for (int i = 0; i < f->n; i++)
-        if (f->s[i].profile == profile && f->s[i].flag == flag) return &f->s[i];
+        if (f->s[i].profile == profile && f->s[i].id == id) return &f->s[i];
     return NULL;
+}
+
+// ---- which of the host's each of this player's is: paired once, when first seen, with the nearest of the host's of its kind
+// and flag that no other of this player's has, then kept. (Enemies without a flag of their own share one: by flag alone, a
+// field's chuchus all followed the same one of the host's.) (g_lock held)
+#define MAX_MAP 128
+#define MAP_NEAR 2000.0f   // farther than this from any of the host's: none of them
+#define MAP_FORGET_MS 1000 // one not updated this long is gone (its memory may be another's later)
+static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; } g_map[MAX_MAP];
+static int g_nmap;
+
+static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pair) {
+    const uint64_t now = SDL_GetTicks();
+    for (int i = 0; i < g_nmap; i++)
+        if (g_map[i].self == self && g_map[i].profile == profile && now - g_map[i].seen < MAP_FORGET_MS) { g_map[i].seen = now; return g_map[i].id; }
+    if (!pair || !g_nframes) return 0;
+    const Frame *f = &g_frames[g_nframes - 1];
+    const float *at = (const float *)(uintptr_t)(self + ACTOR_POS);
+    const Snap *best = NULL;
+    float best_d = MAP_NEAR * MAP_NEAR;
+    for (int k = 0; k < f->n; k++) {
+        const Snap *c = &f->s[k];
+        if (c->profile != profile || c->flag != flag) continue;
+        bool taken = false;
+        for (int i = 0; i < g_nmap && !taken; i++) taken = g_map[i].id == c->id && g_map[i].self != self && now - g_map[i].seen < MAP_FORGET_MS;
+        if (taken) continue;
+        float d = 0;
+        for (int j = 0; j < 3; j++) d += (c->pos[j] - at[j]) * (c->pos[j] - at[j]);
+        if (d < best_d) best_d = d, best = c;
+    }
+    if (!best) return 0;
+    int slot = -1;
+    for (int i = 0; i < g_nmap && slot < 0; i++) if (g_map[i].self == self || now - g_map[i].seen >= MAP_FORGET_MS) slot = i;
+    if (slot < 0 && g_nmap < MAX_MAP) slot = g_nmap++;
+    if (slot < 0) return 0;
+    g_map[slot].self = self, g_map[slot].profile = profile, g_map[slot].id = best->id, g_map[slot].seen = now;
+    return best->id;
 }
 
 static int16_t lerp_angle(int16_t a, int16_t b, float t) { return (int16_t)(a + (int16_t)(b - a) * t); }
 
 #define SM_CHANGE_STATE 5  // sStateMgr_c's vtable: changeState(const sStateIDIf_c &)
 static uint64_t g_sleep_state[NTYPES], g_wake_state[NTYPES];  // (found by name at the start)
+static uint64_t g_grab_state[NTYPES][2], g_idle_state[NTYPES];
+
+static bool grab_state(int ty, uint64_t st) { return st && (st == g_grab_state[ty][0] || st == g_grab_state[ty][1]); }
+
+// ---- An enemy holding the joining player: theirs to run (they're the one held, and only their input shakes it off). While it
+// does, and a little after (so the host's ends in the state theirs ended in), they send it to the host, whose own follows it.
+#define HELD_AFTER_MS 600
+#define MAX_HELD 16
+static struct { uint16_t profile; uint32_t flag; uint64_t until; } g_held[MAX_HELD];  // (the joining player's; flag: the host's id)
+static int g_nheld;
+static Frame g_back[RING];  // (the host's: what the joining player sent of the ones holding them)
+static int g_nback;
+
+static int held_find(uint16_t profile, uint32_t flag) {
+    for (int i = 0; i < g_nheld; i++)
+        if (g_held[i].profile == profile && g_held[i].flag == flag) return i;
+    return -1;
+}
 
 // A class's state object (sStateID_c, its name pointer at +8) by its name. 0: not found.
 static uint64_t find_state(const char *cls, const char *name) {
@@ -150,14 +211,41 @@ static void wake_for_other(int ty, Cpu *c, uint64_t self) {
     change(&tmp);
     LOG("[coop] enemies: woke the %s with flag %#x for the other player\n", T->name, *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG));
 }
+static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
+
+// The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
+static bool back_apply(int ty, uint64_t self, uint32_t flag) {
+    const EnemyType *T = &TYPES[ty];
+    bool ok = false;
+    pthread_mutex_lock(&g_lock);
+    const Frame *last = g_nback ? &g_back[g_nback - 1] : NULL;
+    if (last && SDL_GetTicks() - last->at < STALE_MS && g_stage && last->stage == g_stage()) {
+        const Snap *b = find(last, T->profile, flag);
+        if (b) snap_apply(T, self, b, b, 1), ok = true;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
 // An enemy's update, on a player whose enemies follow the host's: the host's where, which way, size, state and animation first.
 static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
     uint64_t self = c->x[0];
     if (!guest_ptr(self) || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != T->profile) { g_update[ty](c); return; }
     bool driven = false, host_hurt = false;
-    uint16_t flag = guest_ptr(self) ? *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG) : 0;
-    if (g_puppets && guest_ptr(self) && *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) == T->profile && !released(T->profile, flag)) {
+    const uint16_t flag = *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG);
+    // key: which of the host's this is (the host: its own address; a joining player: the one it's paired with, 0 for none)
+    uint32_t key = g_hosting ? (uint32_t)self : 0;
+    bool held = false;  // (the joining player's own, holding them)
+    if (g_puppets) {
+        pthread_mutex_lock(&g_lock);
+        key = map_key(self, T->profile, flag, true);
+        held = key && held_find(T->profile, key) >= 0;
+        pthread_mutex_unlock(&g_lock);
+    }
+    bool back = false;  // (the host's, following the joining player's that holds them)
+    if (g_hosting) back = back_apply(ty, self, key);
+    if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
         // The two either side of the moment shown (DELAY_MS ago); before the first or past the last, that one alone
@@ -165,34 +253,17 @@ static void puppet_update(int ty, Cpu *c) {
         int later = g_nframes - 1, earlier = g_nframes - 1;
         for (int i = 0; i < g_nframes; i++)
             if (g_frames[i].at >= now - DELAY_MS) { later = i, earlier = i ? i - 1 : i; break; }
-        const Snap *b = last ? find(&g_frames[later], T->profile, flag) : NULL, *a = NULL;
+        const Snap *b = last ? find(&g_frames[later], T->profile, key) : NULL, *a = NULL;
         bool ok = b && now - last->at < STALE_MS && g_stage && last->stage == g_stage();
         if (ok) {
             float t = 1;
-            if (earlier != later && (a = find(&g_frames[earlier], T->profile, flag))) {
+            if (earlier != later && (a = find(&g_frames[earlier], T->profile, key))) {
                 t = (float)((int64_t)(now - DELAY_MS) - (int64_t)g_frames[earlier].at) / (float)(g_frames[later].at - g_frames[earlier].at);
                 t = t < 0 ? 0 : t > 1 ? 1 : t;
             } else {
                 a = b;
             }
-            float *pos = (float *)(uintptr_t)(self + ACTOR_POS), *scale = (float *)(uintptr_t)(self + ACTOR_SCALE);
-            int16_t *rot = (int16_t *)(uintptr_t)(self + ACTOR_ROT);
-            for (int k = 0; k < 3; k++) {
-                pos[k] = a->pos[k] + (b->pos[k] - a->pos[k]) * t, rot[k] = lerp_angle(a->rot[k], b->rot[k], t);
-                scale[k] = a->scale[k] + (b->scale[k] - a->scale[k]) * t;
-            }
-            for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
-            uint64_t an = self + T->anim;
-            if (b->anim == 0 || guest_ptr(b->anim)) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
-            if (T->extra && (b->extra == 0 || guest_ptr(b->extra))) *(uint64_t *)(uintptr_t)(self + T->extra) = b->extra;
-            // (its length and mode with it: played with the last one's, the new one stops at the old end)
-            *(float *)(uintptr_t)(an + ANIM_END) = b->end;
-            *(float *)(uintptr_t)(an + ANIM_START) = b->start;
-            *(uint32_t *)(uintptr_t)(an + ANIM_MODE) = b->mode;
-            for (int k = 0; k < 3; k++)
-                if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = b->words[k];
-            bool same = a->anim == b->anim && a->end == b->end && b->frame >= a->frame;  // (not across a change or a wrap)
-            *(float *)(uintptr_t)(an + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+            snap_apply(T, self, a, b, t);
             driven = true;
             host_hurt = hurt_state(b->state[1]);
         }
@@ -229,7 +300,47 @@ static void puppet_update(int ty, Cpu *c) {
         for (int k = 0; k < 3; k++) keep_t[k] = *(float *)(uintptr_t)(pl + MTX_T[k]), *(float *)(uintptr_t)(pl + MTX_T[k]) += d[k];
         for (int k = 0; k < 3; k++) keep_c[k] = centre[k], centre[k] += d[k];
     }
+    // Holding the other player: its update in a harmless state, then as it was, so its hold doesn't slow this player's Link nor
+    // show them "Shake". A game only ever catches its own player: one following the host's that holds a Link holds the host's,
+    // and one of the host's following the joining player's (g_back) holds theirs.
+    const uint64_t before = *(uint64_t *)(uintptr_t)(self + T->state[1]);
+    const bool stand_in = (driven || back) && g_idle_state[ty] && grab_state(ty, before);
+    uint64_t keep_st[4];
+    uint8_t keep_an[0x20];
+    uint64_t keep_ex = 0;
+    if (stand_in) {
+        for (int k = 0; k < 4; k++) keep_st[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
+        memcpy(keep_an, (const void *)(uintptr_t)(self + T->anim), sizeof keep_an);
+        if (T->extra) keep_ex = *(uint64_t *)(uintptr_t)(self + T->extra);
+        *(uint64_t *)(uintptr_t)(self + T->state[1]) = g_idle_state[ty];
+    }
     g_update[ty](c);
+    if (stand_in) {
+        for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = keep_st[k];
+        memcpy((void *)(uintptr_t)(self + T->anim), keep_an, sizeof keep_an);
+        if (T->extra) *(uint64_t *)(uintptr_t)(self + T->extra) = keep_ex;
+        static int told;
+        if (told++ < 8) LOG("[coop] enemies: the %s with flag %#x holds the other player: not this one\n", T->name, flag);
+    }
+    // A joining player caught here (it went into holding them, in its own update): theirs to run, and to send to the host
+    const uint64_t after = *(uint64_t *)(uintptr_t)(self + T->state[1]);
+    // (taken on Absorption, the catch itself; kept through Shake, which follows it)
+    if (g_puppets && !stand_in && (held ? grab_state(ty, after) : driven && after == g_grab_state[ty][0])) {
+        pthread_mutex_lock(&g_lock);
+        int h = held_find(T->profile, key);
+        if (h < 0 && g_nheld < MAX_HELD) h = g_nheld++, g_held[h].profile = T->profile, g_held[h].flag = key;
+        if (h >= 0) g_held[h].until = SDL_GetTicks() + HELD_AFTER_MS;
+        pthread_mutex_unlock(&g_lock);
+        if (!held) LOG("[coop] enemies: the %s with flag %#x caught this player: theirs while it holds them\n", T->name, flag);
+    } else if (held) {
+        pthread_mutex_lock(&g_lock);
+        int h = held_find(T->profile, key);
+        if (h >= 0 && SDL_GetTicks() > g_held[h].until) {
+            g_held[h] = g_held[--g_nheld];
+            LOG("[coop] enemies: the %s with flag %#x let this player go: it follows the host's again\n", T->name, flag);
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
     if (swap) {
         for (int i = 0; i < NSPOTS; i++) memcpy((void *)(uintptr_t)(pl + SPOTS[i]), keep[i], 12);
         for (int k = 0; k < 3; k++) *(float *)(uintptr_t)(pl + MTX_T[k]) = keep_t[k];
@@ -249,22 +360,43 @@ static void puppet_update(int ty, Cpu *c) {
         }
     }
     // One let go that got over it (hit, not killed): it follows the host's again
-    if (!driven && g_puppets && released(T->profile, flag) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+    if (!driven && g_puppets && key && released(T->profile, key) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
         pthread_mutex_lock(&g_lock);
         for (int i = 0; i < g_nreleased; i++)
-            if (g_released[i].profile == T->profile && g_released[i].flag == flag) { g_released[i] = g_released[--g_nreleased]; break; }
+            if (g_released[i].profile == T->profile && g_released[i].flag == key) { g_released[i] = g_released[--g_nreleased]; break; }
         pthread_mutex_unlock(&g_lock);
         LOG("[coop] enemies: the %s with flag %#x got over this player's hit: it follows the host's again\n", T->name, flag);
     }
     // Hurt here (this player's sword, not the host's state): it's this player's while it is (to die here, if it does)
     if (driven && !host_hurt && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_nreleased < MAX_RELEASED) {
         pthread_mutex_lock(&g_lock);
-        g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = flag;
+        g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = key;
         g_nreleased++;
         pthread_mutex_unlock(&g_lock);
         LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now\n", T->name, flag);
     }
 }
+static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t) {
+    float *pos = (float *)(uintptr_t)(self + ACTOR_POS), *scale = (float *)(uintptr_t)(self + ACTOR_SCALE);
+    int16_t *rot = (int16_t *)(uintptr_t)(self + ACTOR_ROT);
+    for (int k = 0; k < 3; k++) {
+        pos[k] = a->pos[k] + (b->pos[k] - a->pos[k]) * t, rot[k] = lerp_angle(a->rot[k], b->rot[k], t);
+        scale[k] = a->scale[k] + (b->scale[k] - a->scale[k]) * t;
+    }
+    for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
+    uint64_t an = self + T->anim;
+    if (b->anim == 0 || guest_ptr(b->anim)) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
+    if (T->extra && (b->extra == 0 || guest_ptr(b->extra))) *(uint64_t *)(uintptr_t)(self + T->extra) = b->extra;
+    // (its length and mode with it: played with the last one's, the new one stops at the old end)
+    *(float *)(uintptr_t)(an + ANIM_END) = b->end;
+    *(float *)(uintptr_t)(an + ANIM_START) = b->start;
+    *(uint32_t *)(uintptr_t)(an + ANIM_MODE) = b->mode;
+    for (int k = 0; k < 3; k++)
+        if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = b->words[k];
+    bool same = a->anim == b->anim && a->end == b->end && b->frame >= a->frame;  // (not across a change or a wrap)
+    *(float *)(uintptr_t)(an + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+}
+
 static void update_0(Cpu *c) { puppet_update(0, c); }
 static void update_1(Cpu *c) { puppet_update(1, c); }
 static const HostFn UPDATES[NTYPES] = {update_0, update_1};
@@ -276,7 +408,13 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
         g_update[ty] = dispatch_lookup(fn);
         if (!g_update[ty]) { LOG("[coop] enemies: the %s's update isn't where it was (%llx)\n", TYPES[ty].name, (unsigned long long)fn); continue; }
         hle_override(fn, UPDATES[ty], "coop enemy update");
-        if (TYPES[ty].cls) {
+        if (TYPES[ty].cls && TYPES[ty].grab[0]) {
+            for (int k = 0; k < 2; k++) g_grab_state[ty][k] = TYPES[ty].grab[k] ? find_state(TYPES[ty].cls, TYPES[ty].grab[k]) : 0;
+            g_idle_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].idle);
+            LOG("[coop] enemies: the %s holds a Link in %llx / %llx, stands in %llx\n", TYPES[ty].name, (unsigned long long)g_grab_state[ty][0],
+                (unsigned long long)g_grab_state[ty][1], (unsigned long long)g_idle_state[ty]);
+        }
+        if (TYPES[ty].cls && TYPES[ty].sleep) {
             g_sleep_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].sleep);
             g_wake_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].wake);
             LOG("[coop] enemies: the %s sleeps in %llx, wakes into %llx\n", TYPES[ty].name, (unsigned long long)g_sleep_state[ty],
@@ -296,6 +434,9 @@ void coop_enemy_tick(void) {
     seen_stage = stage;
     pthread_mutex_lock(&g_lock);
     g_nreleased = 0;
+    g_nheld = 0;
+    g_nback = 0;
+    g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -304,6 +445,9 @@ void coop_enemy_set_puppets(bool on) {
     g_puppets = on;
     g_nframes = 0;
     g_nreleased = 0;
+    g_nheld = 0;
+    g_nback = 0;
+    g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -325,6 +469,13 @@ int coop_enemy_take(uint8_t *out, int cap) {
     }
     uint8_t *w = out + 3;
     int count = 0;
+    const bool back = !g_hosting;  // (a joining player: only the ones holding them)
+    if (back) {
+        pthread_mutex_lock(&g_lock);
+        int nh = g_nheld;
+        pthread_mutex_unlock(&g_lock);
+        if (!nh) return 0;
+    }
     for (int i = 0; i < 8192 && guest_ptr(n) && count < MAX_ENEMIES; i++, n = *(uint64_t *)(uintptr_t)n) {
         uint64_t a = *(uint64_t *)(uintptr_t)(n + 16);
         if (!guest_ptr(a) || *(uint8_t *)(uintptr_t)(a + ACTOR_LIFE) != 1) continue;
@@ -334,6 +485,16 @@ int coop_enemy_take(uint8_t *out, int cap) {
             if (TYPES[ty].profile == prof) T = &TYPES[ty];
         if (!T) continue;
         Snap s;
+        if (back) {
+            pthread_mutex_lock(&g_lock);
+            uint32_t k = map_key(a, prof, *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG), false);
+            int h = k ? held_find(prof, k) : -1;
+            pthread_mutex_unlock(&g_lock);
+            if (h < 0) continue;
+            s.id = k;  // (the host's own, for theirs to find)
+        } else {
+            s.id = (uint32_t)a;
+        }
         s.profile = prof, s.flag = *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG);
         memcpy(s.pos, (const void *)(uintptr_t)(a + ACTOR_POS), 12);
         memcpy(s.scale, (const void *)(uintptr_t)(a + ACTOR_SCALE), 12);
@@ -348,18 +509,19 @@ int coop_enemy_take(uint8_t *out, int cap) {
         for (int k = 0; k < 3; k++) s.words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(a + T->words[k]) : 0;
         put(&w, &s.profile, 2), put(&w, &s.flag, 2), put(&w, s.pos, 12), put(&w, s.rot, 6), put(&w, s.state, 32);
         put(&w, &s.anim, 8), put(&w, &s.frame, 4), put(&w, &s.end, 4), put(&w, &s.start, 4), put(&w, &s.mode, 4);
-        put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12);
+        put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12), put(&w, &s.id, 4);
         count++;
     }
     if (!count) return 0;
-    out[0] = COOP_BLOB_ENEMIES, out[1] = g_stage ? g_stage() : 0, out[2] = (uint8_t)count;
+    out[0] = back ? COOP_BLOB_ENEMIES_BACK : COOP_BLOB_ENEMIES, out[1] = g_stage ? g_stage() : 0, out[2] = (uint8_t)count;
     return (int)(w - out);
 }
 
 // A joining player: the host's latest. Untrusted: sizes are checked, and pointers are only ever written into bats, where
 // they must be the game's own state objects (checked) or an animation in guest memory.
 void coop_enemy_receive(const uint8_t *d, int size) {
-    if (size < 3 || d[0] != COOP_BLOB_ENEMIES) return;
+    const bool back = size >= 1 && d[0] == COOP_BLOB_ENEMIES_BACK;  // (the host: the joining player's, holding them)
+    if (size < 3 || (d[0] != COOP_BLOB_ENEMIES && !back) || back != g_hosting) return;
     int count = d[2];
     if (count > MAX_ENEMIES || size != 3 + count * SNAP_BYTES) return;
     Frame f;
@@ -370,7 +532,7 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         memcpy(&s.profile, r, 2), memcpy(&s.flag, r + 2, 2), memcpy(s.pos, r + 4, 12), memcpy(s.rot, r + 16, 6);
         memcpy(s.state, r + 22, 32), memcpy(&s.anim, r + 54, 8), memcpy(&s.frame, r + 62, 4);
         memcpy(&s.end, r + 66, 4), memcpy(&s.start, r + 70, 4), memcpy(&s.mode, r + 74, 4);
-        memcpy(s.scale, r + 78, 12), memcpy(&s.extra, r + 90, 8), memcpy(s.words, r + 98, 12);
+        memcpy(s.scale, r + 78, 12), memcpy(&s.extra, r + 90, 8), memcpy(s.words, r + 98, 12), memcpy(&s.id, r + 110, 4);
         r += SNAP_BYTES;
         bool known = false;
         for (int ty = 0; ty < NTYPES; ty++) known |= TYPES[ty].profile == s.profile;
@@ -380,7 +542,9 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         if (sane) f.s[f.n++] = s;
     }
     pthread_mutex_lock(&g_lock);
-    if (g_nframes == RING) memmove(&g_frames[0], &g_frames[1], sizeof g_frames[0] * (RING - 1)), g_nframes--;
-    g_frames[g_nframes++] = f;
+    Frame *ring = back ? g_back : g_frames;
+    int *nr = back ? &g_nback : &g_nframes;
+    if (*nr == RING) memmove(&ring[0], &ring[1], sizeof ring[0] * (RING - 1)), (*nr)--;
+    ring[(*nr)++] = f;
     pthread_mutex_unlock(&g_lock);
 }

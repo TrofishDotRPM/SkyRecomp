@@ -66,6 +66,7 @@ static void log_event(const char *dir, const CoopEvent *ev) {
 }
 
 static bool g_treasure_known;     // (monster parts: their counts are known, so a rise is news)
+static bool g_pouch_known;        // (pouch items from chests: likewise)
 
 static void emit(const CoopEvent *ev, void *user) {
     (void)user;
@@ -113,7 +114,7 @@ static int16_t pos_unit(float v) {
 static void blob_received(const uint8_t *data, int size, void *user) {  // (what it is: its first byte)
     (void)user;
     if (size < 1) return;
-    if (data[0] == COOP_BLOB_ENEMIES) { coop_enemy_receive(data, size); return; }
+    if (data[0] == COOP_BLOB_ENEMIES || data[0] == COOP_BLOB_ENEMIES_BACK) { coop_enemy_receive(data, size); return; }
     if (data[0] != COOP_BLOB_POSE) return;
     if (!coop_pose_receive(data + 1, (size_t)size - 1, SDL_GetTicks()) && g_test) LOG("[coop] ignored a malformed pose\n");
 }
@@ -622,6 +623,7 @@ static void copy_end(void) {
     g_copy_done = true;
     coop_core_baseline(&g_core);  // (what came is the host's already: nothing in it to send back)
     g_treasure_known = false;
+    g_pouch_known = false;
     if (g_test) LOG("[coop] got the host's inventory and progress\n");
 }
 
@@ -677,6 +679,60 @@ static void part_received(const CoopEvent *ev) {
     toast("Monster part");
 }
 
+// ---- pouch items from chests: a potion, shield or medal that comes into this player's pouch while a chest they opened is
+// still fresh (COOP_CHEST_WINDOW_MS, as for rupees) is given to the others too, into their first free slot. The pouch: 8 s32
+// at SaveFile+0x7c0 (the zeldaret/ss decomp's pouch_items, which matches HD's save layout everywhere else this file uses):
+// the item id low, something of its own high (1 in every slot seen). Slots open: 4, and one per pouch expansion (item word
+// 54, bits 10-12). Bought, moved from storage or used: each player's own.
+#define COOP_EV_POUCH 14    // b: item id, c: its high half
+#define S_POUCH 0x07C0
+#define POUCH_SLOTS 8
+static uint32_t g_pouch_shadow[POUCH_SLOTS];
+
+static uint32_t *pouch(int i) { return (uint32_t *)(uintptr_t)(SAVE + S_POUCH + 4ull * (uint64_t)i); }
+static int pouch_open(void) { int n = 4 + ((*at(SAVE + S_ITEM + 54 * 2) >> 10) & 7); return n > POUCH_SLOTS ? POUCH_SLOTS : n; }
+
+static const char *pouch_name(int id) {
+    switch (id) {
+    case 78: case 79: case 80: case 81: return "Heart Potion";
+    case 83: return "Guardian Potion";
+    case 84: case 85: return "Stamina Potion";
+    case 86: case 87: return "Air Potion";
+    case 88: return "Bottled Fairy";
+    case 126: case 127: return "Revitalizing Potion";
+    case 114: return "Life Medal";
+    default: return id >= 116 && id <= 125 ? "Shield" : "Pouch item";
+    }
+}
+
+static void pouch_tick(void) {  // (once a frame, with a save in play)
+    for (int i = 0; i < POUCH_SLOTS; i++) {
+        uint32_t v = *pouch(i), was = g_pouch_shadow[i];
+        g_pouch_shadow[i] = v;
+        if (!g_pouch_known || v == was || !v || (v & 0xffff) == (was & 0xffff)) continue;  // (a new item there, not a use)
+        if (g_core.now_ms >= g_core.chest_until_ms) continue;  // (not from a chest, as far as we can tell)
+        g_core.chest_until_ms = 0;  // (a chest holds one)
+        CoopEvent ev = {COOP_EV_POUCH, 0, (uint16_t)(v & 0xffff), (uint16_t)(v >> 16), 0};
+        emit(&ev, NULL);
+    }
+    g_pouch_known = true;
+}
+
+static void pouch_received(const CoopEvent *ev) {
+    if (!ev->b || ev->b > 511) return;
+    int open = pouch_open();
+    for (int i = 0; i < open; i++) {
+        if (*pouch(i)) continue;
+        *pouch(i) = (uint32_t)ev->b | (uint32_t)ev->c << 16;
+        g_pouch_shadow[i] = *pouch(i);  // (theirs: not to send back)
+        toast(pouch_name(ev->b));
+        return;
+    }
+    char text[64];
+    snprintf(text, sizeof text, "%s (pouch full)", pouch_name(ev->b));
+    toast(text);
+}
+
 static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
@@ -691,6 +747,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     }
     if (ev->type == COOP_EV_COPY) { copy_received(ev); return; }
     if (ev->type == COOP_EV_PART) { part_received(ev); return; }
+    if (ev->type == COOP_EV_POUCH) { pouch_received(ev); return; }
     if (ev->type == COOP_EV_COPY_END) { copy_end(); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
     uint16_t had = 0, hp = *g_core.health;
@@ -897,6 +954,7 @@ void coop_tick(void) {
         pthread_mutex_unlock(&g_pos_lock);
         g_core.baselined = false;
         g_treasure_known = false;
+        g_pouch_known = false;
         return;
     }
     if (!g_core.baselined) {
@@ -926,7 +984,7 @@ void coop_tick(void) {
                 }
         if (g_test) LOG("[coop] another player came into this stage: sent its %d kills again\n", n);
     }
-    if (g_mode == 1) {  // (the host: its bats, for the others' to follow)
+    {  // (the host: its enemies, for the others' to follow; a joining player: those holding them, for the host's)
         static uint8_t ebuf[8192];
         int n = coop_enemy_take(ebuf, sizeof ebuf);
         if (n) coop_net_send_blob(ebuf, n);
@@ -940,6 +998,7 @@ void coop_tick(void) {
         LOG("[coop] %d words changed at once: another save loaded? Taking it as the new start\n", changed);
         g_core.baselined = false;  // (next frame: baseline and snapshot, as for any save coming into play)
         g_treasure_known = false;
+        g_pouch_known = false;
         return;
     }
     if (g_test) {
@@ -954,4 +1013,5 @@ void coop_tick(void) {
     g_core.now_ms = SDL_GetTicks();
     coop_core_poll(&g_core, scene);
     treasures_tick();
+    pouch_tick();
 }
