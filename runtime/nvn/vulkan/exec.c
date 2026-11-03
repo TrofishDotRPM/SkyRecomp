@@ -1135,6 +1135,121 @@ static void figure_draw(VkCommandBuffer cb) {
     ss_forget();  // (the pipeline and state just changed behind the state cache)
 }
 
+// ---- the other Link's round shadow, when he's beyond this Link's own (dup_shadow draws his real one near): a soft dark oval
+// lying at his feet, blended over the world as its pass ends (no depth written; behind walls as the world's depth has it).
+#define BLOB_RADIUS 34.0f  // (Link's own shadow, at noon, is about this wide)
+#define BLOB_LIFT 3.0f     // above his feet, against the ground's own depth
+#define BLOB_DARK 0.45f
+static const char BLOB_VS[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { mat4 mvp; vec4 color; vec4 turn; } p;\n"
+    "layout(location = 0) out vec2 v_uv;\n"
+    "const vec2 C[6] = vec2[6](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,-1), vec2(1,1), vec2(-1,1));\n"
+    "void main() { v_uv = C[gl_VertexIndex]; gl_Position = p.mvp * vec4(v_uv.x, 0.0, v_uv.y, 1.0); }\n";
+static const char BLOB_FS[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { mat4 mvp; vec4 color; vec4 turn; } p;\n"
+    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() { float r = length(v_uv); o_color = vec4(0.0, 0.0, 0.0, p.color.a * (1.0 - smoothstep(0.35, 1.0, r))); }\n";
+
+static VkPipelineLayout blob_layout(void) {
+    static VkPipelineLayout l;
+    if (!l) {
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(FigurePush)};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+                                         .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
+    }
+    return l;
+}
+
+static VkPipeline blob_pipeline(void) {
+    static VkPipeline pipe;
+    static VkFormat color0, depth, stencil;
+    static uint32_t ncolor, samples;
+    static bool failed;
+    if (pipe && color0 == pass_color[0] && depth == pass_depth && stencil == pass_stencil && ncolor == pass_ncolor &&
+        samples == pass_samples)
+        return pipe;
+    if (failed) return VK_NULL_HANDLE;
+    size_t nv = 0, nf = 0;
+    uint32_t *sv = vk_glsl_to_spirv(BLOB_VS, STAGE_VERTEX, "coop_blob.vert", &nv);
+    uint32_t *sf = vk_glsl_to_spirv(BLOB_FS, STAGE_FRAGMENT, "coop_blob.frag", &nf);
+    if (!sv || !sf) { failed = true; return VK_NULL_HANDLE; }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_module(sv, nv), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_module(sf, nf), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)pass_samples};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
+                                                .depthWriteEnable = VK_FALSE, .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL};
+    VkPipelineColorBlendAttachmentState cba[8] = {0};
+    cba[0].colorWriteMask = 0x7;  // (colour only: the target's alpha is the game's)
+    cba[0].blendEnable = VK_TRUE;
+    cba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba[0].colorBlendOp = VK_BLEND_OP_ADD;
+    cba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, cba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = pass_ncolor, .pAttachments = cba};
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = pass_ncolor,
+                                           .pColorAttachmentFormats = pass_color, .depthAttachmentFormat = pass_depth,
+                                           .stencilAttachmentFormat = pass_stencil};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rinfo, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = blob_layout()};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) {
+        LOG("[coop] shadow pipeline failed\n");
+        failed = true;
+        return VK_NULL_HANDLE;
+    }
+    pipe = p, color0 = pass_color[0], depth = pass_depth, stencil = pass_stencil, ncolor = pass_ncolor, samples = pass_samples;
+    return pipe;
+}
+
+static uint64_t shadow_near_frame = ~0ull;  // the last frame the other Link's real shadow was drawn (dup_shadow)
+#define SHADOW_NEAR_FRAMES 8
+
+static void blob_draw(VkCommandBuffer cb) {
+    float feet[3], yaw, swing, view[12], px, py;
+    if (!pass_depth || !figure_state(feet, &yaw, &swing, view, &px, &py)) return;
+    const uint64_t f = renderer_present_count();
+    if (shadow_near_frame != ~0ull && f - shadow_near_frame <= SHADOW_NEAR_FRAMES) return;  // (his real one is drawn)
+    VkPipeline pipe = blob_pipeline();
+    if (!pipe) return;
+    int w, h;
+    pass_size(&w, &h);
+    if (w <= 0 || h <= 0) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
+    VkRect2D sc = {{0, 0}, {(uint32_t)w, (uint32_t)h}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    const float clip[16] = {px * view[0], py * view[4], 0, -view[8],
+                            px * view[1], py * view[5], 0, -view[9],
+                            px * view[2], py * view[6], 0, -view[10],
+                            px * view[3], py * view[7], 1, -view[11]};
+    const float place[16] = {BLOB_RADIUS, 0, 0, 0, 0, 1, 0, 0, 0, 0, BLOB_RADIUS, 0, feet[0], feet[1] + BLOB_LIFT, feet[2], 1};
+    FigurePush push = {.color = {0, 0, 0, BLOB_DARK}};
+    figure_mul(push.mvp, clip, place);
+    vkCmdPushConstants(cb, blob_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+    vkCmdDraw(cb, 6, 1, 0, 0);
+    ss_forget();
+}
+
 static uint64_t figure_world_frame = ~0ull;  // the world's targets this frame: where a Link kept for later can be drawn
 static NvnTexture *figure_world_color, *figure_world_depth;
 
@@ -1147,6 +1262,7 @@ static void figure_pass_end(VkCommandBuffer cb) {
     drawn_frame = f;
     figure_world_frame = f, figure_world_color = st.rt.color[0], figure_world_depth = st.rt.depth;
     figure_draw(cb);
+    blob_draw(cb);
 }
 
 static void vk_end_pass_at(int line);
@@ -3355,6 +3471,140 @@ static int own_link_kind(Prog *pr, CmdRec *r) {
     return d2 <= LINK_BONES_NEAR * LINK_BONES_NEAR ? kind : KIND_NONE;
 }
 
+// ---- the second Link's shadow. The game draws this Link's shadow by drawing him from the sun's side (an orthographic view
+// centred on him, a 303-pixel square of a shadow atlas: cbuf masks 0x48 skinned, 0x8 rigid, as dup_link's otherwise), blurs
+// it and lays it on the ground around him. Each piece of his drawn there is drawn again as the other Link's: the sun's
+// rotation (taken from a frame where both views of one piece are known: it hardly changes) turns their bones, and they're
+// placed where they stand from this piece of his, as dup_link last drew both. Only near him: farther, the square doesn't
+// reach (the round shadow, dup_blob, takes over).
+#define SHADOW_CBUFS 0x48
+#define SHADOW_RIGID_CBUFS 0x08
+#define SHADOW_PIECES 64
+#define SHADOW_MAX_BONES 384  // (his body meshes have 300 and more)
+#define SHADOW_FRAMES 16      // presents a piece's last drawing stays good for
+#define SHADOW_NEAR 100.0f      // how far from this Link the other can stand for his real shadow (the square reaches 250)
+#define SHADOW_SAME_LEVEL 25.0f  // how far above or below this Link the other can be for his real shadow
+typedef struct {
+    uint32_t vertices, nbones;
+    uint16_t tag;
+    bool skinned, sun_fresh, turn_known;
+    uint64_t frame;
+    float sun[12];                         // this Link's piece (its first matrix) in the sun's view, as the shadow last drew it
+    float turn[12];                        // camera view -> the sun's, from this piece in one frame (rotation only)
+    float mine[12];                        // this Link's piece in the camera's view, as last drawn
+    float theirs[SHADOW_MAX_BONES * 12];   // the other's, camera view, as drawn
+} ShadowPiece;
+static ShadowPiece shadow_pieces[SHADOW_PIECES];
+
+static void affine_mul(float o[12], const float a[12], const float b[12]) {  // 3x4 row-major, o = a * b
+    float r[12];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            r[i * 4 + j] = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] + (j == 3 ? a[i * 4 + 3] : 0);
+    memcpy(o, r, sizeof r);
+}
+
+static bool affine_inv(float o[12], const float m[12]) {
+    const float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], k = m[10];
+    const float det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    if (fabsf(det) < 1e-12f) return false;
+    const float id = 1 / det;
+    float r[12] = {(e * k - f * h) * id, (c * h - b * k) * id, (b * f - c * e) * id, 0,
+                   (f * g - d * k) * id, (a * k - c * g) * id, (c * d - a * f) * id, 0,
+                   (d * h - e * g) * id, (b * g - a * h) * id, (a * e - b * d) * id, 0};
+    for (int i = 0; i < 3; i++) r[i * 4 + 3] = -(r[i * 4] * m[3] + r[i * 4 + 1] * m[7] + r[i * 4 + 2] * m[11]);
+    memcpy(o, r, sizeof r);
+    return true;
+}
+
+static ShadowPiece *shadow_find(uint32_t vertices, uint16_t tag, bool skinned) {
+    for (int i = 0; i < SHADOW_PIECES; i++) {
+        ShadowPiece *p = &shadow_pieces[i];
+        if (p->vertices == vertices && p->tag == tag && p->skinned == skinned) return p;
+    }
+    return NULL;
+}
+
+// (dup_link, as it draws a piece of theirs) mine / theirs: camera view. The shadow (earlier in the same frame) drew this
+// piece of his in the sun's view: the two give the camera-to-sun turn of this frame, exactly, with no camera of ours in it.
+static void shadow_note(uint32_t vertices, uint16_t tag, bool skinned, uint32_t nbones, const float *mine, const float *theirs) {
+    if (nbones > SHADOW_MAX_BONES) return;
+    ShadowPiece *e = shadow_find(vertices, tag, skinned);
+    if (!e) {
+        e = &shadow_pieces[0];
+        for (int i = 1; i < SHADOW_PIECES; i++) if (shadow_pieces[i].frame < e->frame) e = &shadow_pieces[i];
+        memset(e, 0, offsetof(ShadowPiece, theirs));
+    }
+    e->vertices = vertices, e->tag = tag, e->skinned = skinned, e->nbones = nbones, e->frame = renderer_present_count();
+    float inv[12];
+    if (e->sun_fresh && affine_inv(inv, mine)) {
+        affine_mul(e->turn, e->sun, inv);
+        e->turn[3] = e->turn[7] = e->turn[11] = 0;
+        e->turn_known = true;
+    }
+    e->sun_fresh = false;
+    memcpy(e->mine, mine, sizeof e->mine);
+    memcpy(e->theirs, theirs, nbones * 48);
+}
+
+static void dup_shadow(Prog *pr, CmdRec *r, bool indexed) {
+    if (!g_is_skyward || !in_pass || !pr || !st.rt.depth || !link_hi || dup_drawing) return;
+    const bool skinned = pr->vi->cbuf_mask == SHADOW_CBUFS;
+    if (!skinned && pr->vi->cbuf_mask != SHADOW_RIGID_CBUFS) return;
+    const uint64_t vb = st.vbuf[0].addr;
+    if (vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) return;  // (his model's meshes only)
+    Range *bones = &st.ubuf[0][skinned ? 3 : 0];
+    const Range *proj = &st.ubuf[0][0];
+    const uint32_t first = skinned ? 0 : 16;
+    if (!bones->addr || bones->size < (first + 12) * 4 || !proj->addr || proj->size < 16 * 4) return;
+    const float *pm = (const float *)(uintptr_t)proj->addr;
+    if (pm[15] != 1 || pm[0] <= 0 || pm[1] != 0) return;  // (an orthographic sun's view)
+    const uint32_t nbones = skinned ? bones->size / 48 : 1, vertices = (uint32_t)r->x[2];
+    const uint16_t tag = (uint16_t)(int64_t)(((int64_t)vb - (int64_t)link_lo) >> 12);
+    const uint64_t frame = renderer_present_count();
+    ShadowPiece *e = shadow_find(vertices, tag, skinned);
+    if (!e || e->nbones != nbones) return;  // (theirs isn't drawn, or this piece isn't Link's)
+    const float *src = (const float *)(uintptr_t)bones->addr + first;
+    memcpy(e->sun, src, sizeof e->sun);  // (with this frame's camera view of it, to come: the turn)
+    e->sun_fresh = true;
+    if (!e->turn_known || frame - e->frame > SHADOW_FRAMES) return;
+    float feet[3], view[12], yaw, swing, px, py;
+    if (!figure_state(feet, &yaw, &swing, view, &px, &py)) return;  // (gone, or a cutscene)
+    // (only on about the same level: the shadow has no depth, so across a slope it would streak along the sun's direction)
+    float me[3];
+    if (!coop_my_position(me) || fabsf(feet[1] - me[1]) > SHADOW_SAME_LEVEL) return;
+    // (and well inside the sun's square: near its edge his shadow stretches; the round one takes over before)
+    const float dx = feet[0] - me[0], dz = feet[2] - me[2];
+    if (dx * dx + dz * dz > SHADOW_NEAR * SHADOW_NEAR) return;
+    static uint8_t *buf;
+    static uint32_t used;
+    if (!buf) buf = malloc(DUP_BUF_SIZE);
+    const uint32_t size = (bones->size + 255u) & ~255u;
+    if (!buf || size > DUP_BUF_SIZE) return;
+    if (used + size > DUP_BUF_SIZE) used = 0;
+    float *dst = (float *)(buf + used);
+    used += size;
+    memcpy(dst, (const void *)(uintptr_t)bones->addr, bones->size);
+    bool inside = false;
+    const float *t = e->turn;
+    for (uint32_t b = 0; b < nbones; b++) {
+        float *o = dst + first + b * 12;
+        const float *w = e->theirs + b * 12;
+        affine_mul(o, t, w);  // (turned; placed from this piece of his, where it is now)
+        const float d0 = w[3] - e->mine[3], d1 = w[7] - e->mine[7], d2 = w[11] - e->mine[11];
+        for (int i = 0; i < 3; i++) o[i * 4 + 3] = src[i * 4 + 3] + t[i * 4] * d0 + t[i * 4 + 1] * d1 + t[i * 4 + 2] * d2;
+        inside |= fabsf(pm[0] * o[3]) < 0.9f && fabsf(pm[5] * o[7]) < 0.9f;
+    }
+    if (!inside) return;
+    if (skinned) shadow_near_frame = frame;
+    Range saved = *bones;
+    bones->addr = (uint64_t)(uintptr_t)dst;
+    dup_drawing = true;
+    draw_(r, indexed);
+    dup_drawing = false;
+    *bones = saved;
+}
+
 static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     if (!g_is_skyward || !in_pass || !pr || !st.rt.depth) return;
     // cbuf_mask counts from cbuf_base: bit k is uniform buffer k - 3. A skinned mesh (bits 3 4 6 7) has its bones in buffer 3;
@@ -3466,6 +3716,7 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
             for (uint32_t b = 0; b < nbones; b++) dst[first + b * 12 + i * 4 + 3] += shift;
         }
     }
+    if (!(matched && their_hidden)) shadow_note(vertices, tag, skinned, nbones, src + first, dst + first);
     Range saved = *bones, saved_rots = *rots;
     bones->addr = (uint64_t)(uintptr_t)dst;
     if (rdst) rots->addr = (uint64_t)(uintptr_t)rdst;
@@ -3524,6 +3775,7 @@ static void draw(CmdRec *r, bool indexed) {
     draw_(r, indexed);
     const uint64_t seen_before = dup_copies;
     dup_link(dup_program(), r, indexed);
+    dup_shadow(dup_program(), r, indexed);
     dup_missed_log(dup_program(), r, seen_before);
     link_replay();
     linear_rt_writeback();
