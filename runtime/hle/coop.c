@@ -179,8 +179,21 @@ bool coop_other_feet(float out[3]) {
     return ok;
 }
 
-// The other player's latest position, when they're in this player's stage. Any thread.
+// An event of the game's running here (a cutscene, Fi or someone talking: a recording 2026-11-02): the count of running
+// events, after a list head (self-pointing when empty) in the event manager. The other player is hidden meanwhile, and
+// for half a second after (as the camera comes back).
+#define EVENTS_RUNNING 0x7005b1f1c8ull
+#define EVENT_SHOW_AFTER_MS 500
+static bool in_event(void) {
+    static volatile uint64_t until;
+    uint64_t now = SDL_GetTicks();
+    if (g_in_play && *(volatile uint32_t *)(uintptr_t)EVENTS_RUNNING) until = now + EVENT_SHOW_AFTER_MS;
+    return now < until;
+}
+
+// The other player's latest position, when they're in this player's stage and no cutscene is on. Any thread.
 bool coop_marker_target(float out[3]) {
+    if (in_event()) return false;
     pthread_mutex_lock(&g_pos_lock);
     bool ok = g_in_play && g_other_at && SDL_GetTicks() - g_other_at < POS_STALE_MS && g_other_stage == g_my_stage;
     if (ok) {

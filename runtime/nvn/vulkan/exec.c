@@ -3056,7 +3056,7 @@ static int texel_part(int kind, const uint8_t px[4], float u, float v) {
         bool leather = (h < 25 || h > 340) && s > 0.25f;
         bool cream = h >= 40 && h <= 75 && s < 0.25f && hi > 0.38f;
         bool sole = (h >= 200 && h <= 260 && s > 0.06f && s < 0.3f) ||  // (their blue grey edges)
-                    (u >= 0.45f && u < 0.62f && v >= 0.45f && h >= 35 && h <= 60 && s > 0.35f && hi < 0.5f);  // (undersides: dark olive)
+                    (u >= 0.45f && u < 0.62f && v >= 0.45f && h >= 35 && h <= 60 && s > 0.35f);  // (soles: olive, their edges golden)
         if (kind == KIND_SLEEVES) return cream ? COOP_LOOK_CLASSIC + 2 : leather ? COOP_LOOK_GLOVES : -1;  // (gloves' cuffs)
         // (the waist belt is drawn with the legs: its strip, holes and all, is the texture's left quarter; the boots the rest)
         if (kind == KIND_LEGS) return tan ? COOP_LOOK_CLASSIC + 3 : leather && u < 0.25f ? COOP_LOOK_CLASSIC + 5
