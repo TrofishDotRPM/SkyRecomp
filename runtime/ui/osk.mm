@@ -30,6 +30,7 @@ static std::atomic<bool> s_cancel_req{false};
 static bool s_cancelled_now;
 
 bool osk_is_open(void) { return s.open != 0; }
+ImGuiID osk_field(void) { return s.open ? s.field : 0; }
 void osk_cancel(void) { s_cancel_req = true; }
 
 bool ui_text_busy(void) {

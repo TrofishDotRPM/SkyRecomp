@@ -65,12 +65,10 @@ static void log_event(const char *dir, const CoopEvent *ev) {
     if (g_test) LOG("[coop] %s type %d a %d b %d c 0x%04x\n", dir, ev->type, ev->a, ev->b, ev->c);
 }
 
-static uint64_t g_enemy_died_at;  // (monster parts: when an enemy last died here, killed by either player)
 static bool g_treasure_known;     // (monster parts: their counts are known, so a rise is news)
 
 static void emit(const CoopEvent *ev, void *user) {
     (void)user;
-    if (ev->type == COOP_EV_KILL) g_enemy_died_at = SDL_GetTicks();
     log_event("sent", ev);
     coop_net_send(ev);
 }
@@ -614,13 +612,13 @@ static void copy_end(void) {
     if (g_test) LOG("[coop] got the host's inventory and progress\n");
 }
 
-// ---- monster parts: one picked up shortly after an enemy died (killed by either player) is given to the others too. The
-// treasures are 7-bit counters in the item flags (ids 421-436: monster parts, and things found otherwise, like feathers;
-// those found with no enemy dead lately aren't sent). Each player's own after that: selling and spending stay theirs.
+// ---- monster parts: one picked up is given to the others too. The treasures are 7-bit counters in the item flags (ids
+// 421-436: monster parts, and things found otherwise, like feathers and ore). Any rise is sent: most enemies (chuchus in
+// the fields, say) leave no kill flag behind, so "an enemy died lately" missed their parts. Each player's own after
+// that: selling and spending stay theirs (a fall isn't sent).
 #define COOP_EV_PART 13      // a: which treasure (0-15), c: how many more
 #define TREASURE_FIRST 421
 #define TREASURES 16
-#define PART_AFTER_KILL_MS 60000
 #define TREASURE_MAX 99      // (as the game lets them go)
 static int g_treasure_shadow[TREASURES];
 
@@ -652,7 +650,6 @@ static void treasures_tick(void) {  // (once a frame, with a save in play)
         int v = treasure_get(i), d = v - g_treasure_shadow[i];
         g_treasure_shadow[i] = v;
         if (!g_treasure_known || d <= 0) continue;
-        if (SDL_GetTicks() - g_enemy_died_at > PART_AFTER_KILL_MS) continue;  // (not from an enemy, as far as we can tell)
         CoopEvent ev = {COOP_EV_PART, (uint8_t)i, 0, (uint16_t)d, 0};
         emit(&ev, NULL);
     }
@@ -703,7 +700,6 @@ static void on_event(const CoopEvent *ev, void *user) {
     } else if (ev->type == COOP_EV_HEAL && *g_core.health > hp) {
         toast("Recovery Heart");
     } else if (ev->type == COOP_EV_KILL && g_core.scene >= 0 && ev->b == (uint16_t)g_core.scene) {
-        g_enemy_died_at = SDL_GetTicks();
         enemy_remove_live(ev->c);
     }
 }

@@ -74,6 +74,7 @@ void opt_heading(const char *title, float scale) {
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or 0.
 // arrows: ◀ value ▶ (a choice of several, or a stepper): left / right step it, and the arrows click too
+static bool g_overlap_next;  // (opt_text: the next row lets the field drawn over it take the mouse)
 static int row(const char *label, const std::string &value, bool changed, const char *desc, bool upper = true,
                bool arrows = false, int toggle_state = -1) {
     ImGui::PushID(label);
@@ -81,6 +82,7 @@ static int row(const char *label, const std::string &value, bool changed, const 
     ImVec2 p = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetFontSize() * 1.95f;
     ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));  // (the row's own border shows the selection)
+    if (g_overlap_next) ImGui::SetNextItemAllowOverlap(), g_overlap_next = false;
     bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     ImGui::PopStyleColor();
     if (g_take_first) {  // (opt_focus_first)
@@ -243,25 +245,71 @@ bool opt_action(const char *label, const char *value, const char *desc, bool upp
     return row(label, value ? value : "", false, desc, upper) == 2;
 }
 
-static ImGuiID g_text_editing;  // the text row turned into a field (one at a time)
-bool opt_text_editing(const char *label) { return g_text_editing && g_text_editing == ImGui::GetID(label); }
+// A text row holds a real field in its value area: a mouse click types straight into it (Ctrl+V pastes), A from a
+// controller opens the on-screen keyboard (ui_input_text), Enter from the keyboard starts typing.
+static ImGuiID text_field_id(const char *label) {
+    ImGui::PushID(label);
+    ImGuiID id = ImGui::GetID("##text");
+    ImGui::PopID();
+    return id;
+}
+
+bool opt_text_editing(const char *label) {
+    ImGuiID id = text_field_id(label);
+    return ImGui::GetActiveID() == id || (osk_is_open() && osk_field() == id);
+}
 
 bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc, bool secret) {
-    ImGuiID &editing = g_text_editing;
-    static int focus;        // frames left to give it the keyboard focus
-    ImGuiID id = ImGui::GetID(label);
-    if (editing != id) {
-        std::string shown = buf[0] ? (secret ? std::string(strlen(buf), '*') : std::string(buf)) : std::string(hint ? hint : "");
-        if (row(label, shown, false, desc) == 2) editing = id, focus = 2;
-        return false;
+    ImGuiContext &g = *GImGui;
+    bool off = g_next_disabled;
+    ImGuiID field = text_field_id(label);
+    g_overlap_next = true;  // (the field drawn over the row takes the mouse there)
+    int step = row(label, "", false, desc);
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(), after = ImGui::GetCursorScreenPos();
+    if (step == 2 && !off) {  // the row itself: A / Enter / a click beside the field
+        bool pad = g.NavInputSource == ImGuiInputSource_Gamepad && !ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+        ImGui::ActivateItemByID(field);  // (next frame: a controller's opens the on-screen keyboard)
+        if (!pad) {
+            g.NavNextActivateFlags |= ImGuiActivateFlags_PreferInput;
+            g.NavInputSource = ImGuiInputSource_Keyboard;
+        }
     }
+    std::string up = label;
+    for (char &c : up) c = (char)toupper((unsigned char)c);
+    float pad_x = 18 * g_scale, fs = ImGui::GetFontSize();
+    float x0 = fmaxf(a.x + (b.x - a.x) * 0.40f, a.x + pad_x + 8 * g_scale + ImGui::CalcTextSize(up.c_str()).x + 24 * g_scale);
+    float fh = fs + 8 * g_scale;
+    ImGui::SetCursorScreenPos(ImVec2(x0, a.y + (b.y - a.y - fh) * 0.5f));
     ImGui::PushID(label);
-    ImGui::SetNextItemWidth(-1);
-    if (focus > 0) ImGui::SetKeyboardFocusHere(), focus--;
-    bool done = ui_input_text("##text", buf, cap, ImGuiInputTextFlags_EnterReturnsTrue | (secret ? ImGuiInputTextFlags_Password : 0), hint, label);
-    if (ImGui::IsItemFocused()) { g_desc_focus = desc ? desc : ""; g_title_focus = label ? label : ""; }
-    if (done || ui_input_text_cancelled() || (focus == 0 && !ImGui::IsItemActive() && !osk_is_open())) editing = 0;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * g_scale, 4 * g_scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * g_scale);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(6, 12, 14, off ? 60 : 140));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(10, 20, 22, 190));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(10, 24, 26, 230));
+    ImGui::PushStyleColor(ImGuiCol_Text, off ? ImVec4(0.45f, 0.46f, 0.43f, 1) : ImVec4(0.85f, 0.84f, 0.79f, 1));
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);  // (the row is the controller's stop)
+    ImGui::SetNextItemWidth(b.x - pad_x - x0);
+    ImGuiInputTextFlags flags = (secret ? ImGuiInputTextFlags_Password : 0) | (off ? ImGuiInputTextFlags_ReadOnly : 0);
+    bool r = ui_input_text("##text", buf, cap, flags, hint, label);
+    {  // (test: LARECOMP_TEXT_TEST=<label>|<text>: menu.mm clicks this field's middle, types, pastes, presses Enter)
+        extern float g_text_test_xy[2];
+        static const char *tt = getenv("LARECOMP_TEXT_TEST");
+        if (tt && !strncmp(tt, label, strlen(label)) && tt[strlen(label)] == '|') {
+            ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            g_text_test_xy[0] = (mn.x + mx.x) * 0.5f, g_text_test_xy[1] = (mn.y + mx.y) * 0.5f;
+            static std::string last;
+            if (last != buf) last = buf, fprintf(stderr, "[opt] test: %s = \"%s\"%s\n", label, buf, ImGui::IsItemActive() ? " (typing)" : "");
+        }
+    }
+    bool active = ImGui::IsItemActive();
+    bool done = !off && (ImGui::IsItemDeactivatedAfterEdit() || (r && !active));  // (typed and left / OK on the keyboard)
+    if (active || (osk_is_open() && osk_field() == field)) { g_desc_focus = desc ? desc : ""; g_title_focus = label ? label : ""; }
+    ImGui::PopItemFlag();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
     ImGui::PopID();
+    ImGui::SetCursorScreenPos(after);
+    ImGui::Dummy(ImVec2(0, 0));
     return done;
 }
 

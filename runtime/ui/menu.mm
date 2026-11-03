@@ -327,8 +327,56 @@ bool menu_handle_event(const SDL_Event *e) {
     }
 }
 
+float g_text_test_xy[2];  // (option_rows.mm: where the tested field is)
+
+// (test) LARECOMP_TEXT_TEST=<label>|<text>, with LARECOMP_MENU_TAB: opens the menu on that tab after 15 s, then sends
+// real SDL events through menu_handle_event: a click on the field, the text typed, Ctrl+V of "+paste", Enter.
+static void text_test(void) {
+    static const char *tt = getenv("LARECOMP_TEXT_TEST");
+    if (!tt) return;
+    static Uint64 t0 = SDL_GetTicks();
+    static int step;
+    Uint64 t = SDL_GetTicks() - t0;
+    SDL_Event e;
+    auto key = [&](SDL_Scancode sc, bool down, SDL_Keymod mod) {
+        SDL_zero(e); e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP; e.key.scancode = sc; e.key.mod = mod; e.key.down = down;
+        menu_handle_event(&e);
+    };
+    if (step == 0 && t > 15000) { menu_test_open(); step++; }
+    else if (step == 1 && t > 17000) {
+        { std::lock_guard<std::mutex> l(g_clip_lock); g_clip_cache = "+paste"; g_clip_stale = false; }  // (not the desktop's clipboard)
+        float d = g_pixel_density > 0 ? g_pixel_density : 1;
+        SDL_zero(e); e.type = SDL_EVENT_MOUSE_MOTION; e.motion.x = g_text_test_xy[0] / d; e.motion.y = g_text_test_xy[1] / d; menu_handle_event(&e);
+        fprintf(stderr, "[opt] test: clicking %.0f,%.0f\n", g_text_test_xy[0], g_text_test_xy[1]);
+        step++;
+    } else if (step == 2 && t > 17300) {
+        SDL_zero(e); e.type = SDL_EVENT_MOUSE_BUTTON_DOWN; e.button.button = SDL_BUTTON_LEFT; e.button.down = true; menu_handle_event(&e);
+        step++;
+    } else if (step == 3 && t > 17400) {
+        SDL_zero(e); e.type = SDL_EVENT_MOUSE_BUTTON_UP; e.button.button = SDL_BUTTON_LEFT; menu_handle_event(&e);
+        step++;
+    } else if (step == 4 && t > 18000) {
+        for (int i = 0; i < 12; i++) key(SDL_SCANCODE_BACKSPACE, true, SDL_KMOD_NONE), key(SDL_SCANCODE_BACKSPACE, false, SDL_KMOD_NONE);
+        for (int i = 0; i < 12; i++) key(SDL_SCANCODE_DELETE, true, SDL_KMOD_NONE), key(SDL_SCANCODE_DELETE, false, SDL_KMOD_NONE);
+        step++;
+    } else if (step >= 5 && step < 9 && t > 18500 + (Uint64)(step - 5) * 200) {  // one key per frame or so: as typed
+        SDL_zero(e); e.type = SDL_EVENT_TEXT_INPUT;
+        static char one[2]; const char *txt = strchr(tt, '|') + 1;
+        size_t n = strlen(txt), i = (size_t)(step - 5) * n / 4, j = (size_t)(step - 4) * n / 4;
+        static std::string part; part.assign(txt + i, j - i); e.text.text = part.c_str(); (void)one;
+        if (!part.empty()) menu_handle_event(&e);
+        step++;
+    } else if (step == 9 && t > 20000) { key(SDL_SCANCODE_LCTRL, true, SDL_KMOD_LCTRL); step++; }
+    else if (step == 10 && t > 20200) { key(SDL_SCANCODE_V, true, SDL_KMOD_LCTRL); step++; }
+    else if (step == 11 && t > 20300) { key(SDL_SCANCODE_V, false, SDL_KMOD_LCTRL); key(SDL_SCANCODE_LCTRL, false, SDL_KMOD_NONE); step++; }
+    else if (step == 12 && t > 21000) { key(SDL_SCANCODE_RETURN, true, SDL_KMOD_NONE); step++; }
+    else if (step == 13 && t > 21100) { key(SDL_SCANCODE_RETURN, false, SDL_KMOD_NONE); step++; }
+    else if (step == 14 && t > 22000) { set_open(false); fprintf(stderr, "[opt] test: done\n"); step++; }
+}
+
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
+    text_test();
     clip_main_thread();
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;

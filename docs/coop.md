@@ -39,7 +39,7 @@ For testing, `LARECOMP_COOP_TEST=1` logs every event and adds keys in the focuse
 | Heart pieces | Differences; each player's capacity grows when their own count completes a heart |
 | Recovery hearts picked up | Heals everyone by a heart |
 | Rupees from chests | The first gain within 20 seconds of a chest opening; a full wallet keeps only what fits |
-| Monster parts | One picked up within a minute of an enemy dying (either player's kill) is given to the others too |
+| Monster parts | Treasures picked up (jelly blobs, claws, feathers, ore...) are given to the others too; selling them stays your own |
 | Maps, boss keys | Dungeon flags |
 | Small keys | Differences, so finding and spending both carry over |
 | Pouch expansions, extra wallets, crystals, key pieces | Differences |

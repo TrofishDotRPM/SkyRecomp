@@ -15,6 +15,7 @@ bool ui_input_text_cancelled(void);
 // Once per frame, after the rest of the UI, at the root (outside any window), in the context the field was drawn in.
 void osk_draw(ImFont *big, float scale);
 bool osk_is_open(void);
+ImGuiID osk_field(void);  // the field it types for (0: none open)
 void osk_cancel(void);  // (menu closed / reboot: drop it, the field keeps its text)
 
 // Something is being typed in the current context: a text field has keyboard focus or the on-screen keyboard is up.
