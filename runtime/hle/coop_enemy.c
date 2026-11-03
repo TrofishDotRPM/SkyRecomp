@@ -79,8 +79,8 @@ static bool g_puppets;     // this player's bats follow the host's
 static bool g_hosting;     // this player's enemies are the ones the others' follow
 static uint8_t (*g_stage)(void);
 static GuestFn g_update[NTYPES];
-// Enemies this player hurt: let go, so they're hurt and die here as the game has them (then their defeat flag goes to the
-// host as any kill does, and theirs is removed). Until this player's enemies are set to follow again.
+// Enemies this player hurt: let go while they're hurt, so they're hurt and die here as the game has them (then their defeat
+// flag goes to the host as any kill does, and theirs is removed). One that gets over it follows the host's again.
 #define MAX_RELEASED 64
 static struct { uint16_t profile, flag; } g_released[MAX_RELEASED];
 static int g_nreleased;
@@ -155,15 +155,6 @@ static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
     uint64_t self = c->x[0];
     if (!guest_ptr(self) || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != T->profile) { g_update[ty](c); return; }
-    // (in another stage, or back in one: those let go were others, now gone; these are new)
-    static int seen_stage = -1;
-    int stage = g_stage ? g_stage() : 0;
-    if (stage != seen_stage) {
-        pthread_mutex_lock(&g_lock);
-        g_nreleased = 0;
-        pthread_mutex_unlock(&g_lock);
-        seen_stage = stage;
-    }
     bool driven = false, host_hurt = false;
     uint16_t flag = guest_ptr(self) ? *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG) : 0;
     if (g_puppets && guest_ptr(self) && *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) == T->profile && !released(T->profile, flag)) {
@@ -244,7 +235,28 @@ static void puppet_update(int ty, Cpu *c) {
         for (int k = 0; k < 3; k++) *(float *)(uintptr_t)(pl + MTX_T[k]) = keep_t[k];
         memcpy(centre, keep_c, 12);
     }
-    // Hurt here (this player's sword, not the host's state): from now on it's this player's to finish off
+    if (driven && getenv("LARECOMP_COOP_TEST")) {  // (test: states it went into on its own, here, once each)
+        uint64_t now_st = *(uint64_t *)(uintptr_t)(self + T->state[1]);
+        static uint64_t seen[64];
+        static int nseen;
+        bool known = false;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == now_st;
+        if (!known && nseen < 64) {
+            seen[nseen++] = now_st;
+            uint64_t nm = *(uint64_t *)(uintptr_t)(now_st + 8);
+            LOG("[coop] enemies: a %s went into %s here\n", T->name,
+                nm >= 0x7001000000ull && nm < 0x7002000000ull ? (const char *)(uintptr_t)nm : "?");
+        }
+    }
+    // One let go that got over it (hit, not killed): it follows the host's again
+    if (!driven && g_puppets && released(T->profile, flag) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < g_nreleased; i++)
+            if (g_released[i].profile == T->profile && g_released[i].flag == flag) { g_released[i] = g_released[--g_nreleased]; break; }
+        pthread_mutex_unlock(&g_lock);
+        LOG("[coop] enemies: the %s with flag %#x got over this player's hit: it follows the host's again\n", T->name, flag);
+    }
+    // Hurt here (this player's sword, not the host's state): it's this player's while it is (to die here, if it does)
     if (driven && !host_hurt && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_nreleased < MAX_RELEASED) {
         pthread_mutex_lock(&g_lock);
         g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = flag;
@@ -274,6 +286,18 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
 }
 
 void coop_enemy_set_hosting(bool on) { g_hosting = on; }
+
+// Once a frame, with a save in play. In another stage (or back in one, after another), those let go were others, now gone:
+// the ones there now are new, and follow the host's.
+void coop_enemy_tick(void) {
+    static int seen_stage = -1;
+    int stage = g_stage ? g_stage() : 0;
+    if (stage == seen_stage) return;
+    seen_stage = stage;
+    pthread_mutex_lock(&g_lock);
+    g_nreleased = 0;
+    pthread_mutex_unlock(&g_lock);
+}
 
 void coop_enemy_set_puppets(bool on) {
     pthread_mutex_lock(&g_lock);

@@ -65,8 +65,12 @@ static void log_event(const char *dir, const CoopEvent *ev) {
     if (g_test) LOG("[coop] %s type %d a %d b %d c 0x%04x\n", dir, ev->type, ev->a, ev->b, ev->c);
 }
 
+static uint64_t g_enemy_died_at;  // (monster parts: when an enemy last died here, killed by either player)
+static bool g_treasure_known;     // (monster parts: their counts are known, so a rise is news)
+
 static void emit(const CoopEvent *ev, void *user) {
     (void)user;
+    if (ev->type == COOP_EV_KILL) g_enemy_died_at = SDL_GetTicks();
     log_event("sent", ev);
     coop_net_send(ev);
 }
@@ -606,7 +610,61 @@ static void copy_end(void) {
     if (g_mode != 2 || g_copy_done) return;
     g_copy_done = true;
     coop_core_baseline(&g_core);  // (what came is the host's already: nothing in it to send back)
+    g_treasure_known = false;
     if (g_test) LOG("[coop] got the host's inventory and progress\n");
+}
+
+// ---- monster parts: one picked up shortly after an enemy died (killed by either player) is given to the others too. The
+// treasures are 7-bit counters in the item flags (ids 421-436: monster parts, and things found otherwise, like feathers;
+// those found with no enemy dead lately aren't sent). Each player's own after that: selling and spending stay theirs.
+#define COOP_EV_PART 13      // a: which treasure (0-15), c: how many more
+#define TREASURE_FIRST 421
+#define TREASURES 16
+#define PART_AFTER_KILL_MS 60000
+#define TREASURE_MAX 99      // (as the game lets them go)
+static int g_treasure_shadow[TREASURES];
+
+static uint16_t *treasure_word(int i, int *shift, int *bits, uint16_t **mirror) {
+    const uint8_t *e = (const uint8_t *)(uintptr_t)(MAIN_BASE + T_ITEM_TABLE + 2 * (uint64_t)(TREASURE_FIRST + i));
+    *shift = e[1] >> 4, *bits = (e[1] & 15) + 1;
+    if (e[0] >= 64 || *shift + *bits > 16) return NULL;
+    *mirror = g_core.region[COOP_R_ITEM].mirror ? &g_core.region[COOP_R_ITEM].mirror[e[0]] : NULL;
+    return &g_core.region[COOP_R_ITEM].live[e[0]];
+}
+
+static int treasure_get(int i) {
+    int sh, b;
+    uint16_t *mirror, *w = treasure_word(i, &sh, &b, &mirror);
+    return w ? (*w >> sh) & ((1 << b) - 1) : 0;
+}
+
+static void treasure_set(int i, int v) {
+    int sh, b;
+    uint16_t *mirror, *w = treasure_word(i, &sh, &b, &mirror);
+    if (!w) return;
+    uint16_t m = (uint16_t)(((1 << b) - 1) << sh);
+    *w = (uint16_t)((*w & ~m) | ((v << sh) & m));
+    if (mirror) *mirror = (uint16_t)((*mirror & ~m) | ((v << sh) & m));
+}
+
+static void treasures_tick(void) {  // (once a frame, with a save in play)
+    for (int i = 0; i < TREASURES; i++) {
+        int v = treasure_get(i), d = v - g_treasure_shadow[i];
+        g_treasure_shadow[i] = v;
+        if (!g_treasure_known || d <= 0) continue;
+        if (SDL_GetTicks() - g_enemy_died_at > PART_AFTER_KILL_MS) continue;  // (not from an enemy, as far as we can tell)
+        CoopEvent ev = {COOP_EV_PART, (uint8_t)i, 0, (uint16_t)d, 0};
+        emit(&ev, NULL);
+    }
+    g_treasure_known = true;
+}
+
+static void part_received(const CoopEvent *ev) {
+    if (ev->a >= TREASURES || !ev->c || ev->c > TREASURE_MAX) return;
+    int v = treasure_get(ev->a) + ev->c;
+    treasure_set(ev->a, v > TREASURE_MAX ? TREASURE_MAX : v);
+    g_treasure_shadow[ev->a] = treasure_get(ev->a);  // (theirs, not ours to send back)
+    toast("Monster part");
 }
 
 static void on_event(const CoopEvent *ev, void *user) {
@@ -622,6 +680,7 @@ static void on_event(const CoopEvent *ev, void *user) {
         return;
     }
     if (ev->type == COOP_EV_COPY) { copy_received(ev); return; }
+    if (ev->type == COOP_EV_PART) { part_received(ev); return; }
     if (ev->type == COOP_EV_COPY_END) { copy_end(); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
     uint16_t had = 0, hp = *g_core.health;
@@ -644,6 +703,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     } else if (ev->type == COOP_EV_HEAL && *g_core.health > hp) {
         toast("Recovery Heart");
     } else if (ev->type == COOP_EV_KILL && g_core.scene >= 0 && ev->b == (uint16_t)g_core.scene) {
+        g_enemy_died_at = SDL_GetTicks();
         enemy_remove_live(ev->c);
     }
 }
@@ -827,6 +887,7 @@ void coop_tick(void) {
         g_in_play = false;
         pthread_mutex_unlock(&g_pos_lock);
         g_core.baselined = false;
+        g_treasure_known = false;
         return;
     }
     if (!g_core.baselined) {
@@ -843,6 +904,7 @@ void coop_tick(void) {
     chest_lids_tick();
     pos_send_tick();
     pose_send_tick();
+    coop_enemy_tick();
     if (g_mode == 1 && g_kills_due && g_core.scene >= 0) {
         g_kills_due = false;
         int n = 0;
@@ -868,6 +930,7 @@ void coop_tick(void) {
     if (changed > JUMP_WORDS) {
         LOG("[coop] %d words changed at once: another save loaded? Taking it as the new start\n", changed);
         g_core.baselined = false;  // (next frame: baseline and snapshot, as for any save coming into play)
+        g_treasure_known = false;
         return;
     }
     if (g_test) {
@@ -881,4 +944,5 @@ void coop_tick(void) {
     if (scene != g_core.scene) LOG("[coop] scene %d -> %d\n", g_core.scene, scene);
     g_core.now_ms = SDL_GetTicks();
     coop_core_poll(&g_core, scene);
+    treasures_tick();
 }
