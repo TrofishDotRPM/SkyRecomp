@@ -2985,19 +2985,28 @@ extern bool coop_look(bool other, int part, float rgb[3]);
 extern uint8_t *vk_texture_decode(NvnTexture *t, uint32_t *w, uint32_t *h);
 extern NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, uint32_t w, uint32_t h);
 extern void vk_texture_free(NvnTexture *t);
-enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BUCKLE, KIND_HAIR, KIND_FACE, KIND_EYES, KIND_HANDS };
+enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BUCKLE, KIND_HAIR, KIND_FACE, KIND_EYES, KIND_HANDS,
+       // the classic tunic (a capture 2026-11-02): its tunic and hat have textures of their own; the sleeves, legs and belt
+       // share one leather texture, each mesh using its own corner of it
+       KIND_TUNIC, KIND_HAT, KIND_SLEEVES, KIND_LEGS, KIND_BELT };
 
 static int link_kind(uint32_t vertices, bool rigid) {
     if (rigid) {  // (744: his hands, open or in a fist; 750: one gripping a sword)
         if (vertices == 744 || vertices == 750) return KIND_HANDS;
+        if (vertices == 168 || vertices == 348) return KIND_BELT;  // (the classic tunic's pouches at his belt)
         return vertices == 216 ? KIND_BUCKLE : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
     }
     switch (vertices) {
     case 3162: return KIND_SHIRT;              // (12: the collar band, its own small texture)
     case 684: return KIND_TABARD;
     case 2664: case 948: return KIND_LOWER;    // trousers, boots, belt and the shirt's hem, one texture
-    case 1476: return KIND_HAIR;
-    case 2172: case 240: return KIND_FACE;     // its eyebrows go with the hair
+    case 1476: case 1050: return KIND_HAIR;    // (1050: under the classic tunic's hat)
+    case 2172: case 240: case 174: return KIND_FACE;  // its eyebrows go with the hair (174: with the classic tunic)
+    case 606: case 1860: return KIND_TUNIC;    // its back and front
+    case 735: return KIND_HAT;
+    case 1662: return KIND_SLEEVES;            // the undershirt's sleeves, and the gloves
+    case 2310: return KIND_LEGS;               // trousers and boots
+    case 996: return KIND_BELT;                // the sword's shoulder strap (with the belt's color)
     default: return KIND_NONE;
     }
 }
@@ -3037,6 +3046,21 @@ static int texel_part(int kind, const uint8_t px[4], float u, float v) {
         if (u >= 0.53f && v < 0.25f) return -1;  // the mouth's inside and teeth, in the top right corner
         return COOP_LOOK_SKIN;                   // the rest: his face, ears and neck (the lips with them, a shade darker)
     case KIND_HANDS: return COOP_LOOK_SKIN;
+    case KIND_TUNIC: return COOP_LOOK_CLASSIC;
+    case KIND_HAT: return COOP_LOOK_CLASSIC + 1;
+    case KIND_SLEEVES: case KIND_LEGS: case KIND_BELT: {
+        // the leather texture: the right part's tan (trousers); elsewhere brown leather, the undershirt's cream, the boot
+        // soles' blue grey, and the buckles' silver and brass (left as they are)
+        bool tan = u >= 0.62f && h >= 20 && h <= 40 && s > 0.35f;
+        bool leather = (h < 25 || h > 340) && s > 0.25f;
+        bool cream = h >= 40 && h <= 75 && s < 0.25f && hi > 0.38f;
+        bool sole = h >= 200 && h <= 260 && s > 0.06f && s < 0.3f;
+        if (kind == KIND_SLEEVES) return cream ? COOP_LOOK_CLASSIC + 2 : -1;  // (the gloves stay leather)
+        // (the waist belt is drawn with the legs: its strip, holes and all, is the texture's left quarter; the boots the rest)
+        if (kind == KIND_LEGS) return tan ? COOP_LOOK_CLASSIC + 3 : leather && u < 0.25f ? COOP_LOOK_CLASSIC + 5
+                                    : leather || sole ? COOP_LOOK_CLASSIC + 4 : -1;
+        return leather ? COOP_LOOK_CLASSIC + 5 : -1;
+    }
     case KIND_EYES:  // (the irises, and the eyelids around them: skin, and the shading under and inside them)
         if (b > r + 0.05f) return COOP_LOOK_EYES;
         return h >= 5 && h <= 40 && s > 0.25f && s < 0.6f && hi > 0.3f ? COOP_LOOK_SKIN : -1;  // (not the black lashes)
@@ -3156,6 +3180,36 @@ static void look_texture_swap(Prog *pr, bool other, int kind) {
                 (void *)best, best->width, best->height, copy ? "recolored" : "no colors for it");
         }
     }
+}
+
+// (LARECOMP_DUP_TINT_TEST) each part's main texture, once, to build/link_<vertices><r: rigid>.ppm: to tell its parts apart
+static void look_texture_dump(Prog *pr, uint32_t vertices, bool rigid) {
+    static uint32_t done[64];
+    static int ndone;
+    uint32_t key = vertices * 2 + rigid;
+    for (int i = 0; i < ndone; i++) if (done[i] == key) return;
+    if (ndone >= 64) return;
+    done[ndone++] = key;
+    NvnTexture *best = NULL;
+    for (int i = 0; i < pr->fi->ntex; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->format < 0x79 || t->format > 0x84) continue;
+        if (!best || (uint64_t)t->width * t->height > (uint64_t)best->width * best->height) best = t;
+    }
+    if (!best) { LOG("[coop] look dump: %u%s has no ASTC texture\n", vertices, rigid ? "r" : ""); return; }
+    uint32_t w, h;
+    uint8_t *px = vk_texture_decode(best, &w, &h);
+    if (!px) return;
+    char fn[64];
+    snprintf(fn, sizeof fn, "build/link_%u%s.ppm", vertices, rigid ? "r" : "");
+    FILE *f = fopen(fn, "wb");
+    if (f) {
+        fprintf(f, "P6 %u %u 255\n", w, h);
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) fwrite(px + i * 4, 1, 3, f);
+        fclose(f);
+    }
+    LOG("[coop] look dump: %u%s texture %p %ux%u -> %s\n", vertices, rigid ? "r" : "", (void *)best, w, h, fn);
+    free(px);
 }
 
 // LARECOMP_DUP_TINT_TEST: each of his parts its own colour, named in the log, to see which part is what
@@ -3746,6 +3800,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // a co-op Link's part: its texture in its owner's colors (the second Link's, or this player's own)
     swap_from = swap_to = NULL;
     st_vertices = r->x[2];
+    if (dup_drawing && dup_tint_on) look_texture_dump(pr, (uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS);
     if (dup_drawing) look_texture_swap(pr, true, link_kind((uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS));
     else look_texture_swap(pr, false, own_link_kind(pr, r));
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:

@@ -216,8 +216,7 @@ extern "C" void coop_look_draw(float scale) {
     static const struct { const char *name; const int *parts; const char *note; } PAGES[] = {
         {"Link", LINK, NULL},
         {"Skyloft clothes", SKYLOFT, NULL},
-        {"Classic tunic", CLASSIC,
-         "Picked now, worn once co-op knows the tunic's parts: they're added after Link first puts it on."},
+        {"Classic tunic", CLASSIC, NULL},
     };
     if (ImGui::BeginTabBar("##looks")) {
         for (const auto &page : PAGES) {
