@@ -168,7 +168,7 @@ static bool online_section(float scale) {
 
 static const char *const PARTS[COOP_LOOK_PARTS] = {"Shirt", "Tabard", "Trousers", "Boots", "Belt",
                                                     "Tunic", "Hat", "Undershirt", "Trousers", "Boots", "Belt", "Hair",
-                                                    "Eyes", "Shirt details", "Tabard design", "Earrings"};
+                                                    "Eyes", "Shirt details", "Tabard design", "Earrings", "Skin"};
 
 static const struct { const char *name; uint32_t rgb; } COMMON[] = {
     {"Red", 0xc8302c}, {"Orange", 0xe07a1f}, {"Yellow", 0xe8c43a}, {"Green", 0x3f9b3a}, {"Teal", 0x2a9d8f},
@@ -249,7 +249,7 @@ extern "C" void coop_menu_draw(float scale) {
                        "game's own. Your Link, to the right, shows them as you pick.");
     ImGui::Spacing();
     // a tab each for Link himself and each outfit
-    static const int LINK[] = {COOP_LOOK_HAIR, COOP_LOOK_EYES, COOP_LOOK_EARRINGS, -1};
+    static const int LINK[] = {COOP_LOOK_HAIR, COOP_LOOK_EYES, COOP_LOOK_EARRINGS, COOP_LOOK_SKIN, -1};
     static const int SKYLOFT[] = {0, COOP_LOOK_SHIRT_DETAILS, 1, COOP_LOOK_TABARD_DESIGN, 2, 3, 4, -1};
     static const int CLASSIC[] = {5, 6, 7, 8, 9, 10, -1};
     static const struct { const char *name; const int *parts; const char *note; } PAGES[] = {

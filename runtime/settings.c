@@ -211,7 +211,7 @@ void settings_load(void) {
             continue;
         }
         if (!strncmp(key, "coop_look_", 10)) {  // coop_look_<part> = #rrggbb, or original
-            static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings"};
+            static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings", "skin"};
             for (int p = 0; p < COOP_LOOK_PARTS; p++) {
                 if (strcmp(key + 10, parts[p])) continue;
                 unsigned rgb;
@@ -398,7 +398,7 @@ void settings_save(void) {
     fprintf(f, "coop_upnp = %d\n", g_settings.coop_upnp);
     fprintf(f, "coop_name = %s\n", g_settings.coop_name);
     {
-        static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings"};
+        static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings", "skin"};
         for (int p = 0; p < COOP_LOOK_PARTS; p++) {
             if (g_settings.coop_look[p] & COOP_LOOK_SET) fprintf(f, "coop_look_%s = #%06x\n", parts[p], g_settings.coop_look[p] & 0xffffffu);
             else fprintf(f, "coop_look_%s = original\n", parts[p]);

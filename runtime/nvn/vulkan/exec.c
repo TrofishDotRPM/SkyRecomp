@@ -2985,10 +2985,13 @@ extern bool coop_look(bool other, int part, float rgb[3]);
 extern uint8_t *vk_texture_decode(NvnTexture *t, uint32_t *w, uint32_t *h);
 extern NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, uint32_t w, uint32_t h);
 extern void vk_texture_free(NvnTexture *t);
-enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BUCKLE, KIND_HAIR, KIND_FACE, KIND_EYES };
+enum { KIND_NONE = -1, KIND_SHIRT, KIND_TABARD, KIND_LOWER, KIND_BUCKLE, KIND_HAIR, KIND_FACE, KIND_EYES, KIND_HANDS };
 
 static int link_kind(uint32_t vertices, bool rigid) {
-    if (rigid) return vertices == 216 ? KIND_BUCKLE : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
+    if (rigid) {  // (744: his hands, open or in a fist; 750: one gripping a sword)
+        if (vertices == 744 || vertices == 750) return KIND_HANDS;
+        return vertices == 216 ? KIND_BUCKLE : vertices == 42 ? KIND_EYES : vertices == 12 ? KIND_SHIRT : KIND_NONE;
+    }
     switch (vertices) {
     case 3162: return KIND_SHIRT;              // (12: the collar band, its own small texture)
     case 684: return KIND_TABARD;
@@ -3001,7 +3004,6 @@ static int link_kind(uint32_t vertices, bool rigid) {
 
 // The look part a texel belongs to, -1 for none (it stays as it is). u v: where it is in the texture, 0-1.
 static int texel_part(int kind, const uint8_t px[4], float u, float v) {
-    (void)v;
     float r = px[0] / 255.0f, g = px[1] / 255.0f, b = px[2] / 255.0f;
     float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b)), d = hi - lo, s = hi > 0 ? d / hi : 0, h = 0;
     float l = 0.299f * r + 0.587f * g + 0.114f * b;
@@ -3029,8 +3031,15 @@ static int texel_part(int kind, const uint8_t px[4], float u, float v) {
     case KIND_HAIR: return COOP_LOOK_HAIR;
     case KIND_FACE:
         if (hi < 0.06f) return COOP_LOOK_EARRINGS;  // their patch is pure black (their blue is the shader's shine)
-        return h >= 25 && h <= 55 && s > 0.38f && hi < 0.62f ? COOP_LOOK_HAIR : -1;
-    case KIND_EYES: return b > r + 0.05f ? COOP_LOOK_EYES : -1;
+        if (h >= 25 && h <= 55 && s > 0.38f && hi < 0.62f) return COOP_LOOK_HAIR;  // the brows and sideburns, in shade
+        // their light top edge: yellower than any skin (whose hue stays under 36), however bright
+        if (h >= 36 && h <= 70 && s > 0.45f && hi < 0.9f) return COOP_LOOK_HAIR;
+        if (u >= 0.53f && v < 0.25f) return -1;  // the mouth's inside and teeth, in the top right corner
+        return COOP_LOOK_SKIN;                   // the rest: his face, ears and neck (the lips with them, a shade darker)
+    case KIND_HANDS: return COOP_LOOK_SKIN;
+    case KIND_EYES:  // (the irises, and the eyelids around them: skin, and the shading under and inside them)
+        if (b > r + 0.05f) return COOP_LOOK_EYES;
+        return h >= 5 && h <= 40 && s > 0.25f && s < 0.6f && hi > 0.3f ? COOP_LOOK_SKIN : -1;  // (not the black lashes)
     default: return -1;
     }
 }
@@ -3059,6 +3068,34 @@ static NvnTexture *recoloured_texture(bool other, int kind, NvnTexture *orig) {
     uint32_t w, h;
     uint8_t *px = vk_texture_decode(orig, &w, &h);
     if (!px) return NULL;
+    if ((kind == KIND_FACE || kind == KIND_EYES) && getenv("LARECOMP_COOP_TEST")) {  // (test, once each: the texture, its parts)
+        static NvnTexture *done[8];
+        bool dumped = false;
+        int slot = -1;
+        for (int i = 0; i < 8; i++) {
+            if (done[i] == orig) dumped = true;
+            if (!done[i] && slot < 0) slot = i;
+        }
+        if (slot < 0) dumped = true;
+        char fn[64], fn2[64];
+        snprintf(fn, sizeof fn, "build/%s%d.ppm", kind == KIND_FACE ? "face" : "eyes", slot), snprintf(fn2, sizeof fn2, "build/%s%d_parts.ppm", kind == KIND_FACE ? "face" : "eyes", slot);
+        FILE *f = dumped ? NULL : fopen(fn, "wb"), *g = f ? fopen(fn2, "wb") : NULL;
+        if (f && g) done[slot] = orig;
+        if (f && g) {
+            fprintf(f, "P6 %u %u 255\n", w, h), fprintf(g, "P6 %u %u 255\n", w, h);
+            for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+                fwrite(px + i * 4, 1, 3, f);
+                int p = texel_part(kind, px + i * 4, (float)(i % w + 0.5f) / w, (float)(i / w + 0.5f) / h);
+                uint8_t c[3] = {px[i * 4] / 3, px[i * 4 + 1] / 3, px[i * 4 + 2] / 3};  // (the rest dimmed; brow red, earrings green)
+                if (p == COOP_LOOK_HAIR || p == COOP_LOOK_EYES) c[0] = 255, c[1] = c[2] = 0;
+                if (p == COOP_LOOK_EARRINGS || p == COOP_LOOK_SKIN) c[1] = 255, c[0] = c[2] = 0;
+                fwrite(c, 1, 3, g);
+            }
+            LOG("[coop] look: a kind %d texture, %ux%u, saved (%s)\n", kind, w, h, fn);
+        }
+        if (f) fclose(f);
+        if (g) fclose(g);
+    }
     double sum[COOP_LOOK_PARTS] = {0};
     uint32_t n[COOP_LOOK_PARTS] = {0};
     int8_t *part = malloc((size_t)w * h);
