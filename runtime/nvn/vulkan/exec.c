@@ -1139,7 +1139,7 @@ static void figure_draw(VkCommandBuffer cb) {
 // lying at his feet, blended over the world as its pass ends (no depth written; behind walls as the world's depth has it).
 #define BLOB_RADIUS 34.0f  // (Link's own shadow, at noon, is about this wide)
 #define BLOB_LIFT 3.0f     // above his feet, against the ground's own depth
-#define BLOB_DARK 0.45f
+#define BLOB_DARK 0.55f  // (as dark as the game's own, about)
 static const char BLOB_VS[] =
     "#version 450\n"
     "layout(push_constant) uniform P { mat4 mvp; vec4 color; vec4 turn; } p;\n"
@@ -1220,28 +1220,211 @@ static VkPipeline blob_pipeline(void) {
     return pipe;
 }
 
-static uint64_t shadow_near_frame = ~0ull;  // the last frame the other Link's real shadow was drawn (dup_shadow)
-#define SHADOW_NEAR_FRAMES 8
+static float sun_turn[12];          // camera view -> the sun's, rotation only (dup_shadow's, from his body)
+static uint64_t sun_turn_frame = ~0ull;
+#define LINK_HEIGHT 150.0f          // (for how long his shadow falls)
+// His silhouette from the sun, centred on his feet, drawn by dup_shadow into a texture of our own each frame; blob_draw lays
+// it on the ground at his feet. (The game's own shadow only reaches around this player's Link: it draws onto a copy of the
+// ground there.)
+#define SIL_SIZE 256
+#define SIL_DEPTH -240.0f           // his depth in the sun's view (the game's own Link sits about here)
+static NvnTexture *sil_tex;
+static uint64_t sil_frame = ~0ull;  // the frame it was last drawn in
+static float sil_scale[2];          // the sun view's projection: x and y scale
+extern NvnTexture *vk_texture_target(const NvnTexture *like, uint32_t w, uint32_t h);
+#define SUN_TURN_FRAMES 240         // (without a sun lately - indoors, night - the shadow is round)
+
+static const char SIL_VS[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { mat4 mvp; vec4 uv01; vec4 uv23; } p;\n"
+    "layout(location = 0) out vec2 v_uv;\n"
+    "const vec2 C[6] = vec2[6](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,-1), vec2(1,1), vec2(-1,1));\n"
+    "const int K[6] = int[6](0, 1, 2, 0, 2, 3);\n"
+    "void main() {\n"
+    "    int k = K[gl_VertexIndex];\n"
+    "    v_uv = k == 0 ? p.uv01.xy : k == 1 ? p.uv01.zw : k == 2 ? p.uv23.xy : p.uv23.zw;\n"
+    "    gl_Position = p.mvp * vec4(C[gl_VertexIndex].x, 0.0, C[gl_VertexIndex].y, 1.0);\n"
+    "}\n";
+static const char SIL_FS[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D sil;\n"
+    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() {\n"
+    "    if (any(lessThan(v_uv, vec2(0.0))) || any(greaterThan(v_uv, vec2(1.0)))) discard;\n"
+    "    vec2 px = 1.5 / vec2(textureSize(sil, 0));\n"
+    "    float a = 0.0;\n"
+    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) a += texture(sil, v_uv + vec2(x, y) * px).r;\n"
+    "    a /= 9.0;\n"
+    "    if (a <= 0.0) discard;\n"
+    "    o_color = vec4(0.0, 0.0, 0.0, a * " "0.5" ");\n"
+    "}\n";
+
+static VkDescriptorSetLayout sil_set_layout(void) {
+    static VkDescriptorSetLayout l;
+    if (!l) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &ci, NULL, &l));
+    }
+    return l;
+}
+
+static VkPipelineLayout sil_layout(void) {
+    static VkPipelineLayout l;
+    if (!l) {
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(FigurePush)};
+        VkDescriptorSetLayout sl = sil_set_layout();
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl,
+                                         .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
+    }
+    return l;
+}
+
+// (the texture's view never changes: one set, written once)
+static VkDescriptorSet sil_set(void) {
+    static VkDescriptorSet set;
+    static VkImageView written;
+    if (!sil_tex) return VK_NULL_HANDLE;
+    VkImageView view = vk_view(sil_tex, NULL, false, false, TEXTYPE_2D);
+    if (!view) return VK_NULL_HANDLE;
+    if (!set) {
+        static VkDescriptorPool pool;
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &pci, NULL, &pool));
+        VkDescriptorSetLayout sl = sil_set_layout();
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1,
+                                          .pSetLayouts = &sl};
+        VK_CHECK(vkAllocateDescriptorSets(g_vk.dev, &ai, &set));
+    }
+    if (view != written) {
+        if (written) return VK_NULL_HANDLE;  // (rewriting a set a frame in flight may use isn't allowed: no shadow, rather)
+        static VkSampler smp;
+        if (!smp) {
+            VkSamplerCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+                                       .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                                       .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+                                       .maxLod = 0};
+            VK_CHECK(vkCreateSampler(g_vk.dev, &sci, NULL, &smp));
+        }
+        VkDescriptorImageInfo ii = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+        vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+        written = view;
+    }
+    return set;
+}
+
+static VkPipeline sil_pipeline(void) {
+    static VkPipeline pipe;
+    static VkFormat color0, depth, stencil;
+    static uint32_t ncolor, samples;
+    static bool failed;
+    if (pipe && color0 == pass_color[0] && depth == pass_depth && stencil == pass_stencil && ncolor == pass_ncolor &&
+        samples == pass_samples)
+        return pipe;
+    if (failed) return VK_NULL_HANDLE;
+    size_t nv = 0, nf = 0;
+    uint32_t *sv = vk_glsl_to_spirv(SIL_VS, STAGE_VERTEX, "coop_sil.vert", &nv);
+    uint32_t *sf = vk_glsl_to_spirv(SIL_FS, STAGE_FRAGMENT, "coop_sil.frag", &nf);
+    if (!sv || !sf) { failed = true; return VK_NULL_HANDLE; }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_module(sv, nv), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_module(sf, nf), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)pass_samples};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
+                                                .depthWriteEnable = VK_FALSE, .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL};
+    VkPipelineColorBlendAttachmentState cba[8] = {0};
+    cba[0].colorWriteMask = 0x7;
+    cba[0].blendEnable = VK_TRUE;
+    cba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba[0].colorBlendOp = VK_BLEND_OP_ADD;
+    cba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, cba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = pass_ncolor, .pAttachments = cba};
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = pass_ncolor,
+                                           .pColorAttachmentFormats = pass_color, .depthAttachmentFormat = pass_depth,
+                                           .stencilAttachmentFormat = pass_stencil};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rinfo, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = sil_layout()};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) {
+        LOG("[coop] silhouette pipeline failed\n");
+        failed = true;
+        return VK_NULL_HANDLE;
+    }
+    pipe = p, color0 = pass_color[0], depth = pass_depth, stencil = pass_stencil, ncolor = pass_ncolor, samples = pass_samples;
+    return pipe;
+}
+
+#define SIL_GROUND 280.0f  // half the side of the ground square his silhouette is laid on
 
 static void blob_draw(VkCommandBuffer cb) {
     float feet[3], yaw, swing, view[12], px, py;
     if (!pass_depth || !figure_state(feet, &yaw, &swing, view, &px, &py)) return;
     const uint64_t f = renderer_present_count();
-    if (shadow_near_frame != ~0ull && f - shadow_near_frame <= SHADOW_NEAR_FRAMES) return;  // (his real one is drawn)
-    VkPipeline pipe = blob_pipeline();
-    if (!pipe) return;
     int w, h;
     pass_size(&w, &h);
     if (w <= 0 || h <= 0) return;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
     VkRect2D sc = {{0, 0}, {(uint32_t)w, (uint32_t)h}};
-    vkCmdSetViewport(cb, 0, 1, &vp);
-    vkCmdSetScissor(cb, 0, 1, &sc);
     const float clip[16] = {px * view[0], py * view[4], 0, -view[8],
                             px * view[1], py * view[5], 0, -view[9],
                             px * view[2], py * view[6], 0, -view[10],
                             px * view[3], py * view[7], 1, -view[11]};
+    const bool sun = sun_turn_frame != ~0ull && f - sun_turn_frame <= SUN_TURN_FRAMES;
+    // His silhouette, drawn this frame: laid on a square of ground at his feet, each corner's place in it from the sun's view
+    if (sun && sil_frame == f && sil_scale[0] > 0) {
+        VkPipeline pipe = sil_pipeline();
+        VkDescriptorSet set = sil_set();
+        if (pipe && set) {
+            float rot[9];  // world -> the sun's view: the sun's turn (from the camera's view) after the camera's
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    rot[i * 3 + j] = sun_turn[i * 4] * view[j] + sun_turn[i * 4 + 1] * view[4 + j] + sun_turn[i * 4 + 2] * view[8 + j];
+            static const float CX[4] = {-1, 1, 1, -1}, CZ[4] = {-1, -1, 1, 1};
+            float uv[8];
+            for (int k = 0; k < 4; k++) {
+                const float rx = CX[k] * SIL_GROUND, rz = CZ[k] * SIL_GROUND;  // (on his feet's level)
+                const float sx = rot[0] * rx + rot[2] * rz, sy = rot[3] * rx + rot[5] * rz;
+                uv[k * 2] = 0.5f + 0.5f * sil_scale[0] * sx, uv[k * 2 + 1] = 0.5f + 0.5f * sil_scale[1] * sy;  // (its rows run down the sun's y)
+            }
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            vkCmdSetScissor(cb, 0, 1, &sc);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sil_layout(), 0, 1, &set, 0, NULL);
+            const float place[16] = {SIL_GROUND, 0, 0, 0, 0, 1, 0, 0, 0, 0, SIL_GROUND, 0, feet[0], feet[1] + BLOB_LIFT, feet[2], 1};
+            FigurePush push = {.color = {uv[0], uv[1], uv[2], uv[3]}, .turn = {uv[4], uv[5], uv[6], uv[7]}};
+            figure_mul(push.mvp, clip, place);
+            vkCmdPushConstants(cb, sil_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof push, &push);
+            vkCmdDraw(cb, 6, 1, 0, 0);
+            ss_forget();
+            return;
+        }
+    }
+    // Else (no sun lately: indoors, night) a soft round one
+    VkPipeline pipe = blob_pipeline();
+    if (!pipe) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
     const float place[16] = {BLOB_RADIUS, 0, 0, 0, 0, 1, 0, 0, 0, 0, BLOB_RADIUS, 0, feet[0], feet[1] + BLOB_LIFT, feet[2], 1};
     FigurePush push = {.color = {0, 0, 0, BLOB_DARK}};
     figure_mul(push.mvp, clip, place);
@@ -3472,18 +3655,15 @@ static int own_link_kind(Prog *pr, CmdRec *r) {
 }
 
 // ---- the second Link's shadow. The game draws this Link's shadow by drawing him from the sun's side (an orthographic view
-// centred on him, a 303-pixel square of a shadow atlas: cbuf masks 0x48 skinned, 0x8 rigid, as dup_link's otherwise), blurs
-// it and lays it on the ground around him. Each piece of his drawn there is drawn again as the other Link's: the sun's
-// rotation (taken from a frame where both views of one piece are known: it hardly changes) turns their bones, and they're
-// placed where they stand from this piece of his, as dup_link last drew both. Only near him: farther, the square doesn't
-// reach (the round shadow, dup_blob, takes over).
+// centred on him, a square of a shadow atlas: cbuf masks 0x48 skinned, 0x8 rigid, as dup_link's otherwise), blurs it and
+// lays it on a copy of the ground around him only. Each piece of his drawn there is drawn again as the other Link's, into a
+// texture of our own (sil_tex) centred on the other's feet: the sun's turn from the camera's view (each piece's sun view
+// against its camera view in one frame) turns their bones. blob_draw lays it on the ground at their feet.
 #define SHADOW_CBUFS 0x48
 #define SHADOW_RIGID_CBUFS 0x08
 #define SHADOW_PIECES 64
 #define SHADOW_MAX_BONES 384  // (his body meshes have 300 and more)
 #define SHADOW_FRAMES 16      // presents a piece's last drawing stays good for
-#define SHADOW_NEAR 100.0f      // how far from this Link the other can stand for his real shadow (the square reaches 250)
-#define SHADOW_SAME_LEVEL 25.0f  // how far above or below this Link the other can be for his real shadow
 typedef struct {
     uint32_t vertices, nbones;
     uint16_t tag;
@@ -3541,6 +3721,7 @@ static void shadow_note(uint32_t vertices, uint16_t tag, bool skinned, uint32_t 
         affine_mul(e->turn, e->sun, inv);
         e->turn[3] = e->turn[7] = e->turn[11] = 0;
         e->turn_known = true;
+        if (skinned) memcpy(sun_turn, e->turn, sizeof sun_turn), sun_turn_frame = renderer_present_count();  // (dup_blob)
     }
     e->sun_fresh = false;
     memcpy(e->mine, mine, sizeof e->mine);
@@ -3570,12 +3751,11 @@ static void dup_shadow(Prog *pr, CmdRec *r, bool indexed) {
     if (!e->turn_known || frame - e->frame > SHADOW_FRAMES) return;
     float feet[3], view[12], yaw, swing, px, py;
     if (!figure_state(feet, &yaw, &swing, view, &px, &py)) return;  // (gone, or a cutscene)
-    // (only on about the same level: the shadow has no depth, so across a slope it would streak along the sun's direction)
-    float me[3];
-    if (!coop_my_position(me) || fabsf(feet[1] - me[1]) > SHADOW_SAME_LEVEL) return;
-    // (and well inside the sun's square: near its edge his shadow stretches; the round one takes over before)
-    const float dx = feet[0] - me[0], dz = feet[2] - me[2];
-    if (dx * dx + dz * dz > SHADOW_NEAR * SHADOW_NEAR) return;
+    // His pieces, turned into the sun's view and placed around his feet (at the middle of the texture)
+    float fc[3];
+    for (int i = 0; i < 3; i++) fc[i] = view[i * 4] * feet[0] + view[i * 4 + 1] * feet[1] + view[i * 4 + 2] * feet[2] + view[i * 4 + 3];
+    if (!sil_tex) sil_tex = st.rt.ncolor && st.rt.color[0] ? vk_texture_target(st.rt.color[0], SIL_SIZE, SIL_SIZE) : NULL;
+    if (!sil_tex) return;
     static uint8_t *buf;
     static uint32_t used;
     if (!buf) buf = malloc(DUP_BUF_SIZE);
@@ -3585,24 +3765,41 @@ static void dup_shadow(Prog *pr, CmdRec *r, bool indexed) {
     float *dst = (float *)(buf + used);
     used += size;
     memcpy(dst, (const void *)(uintptr_t)bones->addr, bones->size);
-    bool inside = false;
     const float *t = e->turn;
     for (uint32_t b = 0; b < nbones; b++) {
         float *o = dst + first + b * 12;
         const float *w = e->theirs + b * 12;
-        affine_mul(o, t, w);  // (turned; placed from this piece of his, where it is now)
-        const float d0 = w[3] - e->mine[3], d1 = w[7] - e->mine[7], d2 = w[11] - e->mine[11];
-        for (int i = 0; i < 3; i++) o[i * 4 + 3] = src[i * 4 + 3] + t[i * 4] * d0 + t[i * 4 + 1] * d1 + t[i * 4 + 2] * d2;
-        inside |= fabsf(pm[0] * o[3]) < 0.9f && fabsf(pm[5] * o[7]) < 0.9f;
+        affine_mul(o, t, w);
+        const float d0 = w[3] - fc[0], d1 = w[7] - fc[1], d2 = w[11] - fc[2];
+        for (int i = 0; i < 3; i++) o[i * 4 + 3] = t[i * 4] * d0 + t[i * 4 + 1] * d1 + t[i * 4 + 2] * d2 + (i == 2 ? SIL_DEPTH : 0);
     }
-    if (!inside) return;
-    if (skinned) shadow_near_frame = frame;
+    sil_scale[0] = pm[0], sil_scale[1] = pm[5];
+    // drawn into our texture: its own pass, cleared the first time each frame
+    const RtState rt = st.rt;
+    float vpt[4];
+    int32_t sct[4];
+    memcpy(vpt, st.viewport[0], sizeof vpt), memcpy(sct, st.scissor[0], sizeof sct);
+    memset(&st.rt, 0, sizeof st.rt);
+    st.rt.ncolor = 1, st.rt.color[0] = sil_tex;
+    st.viewport[0][0] = st.viewport[0][1] = 0, st.viewport[0][2] = st.viewport[0][3] = SIL_SIZE;
+    st.scissor[0][0] = st.scissor[0][1] = 0, st.scissor[0][2] = st.scissor[0][3] = SIL_SIZE;
+    st.rt_dirty = true;
+    if (sil_frame != frame) {
+        begin_pass();
+        VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {0, 0, 0, 0}}}};
+        VkClearRect cr = {{{0, 0}, {SIL_SIZE, SIL_SIZE}}, 0, 1};
+        vkCmdClearAttachments(vk_cmd(), 1, &ca, 1, &cr);
+        sil_frame = frame;
+    }
     Range saved = *bones;
     bones->addr = (uint64_t)(uintptr_t)dst;
     dup_drawing = true;
     draw_(r, indexed);
     dup_drawing = false;
     *bones = saved;
+    st.rt = rt;
+    memcpy(st.viewport[0], vpt, sizeof vpt), memcpy(st.scissor[0], sct, sizeof sct);
+    st.rt_dirty = true;
 }
 
 static void dup_link(Prog *pr, CmdRec *r, bool indexed) {

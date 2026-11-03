@@ -500,6 +500,7 @@ static void upload_pending(NvnTexture *t, TexBackend *b) {
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
 // A texture's image from host pixels (RGBA8, w x h, pitch bytes a row), with mip levels made from them if it has any.
+static VkImageUsageFlags upload_extra_usage;  // (vk_texture_target: also drawn into)
 static bool upload_pixels(NvnTexture *t, TexBackend *b, const uint8_t *pixels, int w, int h, int pitch) {
     struct { int w, h, pitch; const void *pixels; } s_ = {w, h, pitch, pixels}, *s = &s_;
     bool srgb = (t->format >= 0x87 && t->format <= 0x94) ||
@@ -510,7 +511,7 @@ static bool upload_pixels(NvnTexture *t, TexBackend *b, const uint8_t *pixels, i
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, .imageType = VK_IMAGE_TYPE_2D,
         .format = format, .extent = {(uint32_t)s->w, (uint32_t)s->h, 1}, .mipLevels = levels, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | upload_extra_usage};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkImage image; VmaAllocation mem;
     VkResult result = vmaCreateImage(g_vk.vma, &ci, &ai, &image, &mem, NULL);
@@ -598,6 +599,18 @@ NvnTexture *vk_texture_from_rgba(const NvnTexture *like, const uint8_t *rgba, ui
     t->backend = b, t->pending_rgba = NULL, t->video_uploaded = false;
     b->gpu_owned = true, b->uploaded = true;  // (never read from game memory: what's uploaded here stays)
     if (!upload_pixels(t, b, rgba, (int)w, (int)h, (int)w * 4)) { free(b); free(t); return NULL; }
+    return t;
+}
+
+// A w x h RGBA8 texture of our own (like's other properties), cleared to black, that draws can also target. No game memory.
+NvnTexture *vk_texture_target(const NvnTexture *like, uint32_t w, uint32_t h) {
+    uint8_t *black = calloc((size_t)w * h, 4);
+    if (!black) return NULL;
+    upload_extra_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    NvnTexture *t = vk_texture_from_rgba(like, black, w, h);
+    upload_extra_usage = 0;
+    free(black);
+    if (t) t->width = w, t->height = h, t->depth = 1, t->levels = 1, t->addr = 0;
     return t;
 }
 
