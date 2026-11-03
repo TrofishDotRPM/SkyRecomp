@@ -1234,47 +1234,67 @@ static float sil_scale[2];          // the sun view's projection: x and y scale
 extern NvnTexture *vk_texture_target(const NvnTexture *like, uint32_t w, uint32_t h);
 #define SUN_TURN_FRAMES 240         // (without a sun lately - indoors, night - the shadow is round)
 
-static const char SIL_VS[] =
+// His silhouette laid on the world as it was drawn: after the world's pass, each pixel's place from its depth, then from his
+// feet in the sun's view; inside his silhouette (and on about his ground: not on what stands above it, not sunward of him),
+// darkened. As the game's own follows the ground, so does this.
+#define DECAL_ABOVE 40.0f     // how far above his feet a point can be and still take his shadow (slopes; not his body)
+#define DECAL_BELOW 160.0f    // ... and below
+#define DECAL_SUNWARD 30.0f   // (the silhouette goes both ways along the light: not on what's between him and the sun)
+static const char DECAL_VS[] =
     "#version 450\n"
-    "layout(push_constant) uniform P { mat4 mvp; vec4 uv01; vec4 uv23; } p;\n"
-    "layout(location = 0) out vec2 v_uv;\n"
-    "const vec2 C[6] = vec2[6](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,-1), vec2(1,1), vec2(-1,1));\n"
-    "const int K[6] = int[6](0, 1, 2, 0, 2, 3);\n"
-    "void main() {\n"
-    "    int k = K[gl_VertexIndex];\n"
-    "    v_uv = k == 0 ? p.uv01.xy : k == 1 ? p.uv01.zw : k == 2 ? p.uv23.xy : p.uv23.zw;\n"
-    "    gl_Position = p.mvp * vec4(C[gl_VertexIndex].x, 0.0, C[gl_VertexIndex].y, 1.0);\n"
-    "}\n";
-static const char SIL_FS[] =
+    "void main() { vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+static const char DECAL_FS[] =
     "#version 450\n"
+    "#ifndef DBG\n#define DBG 0\n#endif\n"
     "layout(set = 0, binding = 0) uniform sampler2D sil;\n"
-    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(set = 0, binding = 1) uniform sampler2D depth;\n"
+    "layout(push_constant) uniform P { vec4 t0, t1, t2, fc, up, proj; } p;\n"
     "layout(location = 0) out vec4 o_color;\n"
     "void main() {\n"
-    "    if (any(lessThan(v_uv, vec2(0.0))) || any(greaterThan(v_uv, vec2(1.0)))) discard;\n"
+    "    vec2 size = vec2(p.fc.w, p.up.w), f = gl_FragCoord.xy / size;\n"
+    "    float d = texture(depth, f).r;\n"
+    "    if (DBG == 1) { o_color = vec4(fract(d * 100.0), fract(d * 10000.0), 0.0, 0.8); return; }\n"
+    "    if (d <= 0.0) discard;\n"
+    "    float dist = 1.0 / d;\n"
+    "    vec2 ndc = f * 2.0 - 1.0;\n"
+    "    vec3 r = vec3(ndc.x * dist / p.proj.x, ndc.y * dist / p.proj.y, -dist) - p.fc.xyz;\n"
+    "    if (DBG == 2) { o_color = vec4(length(r) < 100.0 ? 1.0 : 0.0, length(r) < 300.0 ? 1.0 : 0.0, 0.0, 0.8); return; }\n"
+    "    float h = dot(r, p.up.xyz);\n"
+    "    if (DBG == 3) { o_color = vec4(h > 0.0 ? 1.0 : 0.0, abs(h) < 40.0 ? 1.0 : 0.0, 0.0, 0.8); return; }\n"
+    "    if (h > " "40.0" " || h < -" "160.0" ") discard;\n"
+    "    vec3 s = vec3(dot(p.t0.xyz, r), dot(p.t1.xyz, r), dot(p.t2.xyz, r));\n"
+    "    if (DBG == 4) { o_color = vec4(s.z > 30.0 ? 1.0 : 0.0, 0.0, 1.0, 0.8); return; }\n"
+    "    if (s.z > " "30.0" ") discard;\n"
+    "    vec2 uv = vec2(0.5 + 0.5 * p.proj.z * s.x, 0.5 + 0.5 * p.proj.w * s.y);\n"
+    "    if (DBG == 5) { o_color = vec4(clamp(uv, 0.0, 1.0), 0.0, 0.8); return; }\n"
+    "    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) discard;\n"
     "    vec2 px = 1.5 / vec2(textureSize(sil, 0));\n"
     "    float a = 0.0;\n"
-    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) a += texture(sil, v_uv + vec2(x, y) * px).r;\n"
+    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) a += texture(sil, uv + vec2(x, y) * px).r;\n"
     "    a /= 9.0;\n"
     "    if (a <= 0.0) discard;\n"
-    "    o_color = vec4(0.0, 0.0, 0.0, a * " "0.5" ");\n"
+    "    o_color = vec4(0.0, 0.0, 0.0, a * 0.5);\n"
     "}\n";
+typedef struct { float t0[4], t1[4], t2[4], fc[4], up[4], proj[4]; } DecalPush;
+static struct { bool due; DecalPush push; uint32_t w, h; NvnTexture *color, *depth; } decal;
+#define DECAL_SETS 4
 
-static VkDescriptorSetLayout sil_set_layout(void) {
+static VkDescriptorSetLayout decal_set_layout(void) {
     static VkDescriptorSetLayout l;
     if (!l) {
-        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-        VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+        VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+                                             {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &ci, NULL, &l));
     }
     return l;
 }
 
-static VkPipelineLayout sil_layout(void) {
+static VkPipelineLayout decal_layout(void) {
     static VkPipelineLayout l;
     if (!l) {
-        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(FigurePush)};
-        VkDescriptorSetLayout sl = sil_set_layout();
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(DecalPush)};
+        VkDescriptorSetLayout sl = decal_set_layout();
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl,
                                          .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
@@ -1282,54 +1302,32 @@ static VkPipelineLayout sil_layout(void) {
     return l;
 }
 
-// (the texture's view never changes: one set, written once)
-static VkDescriptorSet sil_set(void) {
-    static VkDescriptorSet set;
-    static VkImageView written;
-    if (!sil_tex) return VK_NULL_HANDLE;
-    VkImageView view = vk_view(sil_tex, NULL, false, false, TEXTYPE_2D);
-    if (!view) return VK_NULL_HANDLE;
-    if (!set) {
-        static VkDescriptorPool pool;
-        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
-        VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
-        VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &pci, NULL, &pool));
-        VkDescriptorSetLayout sl = sil_set_layout();
-        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1,
-                                          .pSetLayouts = &sl};
-        VK_CHECK(vkAllocateDescriptorSets(g_vk.dev, &ai, &set));
+static VkSampler decal_sampler(bool linear) {
+    static VkSampler smp[2];
+    if (!smp[linear]) {
+        VkFilter f = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        VkSamplerCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = f, .minFilter = f,
+                                   .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                                   .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+                                   .maxLod = 0};
+        VK_CHECK(vkCreateSampler(g_vk.dev, &sci, NULL, &smp[linear]));
     }
-    if (view != written) {
-        if (written) return VK_NULL_HANDLE;  // (rewriting a set a frame in flight may use isn't allowed: no shadow, rather)
-        static VkSampler smp;
-        if (!smp) {
-            VkSamplerCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
-                                       .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
-                                       .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
-                                       .maxLod = 0};
-            VK_CHECK(vkCreateSampler(g_vk.dev, &sci, NULL, &smp));
-        }
-        VkDescriptorImageInfo ii = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
-                                  .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
-        vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
-        written = view;
-    }
-    return set;
+    return smp[linear];
 }
 
-static VkPipeline sil_pipeline(void) {
+static VkPipeline decal_pipeline(VkFormat color) {
     static VkPipeline pipe;
-    static VkFormat color0, depth, stencil;
-    static uint32_t ncolor, samples;
+    static VkFormat made_for;
     static bool failed;
-    if (pipe && color0 == pass_color[0] && depth == pass_depth && stencil == pass_stencil && ncolor == pass_ncolor &&
-        samples == pass_samples)
-        return pipe;
+    if (pipe && made_for == color) return pipe;
     if (failed) return VK_NULL_HANDLE;
     size_t nv = 0, nf = 0;
-    uint32_t *sv = vk_glsl_to_spirv(SIL_VS, STAGE_VERTEX, "coop_sil.vert", &nv);
-    uint32_t *sf = vk_glsl_to_spirv(SIL_FS, STAGE_FRAGMENT, "coop_sil.frag", &nf);
+    uint32_t *sv = vk_glsl_to_spirv(DECAL_VS, STAGE_VERTEX, "coop_decal.vert", &nv);
+    // (LARECOMP_DECAL_DEBUG=n: what each step of it sees, painted)
+    static char fs[sizeof DECAL_FS + 64];
+    const char *dbg = getenv("LARECOMP_DECAL_DEBUG");
+    snprintf(fs, sizeof fs, "#version 450\n#define DBG %d\n%s", dbg ? atoi(dbg) : 0, DECAL_FS + strlen("#version 450\n"));
+    uint32_t *sf = vk_glsl_to_spirv(fs, STAGE_FRAGMENT, "coop_decal.frag", &nf);
     if (!sv || !sf) { failed = true; return VK_NULL_HANDLE; }
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -1343,38 +1341,94 @@ static VkPipeline sil_pipeline(void) {
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
                                                  .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)pass_samples};
-    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
-                                                .depthWriteEnable = VK_FALSE, .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL};
-    VkPipelineColorBlendAttachmentState cba[8] = {0};
-    cba[0].colorWriteMask = 0x7;
-    cba[0].blendEnable = VK_TRUE;
-    cba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    cba[0].colorBlendOp = VK_BLEND_OP_ADD;
-    cba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, cba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba[0].alphaBlendOp = VK_BLEND_OP_ADD;
-    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                                              .attachmentCount = pass_ncolor, .pAttachments = cba};
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba = {0};
+    cba.colorWriteMask = 0x7;
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+                                              .pAttachments = &cba};
     const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = 2, .pDynamicStates = dyn};
-    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = pass_ncolor,
-                                           .pColorAttachmentFormats = pass_color, .depthAttachmentFormat = pass_depth,
-                                           .stencilAttachmentFormat = pass_stencil};
+    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                           .pColorAttachmentFormats = &color};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rinfo, .stageCount = 2,
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
-                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = sil_layout()};
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = decal_layout()};
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) {
-        LOG("[coop] silhouette pipeline failed\n");
+        LOG("[coop] shadow decal pipeline failed\n");
         failed = true;
         return VK_NULL_HANDLE;
     }
-    pipe = p, color0 = pass_color[0], depth = pass_depth, stencil = pass_stencil, ncolor = pass_ncolor, samples = pass_samples;
+    pipe = p, made_for = color;
     return pipe;
 }
 
-#define SIL_GROUND 280.0f  // half the side of the ground square his silhouette is laid on
+// (vk_end_pass: the pass the game laid this Link's shadow in just ended) his onto it too
+static void decal_draw(VkCommandBuffer cb) {
+    decal.due = false;
+    NvnTexture *ct = decal.color, *dt = decal.depth;
+    if (!ct || !dt || !sil_tex || !ct->backend || !dt->backend) return;
+    VkImageView cv = vk_view(ct, NULL, false, true, TEXTYPE_2D), dv = vk_view(dt, NULL, false, false, TEXTYPE_2D),
+                sv = vk_view(sil_tex, NULL, false, false, TEXTYPE_2D);
+    if (!cv || !dv || !sv) return;
+    VkPipeline pipe = decal_pipeline(((TexBackend *)ct->backend)->format);
+    if (!pipe) return;
+    static VkDescriptorPool pool;
+    static VkDescriptorSet sets[DECAL_SETS];
+    if (!pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * DECAL_SETS};
+        VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = DECAL_SETS, .poolSizeCount = 1,
+                                          .pPoolSizes = &ps};
+        VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &pci, NULL, &pool));
+        VkDescriptorSetLayout ls[DECAL_SETS];
+        for (int i = 0; i < DECAL_SETS; i++) ls[i] = decal_set_layout();
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool,
+                                          .descriptorSetCount = DECAL_SETS, .pSetLayouts = ls};
+        VK_CHECK(vkAllocateDescriptorSets(g_vk.dev, &ai, sets));
+    }
+    // (a set a frame, in turn: one a frame still in flight uses isn't rewritten)
+    VkDescriptorSet set = sets[renderer_present_count() % DECAL_SETS];
+    VkDescriptorImageInfo ii[2] = {{decal_sampler(true), sv, VK_IMAGE_LAYOUT_GENERAL}, {decal_sampler(false), dv, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]}};
+    vkUpdateDescriptorSets(g_vk.dev, 2, w, 0, NULL);
+    vk_full_barrier(cb);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {decal.w, decal.h}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    VkViewport vp = {0, 0, (float)decal.w, (float)decal.h, 0, 1};
+    VkRect2D sc = {{0, 0}, {decal.w, decal.h}};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, decal_layout(), 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, decal_layout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof decal.push, &decal.push);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    vk_full_barrier(cb);
+    static bool told;
+    if (!told) {
+        told = true;
+        LOG("[coop] shadow decal: %ux%u, color %p depth %p (%ux%u fmt %#x), feet in view %.0f %.0f %.0f, up %.2f %.2f %.2f, proj %.3f %.3f %.4f %.4f\n",
+            decal.w, decal.h, (void *)ct, (void *)dt, dt->width, dt->height, dt->format, decal.push.fc[0], decal.push.fc[1], decal.push.fc[2],
+            decal.push.up[0], decal.push.up[1], decal.push.up[2], decal.push.proj[0], decal.push.proj[1], decal.push.proj[2], decal.push.proj[3]);
+    }
+    ss_forget();
+    st.rt_dirty = true;
+}
+
 
 static void blob_draw(VkCommandBuffer cb) {
     float feet[3], yaw, swing, view[12], px, py;
@@ -1390,35 +1444,7 @@ static void blob_draw(VkCommandBuffer cb) {
                             px * view[2], py * view[6], 0, -view[10],
                             px * view[3], py * view[7], 1, -view[11]};
     const bool sun = sun_turn_frame != ~0ull && f - sun_turn_frame <= SUN_TURN_FRAMES;
-    // His silhouette, drawn this frame: laid on a square of ground at his feet, each corner's place in it from the sun's view
-    if (sun && sil_frame == f && sil_scale[0] > 0) {
-        VkPipeline pipe = sil_pipeline();
-        VkDescriptorSet set = sil_set();
-        if (pipe && set) {
-            float rot[9];  // world -> the sun's view: the sun's turn (from the camera's view) after the camera's
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 3; j++)
-                    rot[i * 3 + j] = sun_turn[i * 4] * view[j] + sun_turn[i * 4 + 1] * view[4 + j] + sun_turn[i * 4 + 2] * view[8 + j];
-            static const float CX[4] = {-1, 1, 1, -1}, CZ[4] = {-1, -1, 1, 1};
-            float uv[8];
-            for (int k = 0; k < 4; k++) {
-                const float rx = CX[k] * SIL_GROUND, rz = CZ[k] * SIL_GROUND;  // (on his feet's level)
-                const float sx = rot[0] * rx + rot[2] * rz, sy = rot[3] * rx + rot[5] * rz;
-                uv[k * 2] = 0.5f + 0.5f * sil_scale[0] * sx, uv[k * 2 + 1] = 0.5f + 0.5f * sil_scale[1] * sy;  // (its rows run down the sun's y)
-            }
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-            vkCmdSetViewport(cb, 0, 1, &vp);
-            vkCmdSetScissor(cb, 0, 1, &sc);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sil_layout(), 0, 1, &set, 0, NULL);
-            const float place[16] = {SIL_GROUND, 0, 0, 0, 0, 1, 0, 0, 0, 0, SIL_GROUND, 0, feet[0], feet[1] + BLOB_LIFT, feet[2], 1};
-            FigurePush push = {.color = {uv[0], uv[1], uv[2], uv[3]}, .turn = {uv[4], uv[5], uv[6], uv[7]}};
-            figure_mul(push.mvp, clip, place);
-            vkCmdPushConstants(cb, sil_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof push, &push);
-            vkCmdDraw(cb, 6, 1, 0, 0);
-            ss_forget();
-            return;
-        }
-    }
+    if (sun && sil_frame == f && sil_scale[0] > 0) return;  // (his silhouette: decal_note lays it, where the game lays this Link's)
     // Else (no sun lately: indoors, night) a soft round one
     VkPipeline pipe = blob_pipeline();
     if (!pipe) return;
@@ -1457,6 +1483,7 @@ static void vk_end_pass_at(int line) {
     figure_pass_end(vk_cmd());
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    if (decal.due) decal_draw(vk_cmd());
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
@@ -3967,9 +3994,37 @@ static void dup_missed_log(Prog *pr, CmdRec *r, uint64_t seen_before) {
     }
 }
 
+// A draw of the game's that lays this Link's shadow (it samples the game's 303-pixel shadow texture, in a pass with depth):
+// the other's goes into the same pass, as it ends (decal_draw).
+static void decal_note(Prog *pr) {
+    const uint64_t f = renderer_present_count();
+    if (decal.due || !pr || !pr->fi || !st.rt.depth || !st.rt.ncolor || !st.rt.color[0] || sil_frame != f || sil_scale[0] <= 0) return;
+    bool lays = false;
+    for (int i = 0; i < pr->fi->ntex && !lays; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        lays = t && t != sil_tex && t->width == 303 && t->height == 303;
+    }
+    if (!lays) return;
+    float feet[3], yaw, swing, view[12], px, py;
+    if (!figure_state(feet, &yaw, &swing, view, &px, &py)) return;
+    if (sun_turn_frame == ~0ull || f - sun_turn_frame > SUN_TURN_FRAMES) return;
+    int w, h;
+    pass_size(&w, &h);
+    if (w <= 0 || h <= 0) return;
+    DecalPush *q = &decal.push;
+    float *rows[3] = {q->t0, q->t1, q->t2};
+    for (int i = 0; i < 3; i++) rows[i][0] = sun_turn[i * 4], rows[i][1] = sun_turn[i * 4 + 1], rows[i][2] = sun_turn[i * 4 + 2], rows[i][3] = 0;
+    for (int i = 0; i < 3; i++) q->fc[i] = view[i * 4] * feet[0] + view[i * 4 + 1] * feet[1] + view[i * 4 + 2] * feet[2] + view[i * 4 + 3];
+    for (int i = 0; i < 3; i++) q->up[i] = view[i * 4 + 1];  // (the world's up, in the camera's view)
+    q->fc[3] = (float)w, q->up[3] = (float)h;
+    q->proj[0] = px, q->proj[1] = py, q->proj[2] = sil_scale[0], q->proj[3] = sil_scale[1];
+    decal.w = (uint32_t)w, decal.h = (uint32_t)h, decal.color = st.rt.color[0], decal.depth = st.rt.depth, decal.due = true;
+}
+
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
+    decal_note(dup_program());
     const uint64_t seen_before = dup_copies;
     dup_link(dup_program(), r, indexed);
     dup_shadow(dup_program(), r, indexed);
