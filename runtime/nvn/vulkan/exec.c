@@ -3045,7 +3045,8 @@ static int texel_part(int kind, const uint8_t px[4], float u, float v) {
         if (h >= 36 && h <= 70 && s > 0.45f && hi < 0.9f) return COOP_LOOK_HAIR;
         if (u >= 0.53f && v < 0.25f) return -1;  // the mouth's inside and teeth, in the top right corner
         return COOP_LOOK_SKIN;                   // the rest: his face, ears and neck (the lips with them, a shade darker)
-    case KIND_HANDS: return COOP_LOOK_SKIN;
+    case KIND_HANDS:  // (with the classic tunic his hands' texture is glove leather around the fingers' skin band)
+        return hi < 0.45f && (h < 30 || h > 340) && s > 0.2f ? COOP_LOOK_GLOVES : COOP_LOOK_SKIN;
     case KIND_TUNIC: return COOP_LOOK_CLASSIC;
     case KIND_HAT: return COOP_LOOK_CLASSIC + 1;
     case KIND_SLEEVES: case KIND_LEGS: case KIND_BELT: {
@@ -3054,8 +3055,9 @@ static int texel_part(int kind, const uint8_t px[4], float u, float v) {
         bool tan = u >= 0.62f && h >= 20 && h <= 40 && s > 0.35f;
         bool leather = (h < 25 || h > 340) && s > 0.25f;
         bool cream = h >= 40 && h <= 75 && s < 0.25f && hi > 0.38f;
-        bool sole = h >= 200 && h <= 260 && s > 0.06f && s < 0.3f;
-        if (kind == KIND_SLEEVES) return cream ? COOP_LOOK_CLASSIC + 2 : -1;  // (the gloves stay leather)
+        bool sole = (h >= 200 && h <= 260 && s > 0.06f && s < 0.3f) ||  // (their blue grey edges)
+                    (u >= 0.45f && u < 0.62f && v >= 0.45f && h >= 35 && h <= 60 && s > 0.35f && hi < 0.5f);  // (undersides: dark olive)
+        if (kind == KIND_SLEEVES) return cream ? COOP_LOOK_CLASSIC + 2 : leather ? COOP_LOOK_GLOVES : -1;  // (gloves' cuffs)
         // (the waist belt is drawn with the legs: its strip, holes and all, is the texture's left quarter; the boots the rest)
         if (kind == KIND_LEGS) return tan ? COOP_LOOK_CLASSIC + 3 : leather && u < 0.25f ? COOP_LOOK_CLASSIC + 5
                                     : leather || sole ? COOP_LOOK_CLASSIC + 4 : -1;
