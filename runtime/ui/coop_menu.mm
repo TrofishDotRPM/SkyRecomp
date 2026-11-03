@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "imgui.h"
+#include "option_rows.h"
 #include "osk.h"
 
 extern "C" {
@@ -14,157 +15,6 @@ extern "C" {
 #include "../hle/coop_upnp.h"
 }
 #include "../hle/coop.h"
-
-static const ImVec4 WARN(1.0f, 0.62f, 0.35f, 1);
-
-// A button showing an eye: open while what it guards is shown, struck through while it's hidden. Pressing it flips *shown.
-static bool eye_button(const char *id, bool *shown, float scale) {
-    const float h = ImGui::GetFrameHeight(), w = h * 1.4f;
-    ImVec2 at = ImGui::GetCursorScreenPos();
-    bool pressed = ImGui::Button(id, ImVec2(w, h));  // (an ordinary button: focus, controller and hover as the rest)
-    if (pressed) *shown = !*shown;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(*shown ? "Hide" : "Show");
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
-    const ImVec2 c(at.x + w / 2, at.y + h / 2);
-    const float rx = h * 0.42f, ry = h * 0.22f, th = 1.6f * scale;
-    // the almond: an upper and a lower curve meeting at the corners
-    dl->PathClear();
-    dl->PathLineTo(ImVec2(c.x - rx, c.y));
-    dl->PathBezierQuadraticCurveTo(ImVec2(c.x, c.y - ry * 2), ImVec2(c.x + rx, c.y));
-    dl->PathBezierQuadraticCurveTo(ImVec2(c.x, c.y + ry * 2), ImVec2(c.x - rx, c.y));
-    dl->PathStroke(col, ImDrawFlags_Closed, th);
-    dl->AddCircleFilled(c, ry * 0.75f, col);
-    if (!*shown) dl->AddLine(ImVec2(c.x - rx * 0.8f, c.y + ry * 1.6f), ImVec2(c.x + rx * 0.8f, c.y - ry * 1.6f), col, th);
-    return pressed;
-}
-
-// Off, host or join; the fields for it; Start or Stop; and how it's going. Applying saves the settings (skyrecomp.ini) and
-// starts again from them on the game thread. true: a setting changed.
-static bool online_section(float scale) {
-    bool changed = false;
-    CoopStatus st;
-    coop_status(&st);
-    ImGui::SeparatorText("Online");
-    int mode = !strcmp(g_settings.coop_mode, "host") ? 1 : !strcmp(g_settings.coop_mode, "join") ? 2 : 0;
-    const bool running = st.mode != 0;
-    ImGui::BeginDisabled(running);  // (stop first: changing what's running underneath it would only confuse)
-    int pick = mode;
-    ImGui::RadioButton("Off", &pick, 0);
-    ImGui::SameLine();
-    ImGui::RadioButton("Host a game", &pick, 1);
-    ImGui::SameLine();
-    ImGui::RadioButton("Join a game", &pick, 2);
-    if (pick != mode) {
-        snprintf(g_settings.coop_mode, sizeof g_settings.coop_mode, "%s", pick == 1 ? "host" : pick == 2 ? "join" : "");
-        mode = pick;
-        changed = true;
-    }
-    const float label_w = 150 * scale;
-    auto field_label = [&](const char *text) {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(text);
-        ImGui::SameLine(label_w);
-        ImGui::SetNextItemWidth(-1);
-    };
-    char port[8];
-    snprintf(port, sizeof port, "%d", g_settings.coop_port > 0 ? g_settings.coop_port : COOP_DEFAULT_PORT);
-    if (mode == 2) {
-        field_label("Host address");
-        if (ui_input_text("##addr", g_settings.coop_addr, sizeof g_settings.coop_addr, 0, "The host's address, as they see it",
-                          "Host address"))
-            changed = true;
-    }
-    if (mode) {
-        field_label("Port");
-        if (ui_input_text("##port", port, sizeof port, ImGuiInputTextFlags_CharsDecimal, "27183", "Port")) {
-            int p = atoi(port);
-            g_settings.coop_port = p > 0 && p < 65536 ? p : 0;
-            changed = true;
-        }
-        static bool show;
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Password");
-        ImGui::SameLine(label_w);
-        ImGui::SetNextItemWidth(-(ImGui::GetFrameHeight() * 1.4f + ImGui::GetStyle().ItemSpacing.x));
-        if (ui_input_text("##key", g_settings.coop_key, 33, show ? 0 : ImGuiInputTextFlags_Password,
-                          mode == 1 ? "Friends need it to join" : "The host's password", "Password"))
-            changed = true;
-        ImGui::SameLine();
-        eye_button("##showkey", &show, scale);
-    }
-    if (mode == 1) {
-        ImGui::Dummy(ImVec2(label_w - ImGui::GetStyle().ItemSpacing.x, 0));
-        ImGui::SameLine(label_w);
-        if (ImGui::Checkbox("Open the port on my router automatically", &g_settings.coop_upnp)) changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::Spacing();
-    // Start or stop
-    if (running) {
-        if (ImGui::Button("Stop")) {
-            g_settings.coop_mode[0] = 0;  // (and not again at the next start of the game)
-            changed = true;
-            settings_save();
-            coop_apply_settings();
-        }
-    } else if (mode) {
-        bool ready = mode == 1 || g_settings.coop_addr[0];
-        ImGui::BeginDisabled(!ready);
-        if (ImGui::Button(mode == 1 ? "Start hosting" : "Join game")) {
-            settings_save();
-            coop_apply_settings();
-        }
-        ImGui::EndDisabled();
-        if (!ready) { ImGui::SameLine(); ImGui::TextDisabled("Type the host's address first."); }
-    }
-    // How it's going
-    ImGui::Spacing();
-    if (st.from_env) ImGui::TextWrapped("Started by the test launcher's settings; Stop, then start, to use these instead.");
-    if (st.mode == 1) {
-        if (st.peers) ImGui::TextWrapped("Hosting on port %d: %d player%s connected.", st.port, st.peers, st.peers == 1 ? "" : "s");
-        else ImGui::TextWrapped("Hosting on port %d: waiting for players.", st.port);
-        if (st.upnp == UPNP_WORKING) ImGui::TextWrapped("Opening the port on your router...");
-        if (st.upnp == UPNP_OPEN && st.address[0]) {  // (hidden until asked: it's easy to show on a stream by mistake)
-            static bool shown;
-            char line[96], masked[96];
-            snprintf(line, sizeof line, "%s:%d", st.address, st.port);
-            size_t n = strlen(line);
-            memset(masked, '*', n);
-            masked[n] = 0;
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Friends join with public IP:");
-            ImGui::SameLine();
-            ImGui::TextUnformatted(shown ? line : masked);
-            ImGui::SameLine();
-            eye_button("##showaddr", &shown, scale);
-            ImGui::SameLine();
-            if (ImGui::Button("Copy")) ImGui::SetClipboardText(line);
-        }
-        if (st.upnp_note[0]) {
-            ImGui::PushStyleColor(ImGuiCol_Text, WARN);
-            ImGui::TextWrapped("%s", st.upnp_note);
-            ImGui::PopStyleColor();
-        }
-        if (!g_settings.coop_upnp && !st.from_env)
-            ImGui::TextWrapped("The port isn't opened for you: forward port %d (TCP) on your router to this computer, or "
-                               "friends outside your home can't join.", st.port);
-    } else if (st.mode == 2) {
-        if (st.peers) ImGui::TextWrapped("Connected to the host.");
-        else if (st.joining) ImGui::TextWrapped("Connecting to %s...", g_settings.coop_addr);
-    } else {
-        ImGui::TextDisabled("Not connected.");
-    }
-    if (st.error[0] && !st.peers) {
-        ImGui::PushStyleColor(ImGuiCol_Text, WARN);
-        ImGui::TextWrapped("%s", st.error);
-        ImGui::PopStyleColor();
-    }
-    ImGui::Spacing();
-    ImGui::Spacing();
-    return changed;
-}
-
 
 static const char *const PARTS[COOP_LOOK_PARTS] = {"Shirt", "Tabard", "Trousers", "Boots", "Belt",
                                                     "Tunic", "Hat", "Undershirt", "Trousers", "Boots", "Belt", "Hair",
@@ -190,8 +40,7 @@ static bool part_row(int p, float scale) {
     bool changed = false;
     const float sw = 30 * scale;
     ImGui::PushID(p);
-    ImGui::Spacing();
-    ImGui::SeparatorText(PARTS[p]);
+    opt_heading(PARTS[p], scale);  // (as the other pages' sections)
     uint32_t &look = g_settings.coop_look[p];
     bool set = look & COOP_LOOK_SET;
     // The wheel works on its own floats while it's open: made again each frame from the 8-bit color saved, its hue would
@@ -237,14 +86,126 @@ static bool part_row(int p, float scale) {
     return changed;
 }
 
+// The Co-op page, as option rows (runtime/ui/option_rows.h) like the other pages: your name; then off, host or join, the
+// fields for it, Start or Stop, and how it's going. Applying saves the settings (skyrecomp.ini) and starts again from them
+// on the game thread.
 extern "C" void coop_menu_draw(float scale) {
-    bool changed = online_section(scale);
-    // the name over your Link, for the others
-    ImGui::SeparatorText("Your name");
-    ImGui::SetNextItemWidth(-1);
-    if (ui_input_text("##name", g_settings.coop_name, 21, 0, "Shown over your Link to the other player", "Your name")) changed = true;
-    ImGui::Spacing();
-    ImGui::Spacing();
+    bool changed = false;
+    CoopStatus st;
+    coop_status(&st);
+    const bool running = st.mode != 0;
+    int mode = !strcmp(g_settings.coop_mode, "host") ? 1 : !strcmp(g_settings.coop_mode, "join") ? 2 : 0;
+    opt_begin("##coop", scale);
+
+    opt_section("You");
+    if (opt_text("Name", g_settings.coop_name, 21, "Other player",
+                 "Shown over your Link to the other player, and in their popups. Up to 20 letters."))
+        changed = true;
+    if (opt_action("Link's colors", "Customize tab", "Your Link's hair, eyes, skin and clothes: the Customize tab, next to this one.")) {
+        extern int g_tab_request_ext;
+        g_tab_request_ext = 12;
+    }
+
+    opt_section("Online");
+    static const char *const MODES[] = {"Off", "Host a game", "Join a game"};
+    int pick = mode;
+    if (running) opt_disable_next();  // (stop first: changing what's running underneath it would only confuse)
+    if (opt_choice("Mode", &pick, MODES, 3, 0,
+                   "Host a game for a friend to join, or join a friend's. Stop first to change it.") && pick != mode) {
+        snprintf(g_settings.coop_mode, sizeof g_settings.coop_mode, "%s", pick == 1 ? "host" : pick == 2 ? "join" : "");
+        mode = pick;
+        changed = true;
+    }
+    if (mode == 2) {
+        if (running) opt_disable_next();
+        if (opt_text("Host address", g_settings.coop_addr, sizeof g_settings.coop_addr, "Type or paste it",
+                     "The host's public IP, as their Co-op page shows it (it may end with :port). Ctrl+V pastes."))
+            changed = true;
+    }
+    if (mode) {
+        static char port[8];  // (kept while it's being typed)
+        if (!opt_text_editing("Port")) snprintf(port, sizeof port, "%d", g_settings.coop_port > 0 ? g_settings.coop_port : COOP_DEFAULT_PORT);
+        if (running) opt_disable_next();
+        if (opt_text("Port", port, sizeof port, "27183", "The port to host on, or the host's. 27183 unless you change it.")) {
+            int p = atoi(port);
+            g_settings.coop_port = p > 0 && p < 65536 ? p : 0;
+            changed = true;
+        }
+        if (running) opt_disable_next();
+        if (opt_text("Password", g_settings.coop_key, 33, mode == 1 ? "None" : "The host's",
+                     mode == 1 ? "Friends need it to join. It's never sent: joining proves it instead."
+                               : "The host's password. It's never sent: joining proves it instead.",
+                     true))
+            changed = true;
+    }
+    if (mode == 1) {
+        if (running) opt_disable_next();
+        if (opt_toggle("Open router port", &g_settings.coop_upnp, true,
+                       "Ask your router (UPnP) to forward the port to this computer while you host, so friends outside your "
+                       "home can join. Off: forward it (TCP) by hand."))
+            changed = true;
+    }
+    if (running) {
+        if (opt_button("Stop", "Disconnect, and don't connect again when the game next starts.")) {
+            g_settings.coop_mode[0] = 0;
+            settings_save();
+            coop_apply_settings();
+        }
+    } else if (mode) {
+        bool ready = mode == 1 || g_settings.coop_addr[0];
+        if (!ready) opt_disable_next();
+        if (opt_button(mode == 1 ? "Start hosting" : "Join game",
+                       ready ? (mode == 1 ? "Start hosting with these settings (and next time the game starts)."
+                                          : "Join the host with these settings (and next time the game starts).")
+                             : "Type the host's address first.")) {
+            settings_save();
+            coop_apply_settings();
+        }
+    }
+
+    // How it's going: short on the row, the rest in its description
+    opt_section("Status");
+    char value[96], desc[512];
+    if (st.mode == 1) {
+        snprintf(value, sizeof value, st.peers ? "%d player%s connected" : "Waiting for players", st.peers, st.peers == 1 ? "" : "s");
+        snprintf(desc, sizeof desc, "Hosting on port %d.%s%s", st.port, st.error[0] && !st.peers ? " " : "", st.error[0] && !st.peers ? st.error : "");
+    } else if (st.mode == 2) {
+        snprintf(value, sizeof value, "%s", st.peers ? "Connected" : st.joining ? "Connecting..." : "Not connected");
+        snprintf(desc, sizeof desc, "%s%s%s", st.peers ? "Connected to the host." : "Joining the host.", st.error[0] && !st.peers ? " " : "",
+                 st.error[0] && !st.peers ? st.error : "");
+    } else {
+        snprintf(value, sizeof value, "%s", st.error[0] ? "Problem" : "Not connected");
+        snprintf(desc, sizeof desc, "%s", st.error[0] ? st.error : "Choose a mode above, then start.");
+    }
+    if (st.from_env) strncat(desc, " (Started by the test launcher's settings: Stop, then start, to use these.)", sizeof desc - strlen(desc) - 1);
+    opt_action("Connection", value, desc);
+    if (st.mode == 1) {
+        const char *router = st.upnp == UPNP_WORKING ? "Opening..." : st.upnp == UPNP_OPEN ? "Open" : st.upnp == UPNP_FAILED ? "Couldn't open"
+                           : g_settings.coop_upnp && !st.from_env ? "Not open" : "Forward it by hand";
+        char rdesc[256];
+        snprintf(rdesc, sizeof rdesc, "%s", st.upnp_note[0] ? st.upnp_note
+                 : st.upnp == UPNP_OPEN ? "Your router forwards the port to this computer while you host."
+                 : "Forward the port (TCP) on your router to this computer, or friends outside your home can't join.");
+        opt_action("Router port", router, rdesc);
+        if (st.upnp == UPNP_OPEN && st.address[0]) {  // (hidden until asked: it's easy to show on a stream by mistake)
+            static bool shown;
+            char line[96], masked[96];
+            snprintf(line, sizeof line, "%s:%d", st.address, st.port);
+            size_t n = strlen(line);
+            memset(masked, '*', n), masked[n] = 0;
+            if (opt_action("Public IP", shown ? line : masked, "What friends type to join. Hidden: press to show it, again to hide it."))
+                shown = !shown;
+            if (opt_button("Copy public IP", "Copy it, to paste to a friend.")) ImGui::SetClipboardText(line);
+        }
+    }
+    opt_end();
+    if (changed) settings_save();
+}
+
+// Customize page: the colors of your Link, part by part. The menu keeps to the left there, the game undimmed, so Link, in
+// the middle of the picture, shows them as they're picked (runtime/ui/menu.mm).
+extern "C" void coop_look_draw(float scale) {
+    bool changed = false;
     ImGui::TextWrapped("Your Link's looks: both players see them. Pick a color for each part, or Original for the "
                        "game's own. Your Link, to the right, shows them as you pick.");
     ImGui::Spacing();

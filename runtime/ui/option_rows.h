@@ -10,6 +10,8 @@
 
 void opt_begin(const char *id, float scale);
 void opt_section(const char *title);
+// the same heading (the gold diamond, the title in capitals, the rule after it) on a page that isn't option rows
+void opt_heading(const char *title, float scale);
 bool opt_toggle(const char *label, bool *v, bool def, const char *desc);
 // wrap: past the last value back to the first (and the other way); false: stops at the ends
 bool opt_choice(const char *label, int *v, const char *const *names, int n, int def, const char *desc, bool wrap = true);
@@ -29,7 +31,8 @@ bool opt_action(const char *label, const char *value, const char *desc, bool upp
 // text: the value shown on the right (hint when empty); A / click turns the row into a text field (the on-screen
 // keyboard with a controller). True when Enter / the keyboard confirmed a change.
 #include <stddef.h>
-bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc);
+// secret: shown as asterisks, and typed hidden (a password)
+bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc, bool secret = false);
 // that text row is being edited (its buffer is the user's: don't overwrite it)
 bool opt_text_editing(const char *label);
 // the next row is shown greyed out and can't be changed (e.g. forced by the seed)

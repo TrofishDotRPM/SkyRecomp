@@ -880,6 +880,7 @@ extern "C" bool chaos_overlay_wanted(void);
 extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" void coop_overlay_draw(ImVec2 display, ImFont *font, ImFont *label_font);
 extern "C" void coop_menu_draw(float scale);  // runtime/ui/coop_menu.mm
+extern "C" void coop_look_draw(float scale);
 extern "C" bool coop_overlay_wanted(void);
 extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
 
@@ -959,8 +960,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
-                                  "Cosmetics", "Controls", "Quit", "Mods", "Co-op"};
-    static const int order[] = {8, 0, 1, 6, 11, 5, 9};  // Controls, Video, Audio, Gameplay, Co-op, Cheats, Quit (Mods: hidden for now)
+                                  "Cosmetics", "Controls", "Quit", "Mods", "Co-op", "Customize"};
+    static const int order[] = {8, 0, 1, 6, 11, 12, 5, 9};  // Controls, Video, Audio, Gameplay, Co-op, Customize, Cheats, Quit (Mods: hidden for now)
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -1044,6 +1045,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 8: tab_about(); break;
                 case 10: tab_mods(scale); break;
                 case 11: coop_menu_draw(scale); break;
+                case 12: coop_look_draw(scale); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
@@ -1153,9 +1155,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (open) {
-        // dim the game behind the menu. The Co-op page instead keeps to the left, undimmed: Link, in the middle of the
+        // dim the game behind the menu. The Customize page instead keeps to the left, undimmed: Link, in the middle of the
         // picture, shows the colors being picked for him.
-        const bool preview = g_tab == 11;
+        const bool preview = g_tab == 12;
         if (!preview) ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
         float w = fminf(io.DisplaySize.x * 0.9f, 1500 * scale), h = io.DisplaySize.y - 2 * 18 * scale;  // (all the height: a slim margin)
         if (preview) {

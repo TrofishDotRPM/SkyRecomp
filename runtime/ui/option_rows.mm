@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <string>
 
 #include "imgui.h"
@@ -64,6 +65,11 @@ void opt_section(const char *title) {
     float lx = p.x + 24 * g_scale + tw;
     if (lx < p.x + avail_w - 8 * g_scale)
         dl->AddLine(ImVec2(lx, p.y + fs * 0.52f), ImVec2(p.x + avail_w, p.y + fs * 0.52f), IM_COL32(238, 198, 92, 48), 1.0f);
+}
+
+void opt_heading(const char *title, float scale) {
+    g_scale = scale;
+    opt_section(title);
 }
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or 0.
@@ -240,18 +246,19 @@ bool opt_action(const char *label, const char *value, const char *desc, bool upp
 static ImGuiID g_text_editing;  // the text row turned into a field (one at a time)
 bool opt_text_editing(const char *label) { return g_text_editing && g_text_editing == ImGui::GetID(label); }
 
-bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc) {
+bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc, bool secret) {
     ImGuiID &editing = g_text_editing;
     static int focus;        // frames left to give it the keyboard focus
     ImGuiID id = ImGui::GetID(label);
     if (editing != id) {
-        if (row(label, buf[0] ? buf : (hint ? hint : ""), false, desc) == 2) editing = id, focus = 2;
+        std::string shown = buf[0] ? (secret ? std::string(strlen(buf), '*') : std::string(buf)) : std::string(hint ? hint : "");
+        if (row(label, shown, false, desc) == 2) editing = id, focus = 2;
         return false;
     }
     ImGui::PushID(label);
     ImGui::SetNextItemWidth(-1);
     if (focus > 0) ImGui::SetKeyboardFocusHere(), focus--;
-    bool done = ui_input_text("##text", buf, cap, ImGuiInputTextFlags_EnterReturnsTrue, hint, label);
+    bool done = ui_input_text("##text", buf, cap, ImGuiInputTextFlags_EnterReturnsTrue | (secret ? ImGuiInputTextFlags_Password : 0), hint, label);
     if (ImGui::IsItemFocused()) { g_desc_focus = desc ? desc : ""; g_title_focus = label ? label : ""; }
     if (done || ui_input_text_cancelled() || (focus == 0 && !ImGui::IsItemActive() && !osk_is_open())) editing = 0;
     ImGui::PopID();
