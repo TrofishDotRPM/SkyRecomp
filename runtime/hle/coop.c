@@ -154,8 +154,13 @@ static void pos_send_tick(void) {
     last = now;
 }
 
+// The host, when another player arrives in its stage: the game forgets a stage's kills when you leave it, so theirs spawns
+// every enemy again; the host's kills there are sent again (pos_send_tick), and theirs are removed as they are live.
+static volatile bool g_kills_due;
+
 static void pos_received(const CoopEvent *ev) {
     pthread_mutex_lock(&g_pos_lock);
+    if ((ev->a != g_other_stage || !g_other_at) && ev->a == g_my_stage) g_kills_due = true;
     g_other[0] = (int16_t)ev->b * 2.0f;
     g_other[1] = (int16_t)ev->c * 2.0f;
     g_other[2] = (int16_t)ev->d * 2.0f;
@@ -720,6 +725,7 @@ static void start(bool use_env) {
     g_state = coop_net_start(mode, addr, port, key, on_event, on_joined, NULL) ? 1 : -1;
     coop_net_set_blob(blob_received);
     coop_enemy_set_puppets(g_state == 1 && join);  // (a joining player's bats follow the host's)
+    coop_enemy_set_hosting(g_state == 1 && host);
     // The router's port: hosting from the settings, if wanted (the test launcher's copies talk over this computer)
     g_upnp_on = g_state == 1 && host && !env && g_settings.coop_upnp;
     if (g_upnp_on) coop_upnp_open(g_port);
@@ -730,6 +736,7 @@ static void stop(void) {
     if (g_upnp_on) coop_upnp_close();
     g_upnp_on = false;
     coop_enemy_set_puppets(false);
+    coop_enemy_set_hosting(false);
     g_state = -1, g_mode = 0;
     pthread_mutex_lock(&g_pos_lock);
     g_other_at = 0;  // (their marker and Link go with them)
@@ -836,6 +843,18 @@ void coop_tick(void) {
     chest_lids_tick();
     pos_send_tick();
     pose_send_tick();
+    if (g_mode == 1 && g_kills_due && g_core.scene >= 0) {
+        g_kills_due = false;
+        int n = 0;
+        for (int w = 0; w < 4096; w++)
+            for (int b = 0; b < 16; b++)
+                if (g_core.enemy_live[w] & 1 << b) {
+                    CoopEvent kill = {COOP_EV_KILL, 0, (uint16_t)g_core.scene, (uint16_t)(w * 16 + b), 0};
+                    coop_net_send(&kill);
+                    n++;
+                }
+        if (g_test) LOG("[coop] another player came into this stage: sent its %d kills again\n", n);
+    }
     if (g_mode == 1) {  // (the host: its bats, for the others' to follow)
         static uint8_t ebuf[8192];
         int n = coop_enemy_take(ebuf, sizeof ebuf);

@@ -34,6 +34,7 @@ static const EnemyType TYPES[] = {
 #define NTYPES (int)(sizeof TYPES / sizeof *TYPES)
 #define PLAYER_PTR 0x7001826AD0ull
 #define PLAYER_VTABLE 0x7001637D28ull
+#define PLAYER_CENTRE 0x7001829a30ull  // 3 f32: Link's middle, kept apart from him (the same as his +0x1c8)
 #define ACTOR_PROFILE 0x10
 #define ACTOR_LIFE 0x12
 #define ACTOR_LIST 0x40
@@ -70,6 +71,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static Frame g_frames[RING];  // the latest from the host, oldest first
 static int g_nframes;
 static bool g_puppets;     // this player's bats follow the host's
+static bool g_hosting;     // this player's enemies are the ones the others' follow
 static uint8_t (*g_stage)(void);
 static GuestFn g_update[NTYPES];
 // Enemies this player hurt: let go, so they're hurt and die here as the game has them (then their defeat flag goes to the
@@ -109,6 +111,16 @@ static int16_t lerp_angle(int16_t a, int16_t b, float t) { return (int16_t)(a + 
 static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
     uint64_t self = c->x[0];
+    if (!guest_ptr(self) || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != T->profile) { g_update[ty](c); return; }
+    // (in another stage, or back in one: those let go were others, now gone; these are new)
+    static int seen_stage = -1;
+    int stage = g_stage ? g_stage() : 0;
+    if (stage != seen_stage) {
+        pthread_mutex_lock(&g_lock);
+        g_nreleased = 0;
+        pthread_mutex_unlock(&g_lock);
+        seen_stage = stage;
+    }
     bool driven = false, host_hurt = false;
     uint16_t flag = guest_ptr(self) ? *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG) : 0;
     if (g_puppets && guest_ptr(self) && *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) == T->profile && !released(T->profile, flag)) {
@@ -152,14 +164,42 @@ static void puppet_update(int ty, Cpu *c) {
         }
         pthread_mutex_unlock(&g_lock);
     }
-    // Its own update, with Link where the host's Link is: what it reacts to (waking, chasing) is then what the host's did, and
-    // it doesn't start reacting to this player's Link only to be put back next frame (stuck on the first frame of waking).
-    float other[3], saved[3];
+    // Its own update, with Link at whichever player is nearer it (the game knows of one Link): so the host's enemies wake for,
+    // chase and attack either player, and a joining player's react as the host's did (rather than start for this player's Link
+    // only to be put back next frame, stuck on the first frame of waking). Its attacks hit only the player really there.
+    float other[3];
     uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
-    bool swap = driven && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE && coop_other_feet(other);
-    if (swap) memcpy(saved, (const void *)(uintptr_t)(pl + ACTOR_POS), 12), memcpy((void *)(uintptr_t)(pl + ACTOR_POS), other, 12);
+    bool swap = (driven || g_hosting) && guest_ptr(self) && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE &&
+                coop_other_feet(other);
+    if (swap) {
+        const float *me = (const float *)(uintptr_t)(pl + ACTOR_POS), *it = (const float *)(uintptr_t)(self + ACTOR_POS);
+        float d_me = 0, d_other = 0;
+        for (int k = 0; k < 3; k++) d_me += (me[k] - it[k]) * (me[k] - it[k]), d_other += (other[k] - it[k]) * (other[k] - it[k]);
+        swap = d_other < d_me;
+    }
+    // (his feet, and the copies enemies aim at: his last position, head and middle, and those dAcPy_c keeps of its own; each
+    // moved by the same amount. Then his model's place: its matrix's translation, x y z a row apart)
+    static const int SPOTS[] = {ACTOR_POS, 0x1b0, 0x1bc, 0x1c8, 0x3d48, 0x4124, 0x4140, 0x6654, 0x6660, 0x6678, 0x67d4};
+    enum { NSPOTS = sizeof SPOTS / sizeof *SPOTS };
+    static const int MTX_T[3] = {0x200, 0x210, 0x220};
+    float *centre = (float *)(uintptr_t)PLAYER_CENTRE;  // (a global copy of his middle, outside him)
+    float keep[NSPOTS][3], keep_t[3], keep_c[3], d[3];
+    if (swap) {
+        for (int k = 0; k < 3; k++) d[k] = other[k] - ((const float *)(uintptr_t)(pl + ACTOR_POS))[k];
+        for (int i = 0; i < NSPOTS; i++) {
+            float *v = (float *)(uintptr_t)(pl + SPOTS[i]);
+            memcpy(keep[i], v, 12);
+            for (int k = 0; k < 3; k++) v[k] += d[k];
+        }
+        for (int k = 0; k < 3; k++) keep_t[k] = *(float *)(uintptr_t)(pl + MTX_T[k]), *(float *)(uintptr_t)(pl + MTX_T[k]) += d[k];
+        for (int k = 0; k < 3; k++) keep_c[k] = centre[k], centre[k] += d[k];
+    }
     g_update[ty](c);
-    if (swap) memcpy((void *)(uintptr_t)(pl + ACTOR_POS), saved, 12);
+    if (swap) {
+        for (int i = 0; i < NSPOTS; i++) memcpy((void *)(uintptr_t)(pl + SPOTS[i]), keep[i], 12);
+        for (int k = 0; k < 3; k++) *(float *)(uintptr_t)(pl + MTX_T[k]) = keep_t[k];
+        memcpy(centre, keep_c, 12);
+    }
     // Hurt here (this player's sword, not the host's state): from now on it's this player's to finish off
     if (driven && !host_hurt && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_nreleased < MAX_RELEASED) {
         pthread_mutex_lock(&g_lock);
@@ -182,6 +222,8 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
         hle_override(fn, UPDATES[ty], "coop enemy update");
     }
 }
+
+void coop_enemy_set_hosting(bool on) { g_hosting = on; }
 
 void coop_enemy_set_puppets(bool on) {
     pthread_mutex_lock(&g_lock);
