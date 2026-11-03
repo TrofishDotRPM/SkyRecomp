@@ -26,10 +26,15 @@ typedef struct {
     int anim;      // its animation: last frame f32, first frame f32, frame f32, mode u32, then (+0x18) its resource
     int extra;     // another animation resource it changes (0: none)
     int words[3];  // u32s copied as they are (0: none): a chuchu's are whether it's shown, once risen out of the ground
+    // Waking it for a player the game doesn't know (the host's, for a joining player under it): its state machine, the
+    // state it sleeps in and the one it wakes into (by name: <class>::StateID_<name>), and how near (sideways) wakes it.
+    const char *cls, *sleep, *wake;
+    int sm;
+    float wake_radius;
 } EnemyType;
 static const EnemyType TYPES[] = {
-    {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}},
-    {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}},
+    {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350},
+    {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, NULL, NULL, NULL, 0, 0},
 };
 #define NTYPES (int)(sizeof TYPES / sizeof *TYPES)
 #define PLAYER_PTR 0x7001826AD0ull
@@ -107,6 +112,44 @@ static const Snap *find(const Frame *f, uint16_t profile, uint16_t flag) {
 
 static int16_t lerp_angle(int16_t a, int16_t b, float t) { return (int16_t)(a + (int16_t)(b - a) * t); }
 
+#define SM_CHANGE_STATE 5  // sStateMgr_c's vtable: changeState(const sStateIDIf_c &)
+static uint64_t g_sleep_state[NTYPES], g_wake_state[NTYPES];  // (found by name at the start)
+
+// A class's state object (sStateID_c, its name pointer at +8) by its name. 0: not found.
+static uint64_t find_state(const char *cls, const char *name) {
+    char want[96];
+    int n = snprintf(want, sizeof want, "%s::StateID_%s", cls, name);
+    const char *ro = (const char *)(uintptr_t)0x7001300000ull;  // (the main module's strings and data, 1.0.0)
+    uint64_t str = 0;
+    for (size_t i = 0; i + (size_t)n + 1 < 0x100000; i++)
+        if (ro[i] == want[0] && !memcmp(ro + i, want, (size_t)n + 1)) { str = 0x7001300000ull + i; break; }
+    if (!str) return 0;
+    const uint64_t *data = (const uint64_t *)(uintptr_t)0x7001500000ull;
+    for (size_t i = 1; i < 0x200000 / 8; i++)
+        if (data[i] == str) return 0x7001500000ull + (i - 1) * 8;
+    return 0;
+}
+
+// The host: a sleeping one with the other player under it is woken, as it would wake for Link (its own changeState).
+static void wake_for_other(int ty, Cpu *c, uint64_t self) {
+    const EnemyType *T = &TYPES[ty];
+    if (!T->sm || !g_sleep_state[ty] || !g_wake_state[ty]) return;
+    uint64_t sm = self + T->sm;
+    if (*(uint64_t *)(uintptr_t)(sm + 0x20) != g_sleep_state[ty]) return;
+    float other[3];
+    if (!coop_other_feet(other)) return;
+    const float *it = (const float *)(uintptr_t)(self + ACTOR_POS);
+    float dx = other[0] - it[0], dz = other[2] - it[2];
+    if (dx * dx + dz * dz > T->wake_radius * T->wake_radius || other[1] > it[1] || it[1] - other[1] > 1500) return;
+    uint64_t vt = *(uint64_t *)(uintptr_t)sm;
+    if (vt < 0x7001000000ull || vt >= 0x7002000000ull) return;
+    GuestFn change = dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 8 * SM_CHANGE_STATE));
+    if (!change) return;
+    Cpu tmp = *c;  // (before its update: the guest stack below is free)
+    tmp.x[0] = sm, tmp.x[1] = g_wake_state[ty];
+    change(&tmp);
+    LOG("[coop] enemies: woke the %s with flag %#x for the other player\n", T->name, *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG));
+}
 // An enemy's update, on a player whose enemies follow the host's: the host's where, which way, size, state and animation first.
 static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
@@ -164,6 +207,7 @@ static void puppet_update(int ty, Cpu *c) {
         }
         pthread_mutex_unlock(&g_lock);
     }
+    if (g_hosting) wake_for_other(ty, c, self);
     // Its own update, with Link at whichever player is nearer it (the game knows of one Link): so the host's enemies wake for,
     // chase and attack either player, and a joining player's react as the host's did (rather than start for this player's Link
     // only to be put back next frame, stuck on the first frame of waking). Its attacks hit only the player really there.
@@ -220,6 +264,12 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
         g_update[ty] = dispatch_lookup(fn);
         if (!g_update[ty]) { LOG("[coop] enemies: the %s's update isn't where it was (%llx)\n", TYPES[ty].name, (unsigned long long)fn); continue; }
         hle_override(fn, UPDATES[ty], "coop enemy update");
+        if (TYPES[ty].cls) {
+            g_sleep_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].sleep);
+            g_wake_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].wake);
+            LOG("[coop] enemies: the %s sleeps in %llx, wakes into %llx\n", TYPES[ty].name, (unsigned long long)g_sleep_state[ty],
+                (unsigned long long)g_wake_state[ty]);
+        }
     }
 }
 
