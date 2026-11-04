@@ -173,6 +173,31 @@ extern "C" void coop_menu_draw(float scale) {
             menu_close_now();
         }
     }
+    if (getenv("LARECOMP_COOP_TEST")) {  // (the test windows only: enemies to try their sync on, without going to them)
+        opt_section("Testing");
+        static const struct { const char *name; uint16_t profile; } SPAWNS[] = {
+            {"Bokoblin", 0x17e}, {"Deku Baba", 0x16e}, {"Chuchu", 0x155}, {"Keese", 0x16d}, {"Cursed Bokoblin", 0x184},
+            {"Bokoblin (E_BCE)", 0x17f}, {"Technoblin", 0x18d}, {"Moblin", 0xc1}, {"Lizalfos", 0x171}, {"Stalfos", 0x167},
+            {"Stalmaster", 0x168}, {"Skulltula", 0x169}, {"Octorok", 0x15c}, {"Peahat", 0xc2}, {"Guay", 0x188},
+            {"Remlit", 0x170}, {"Froak", 0x158}, {"Armos", 0x14f}, {"Beamos", 0x156}, {"Walltula", 0x190}, {"Pyrup", 0x173},
+            {"Staldra", 0x175}, {"Magmanos", 0x163}, {"Spume", 0x164}, {"Sparks", 0x162}, {"Skytail", 0x185},
+        };
+        enum { N = sizeof SPAWNS / sizeof *SPAWNS };
+        static const char *names[N];
+        for (int i = 0; i < N; i++) names[i] = SPAWNS[i].name;
+        static int pick;
+        opt_choice("Enemy", &pick, names, N, 0, "Which enemy to spawn (test windows only).", true);
+        static char p1[12] = "ffffffff", p2[12] = "ffffffff";
+        opt_text("Parameters", p1, sizeof p1, "ffffffff", "Its first parameter, in hex (what kind, weapon, path...): ffffffff is the "
+                 "game's \"none\" for most fields. Placed enemies' own are in the stage files.");
+        opt_text("Parameters 2", p2, sizeof p2, "ffffffff", "Its second parameter, in hex.");
+        if (opt_button("Spawn in front of Link", "In front of your Link, facing him; the other window spawns the same, at the same "
+                       "spot, if it's in this area.")) {
+            coop_spawn_request(SPAWNS[pick].profile, (uint32_t)strtoul(p1, NULL, 16), (uint32_t)strtoul(p2, NULL, 16));
+            extern void menu_close_now(void);
+            menu_close_now();
+        }
+    }
     opt_section("Status");
     char value[96], desc[512];
     if (st.mode == 1) {

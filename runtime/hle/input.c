@@ -725,6 +725,8 @@ static void fill_state(Cpu *c) {
     if (g_is_skyward) {
         extern void coop_tick(void);
         coop_tick();
+        extern void coop_game_tick(Cpu *c);
+        coop_game_tick(c);
     }
     if (g_is_las) {
         extern void warp_game_tick(Cpu *c);

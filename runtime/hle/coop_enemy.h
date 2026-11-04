@@ -6,7 +6,8 @@
 // Co-op's larger messages (coop_net_send_blob) start with what they are.
 // ENEMIES_BACK: a joining player's, of the enemies holding them (theirs to run while they do), to the host.
 // ENEMY_TYPES: the host's added enemy types (coop_enemies.txt), as text, to whoever joins.
-enum { COOP_BLOB_POSE = 0, COOP_BLOB_ENEMIES = 1, COOP_BLOB_ENEMIES_BACK = 2, COOP_BLOB_ENEMY_TYPES = 3 };
+// SPAWN: an enemy spawned for testing (coop.c coop_spawn_request), for the other player's game to spawn too.
+enum { COOP_BLOB_POSE = 0, COOP_BLOB_ENEMIES = 1, COOP_BLOB_ENEMIES_BACK = 2, COOP_BLOB_ENEMY_TYPES = 3, COOP_BLOB_SPAWN = 4 };
 
 void coop_enemy_init(uint8_t (*stage)(void));  // once, before the game's first bat (stage: a hash of this player's stage)
 void coop_enemy_set_puppets(bool on);          // this player's bats follow the host's (a joining player)

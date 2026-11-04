@@ -127,10 +127,12 @@ static int16_t pos_unit(float v) {
     return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
 }
 
+static void spawn_received(const uint8_t *d, int size);
 static void blob_received(const uint8_t *data, int size, void *user) {  // (what it is: its first byte)
     (void)user;
     if (size < 1) return;
     if (data[0] == COOP_BLOB_ENEMIES || data[0] == COOP_BLOB_ENEMIES_BACK) { coop_enemy_receive(data, size); return; }
+    if (data[0] == COOP_BLOB_SPAWN) { spawn_received(data, size); return; }
     if (data[0] == COOP_BLOB_ENEMY_TYPES && g_mode == 2) {  // (the host's added enemy types: each line, as text)
         char text[2048];
         int n = size - 1 < (int)sizeof text - 1 ? size - 1 : (int)sizeof text - 1;
@@ -1070,6 +1072,104 @@ static void boss_room_tick(void) {
     }
     static unsigned frame;
     if (beaten_before && !(frame++ & 7)) actors_each(remove_heart_container, NULL);
+}
+
+// ---- (testing) spawning an actor: an enemy in front of Link, to try each one's sync without travelling to it. The game's
+// own way, as sshd-rando's spawn_actor does it (its 1.0.1 addresses; 1.0.0's found by the stores before the 167 calls to the
+// same function, the data 0x4000 lower than 1.0.1's): globals the new actor's constructor reads (where, which way, its
+// second parameter, room...), then allocateNewActor(profile, parent, param1, group 2), the parent its room's actor
+// (room manager +0xf0 + room * 8, its tree node at +0x18), the room the actor's s8 at +0x17c (Link's, here).
+#define SP_OBJINFO 0x2bfd8b0ull  // (main+) ptr
+#define SP_SUBTYPE 0x2bfd8b8ull  // u8
+#define SP_POS 0x2bfd8c0ull      // f32 *
+#define SP_ROT 0x2bfd8c8ull      // s16 *
+#define SP_SCALE 0x2bfd8d0ull    // f32 *
+#define SP_REF 0x2bfd8d8ull      // ptr
+#define SP_PARAM2 0x16854b8ull   // u32
+#define SP_OBJFLAG 0x16854bcull  // u16
+#define SP_VIEWCLIP 0x16854c0ull // u8
+#define SP_ROOM 0x16854c4ull     // u32
+#define ROOM_MGR 0x2bf9d90ull    // ptr
+#define ALLOCATE_NEW_ACTOR 0xf101b0ull
+#define ACTOR_ROOM 0x17c         // s8
+#define SPAWN_AHEAD 250.0f
+static volatile int g_spawn_req;
+static uint16_t g_spawn_prof;
+static uint32_t g_spawn_p1, g_spawn_p2;
+static struct { bool due; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; uint8_t stage; } g_spawn_theirs;
+static float *g_spawn_buf;  // (guest-visible: where and which way, for the constructor to read)
+RT_ON_RESET(coop_spawn_reset) { g_spawn_buf = NULL; }  // (reboot: the HLE heap it was in is gone)
+
+void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2) {
+    g_spawn_prof = profile, g_spawn_p1 = param1, g_spawn_p2 = param2;
+    g_spawn_req = 1;
+}
+
+static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw, int room) {
+    uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ROOM_MGR);
+    if (!guest_ptr(mgr) || room < 0 || room > 63) return 0;
+    uint64_t room_actor = *(uint64_t *)(uintptr_t)(mgr + 0xf0 + 8ull * (uint64_t)room);
+    if (!guest_ptr(room_actor)) return 0;
+    if (!g_spawn_buf) g_spawn_buf = hle_alloc(32);
+    float *p = g_spawn_buf;
+    int16_t *r = (int16_t *)(p + 4);
+    memcpy(p, pos, 12), r[0] = 0, r[1] = yaw, r[2] = 0;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_POS) = (uint64_t)(uintptr_t)p;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_ROT) = (uint64_t)(uintptr_t)r;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_SCALE) = 0;
+    *(uint16_t *)(uintptr_t)(MAIN_BASE + SP_OBJFLAG) = 0xFFFF;
+    *(uint8_t *)(uintptr_t)(MAIN_BASE + SP_VIEWCLIP) = 0xFF;
+    *(uint32_t *)(uintptr_t)(MAIN_BASE + SP_PARAM2) = p2;
+    *(uint32_t *)(uintptr_t)(MAIN_BASE + SP_ROOM) = (uint32_t)room;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_REF) = 0;
+    *(uint8_t *)(uintptr_t)(MAIN_BASE + SP_SUBTYPE) = 0;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_OBJINFO) = 0;
+    Cpu t = *c;  // (inside a call of the game's: the stack below is free)
+    t.x[0] = prof, t.x[1] = room_actor + 0x18, t.x[2] = p1, t.x[3] = 2;
+    guest_call(&t, MAIN_BASE + ALLOCATE_NEW_ACTOR);
+    *(uint32_t *)(uintptr_t)(MAIN_BASE + SP_PARAM2) = 0xFFFFFFFF;  // (as the game leaves them)
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_POS) = 0, *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_ROT) = 0;
+    LOG("[coop] test: spawned profile %#x (params %#x %#x) in room %d at %.0f %.0f %.0f: %llx\n", prof, p1, p2, room, pos[0], pos[1],
+        pos[2], (unsigned long long)t.x[0]);
+    return t.x[0];
+}
+
+static void spawn_received(const uint8_t *d, int size) {  // [kind][stage][prof u16][p1 u32][p2 u32][pos 3 f32][yaw s16]
+    if (size != 1 + 1 + 2 + 4 + 4 + 12 + 2) return;
+    g_spawn_theirs.stage = d[1];
+    memcpy(&g_spawn_theirs.prof, d + 2, 2), memcpy(&g_spawn_theirs.p1, d + 4, 4), memcpy(&g_spawn_theirs.p2, d + 8, 4);
+    memcpy(g_spawn_theirs.pos, d + 12, 12), memcpy(&g_spawn_theirs.yaw, d + 24, 2);
+    bool sane = g_spawn_theirs.prof < 0x300;
+    for (int k = 0; k < 3; k++) sane &= isfinite(g_spawn_theirs.pos[k]);
+    g_spawn_theirs.due = sane;
+}
+
+// Once per frame, with the game's own call in hand (runtime/hle/input.c): what needs the game's functions.
+void coop_game_tick(Cpu *c) {
+    if (!g_test || g_state != 1 || !g_core.baselined) { g_spawn_req = 0, g_spawn_theirs.due = false; return; }
+    uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return;
+    const int room = *(int8_t *)(uintptr_t)(pl + ACTOR_ROOM);
+    if (g_spawn_req) {
+        g_spawn_req = 0;
+        const float *me = (const float *)(uintptr_t)(pl + PLAYER_POS);
+        const int16_t yaw = *(int16_t *)(uintptr_t)(pl + 0x13e);
+        const float a = yaw * (float)M_PI / 32768.0f;
+        float pos[3] = {me[0] + sinf(a) * SPAWN_AHEAD, me[1] + 20, me[2] + cosf(a) * SPAWN_AHEAD};
+        const int16_t face = (int16_t)(yaw + 0x8000);  // (facing Link)
+        spawn_actor(c, g_spawn_prof, g_spawn_p1, g_spawn_p2, pos, face, room);
+        uint8_t b[26];
+        b[0] = COOP_BLOB_SPAWN, b[1] = stage_hash();
+        memcpy(b + 2, &g_spawn_prof, 2), memcpy(b + 4, &g_spawn_p1, 4), memcpy(b + 8, &g_spawn_p2, 4), memcpy(b + 12, pos, 12),
+            memcpy(b + 24, &face, 2);
+        coop_net_send_blob(b, sizeof b);
+    }
+    if (g_spawn_theirs.due) {
+        g_spawn_theirs.due = false;
+        if (g_spawn_theirs.stage == stage_hash())
+            spawn_actor(c, g_spawn_theirs.prof, g_spawn_theirs.p1, g_spawn_theirs.p2, g_spawn_theirs.pos, g_spawn_theirs.yaw, room);
+        else LOG("[coop] test: the other player spawned profile %#x in another area\n", g_spawn_theirs.prof);
+    }
 }
 
 // Once per frame, on the game thread (runtime/hle/input.c).
