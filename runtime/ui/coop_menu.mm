@@ -167,7 +167,7 @@ extern "C" void coop_menu_draw(float scale) {
     if (running && st.peers) {
         if (!st.other_here) opt_disable_next();
         if (opt_button("Wait for me!", st.other_here ? "Go to where the other player stands, right now."
-                                                     : "Go to where the other player stands: only in the same area as them (not in a boss's)."))  {
+                                                     : "Go to where the other player stands: only in the same area as them (not a boss's or a Silent Realm)."))  {
             coop_wait_for_me();
             extern void menu_close_now(void);
             menu_close_now();

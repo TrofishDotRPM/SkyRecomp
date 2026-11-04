@@ -73,7 +73,7 @@ static void emit(const CoopEvent *ev, void *user) {
     (void)user;
     if (in_boss()) {  // (a boss area's: this player's alone)
         static int told;
-        if (told++ < 20) LOG("[coop] boss area: not sending type %d a %d b %d c %#x\n", ev->type, ev->a, ev->b, ev->c);
+        if (told++ < 20) LOG("[coop] boss area or Silent Realm: not sending type %d a %d b %d c %#x\n", ev->type, ev->a, ev->b, ev->c);
         return;
     }
     log_event("sent", ev);
@@ -108,10 +108,11 @@ static bool g_in_play;
 // ---- boss areas are each player's own (the user's wish: every boss fought alone). Their stages are named B... (B100
 // Ghirahim 1, B200 Scaldera, B300 Moldarach, B101 Koloktos, B301 Tentalus, B201 Ghirahim 2, as sshd-rando's heart
 // container locations have them; B210, B400, and B100_1, B101_1, B201_1 besides). While this player is in one: the other isn't shown, nothing this player does there is sent (ever: the
-// other fights it too), and what the other does meanwhile waits until this player leaves.
+// other fights it too), and what the other does meanwhile waits until this player leaves. The Silent Realms (S000 Skyloft,
+// S100 Faron, S200 Eldin, S300 Lanayru) likewise: each player's trial is their own.
 static bool in_boss(void) {
     const char *s = (const char *)(uintptr_t)STAGE_NAME;
-    return s[0] == 'B' && s[1] >= '0' && s[1] <= '9';
+    return (s[0] == 'B' || s[0] == 'S') && s[1] >= '0' && s[1] <= '9';
 }
 
 static uint8_t stage_hash(void) {
@@ -1090,7 +1091,7 @@ void coop_tick(void) {
     if (g_ndeferred && !in_boss() && g_core.baselined) {  // (out of a boss area: what the other did meanwhile)
         int n = g_ndeferred;
         g_ndeferred = 0;
-        LOG("[coop] out of the boss area: %d of the other player's changes now\n", n);
+        LOG("[coop] out of the boss area or Silent Realm: %d of the other player's changes now\n", n);
         for (int i = 0; i < n; i++) on_event(&g_deferred[i], NULL);
     }
     if (!save_in_play()) {
