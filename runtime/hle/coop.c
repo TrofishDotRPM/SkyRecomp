@@ -1123,7 +1123,13 @@ static bool profile_here(uint64_t a, const char *name, void *user) {
 #define ARC_MGR 0x192fd50ull
 #define WORK2_HEAP 0x1830560ull
 #define ARC_LOAD 0xde7440ull
-#define ARC_ENSURE 0xde7a84ull  // dRawArcTable_c::ensureLoadedMaybe(table, name): 0 ready, 1 still reading, < 0 failed
+#define ARC_GET_DATA 0xde7b30ull  // dRawArcTable_c::getDataFromOarc(table, name, path): NULL if it isn't there
+// An entry's own loading step, dRawArcEntry_c::ensureLoadedMaybe(entry, the table's callback): 0 mounted, 1 still reading,
+// < 0 failed (main+0xde71ec: 94 callers, the read's isDone and the heap calls the decomp has; main+0xde7a84 is the table's
+// decreaseRefCount, which releases it). Entries: 0x58 bytes from the table's first pointer, count u16 at +8, the callback
+// at +0x10; in each the name (32 bytes), its users u16 at +0x20, the read under way at +0x28, the mounted archive at +0x30.
+#define ARC_ENTRY_ENSURE 0xde71ecull
+#define ARC_ENTRY_SIZE 0x58
 #define SPAWN_LOAD_FRAMES 300 // (given up on after this: 5 s)
 static const struct { uint16_t profile; const char *arcs[3]; } SPAWN_ARCS[] = {
     {0x16e, {"Degubaba"}}, {0x16d, {"Kiesu", "Kiesu_anime"}}, {0x155, {"Sm"}}, {0x184, {"Bocoburin_Z", "Skull"}},
@@ -1144,19 +1150,26 @@ static bool spawn_known(uint16_t prof) {
 static int spawn_arcs_ready(Cpu *c, uint16_t prof) {
     uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ARC_MGR);
     if (!guest_ptr(mgr)) return -1;
-    static char *name;
-    if (!name) name = hle_alloc(32);
+    const uint64_t table = mgr + 8, entries = *(uint64_t *)(uintptr_t)table, callback = *(uint64_t *)(uintptr_t)(table + 0x10);
+    const unsigned count = *(uint16_t *)(uintptr_t)(table + 8);
+    if (!guest_ptr(entries) || count > 1024) return -1;
     int state = 0;
     for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++) {
         if (SPAWN_ARCS[i].profile != prof) continue;
         for (int k = 0; k < 3 && SPAWN_ARCS[i].arcs[k]; k++) {
-            snprintf(name, 32, "%s", SPAWN_ARCS[i].arcs[k]);
+            uint64_t e = 0;
+            for (unsigned j = 0; j < count && !e; j++) {
+                uint64_t x = entries + (uint64_t)j * ARC_ENTRY_SIZE;
+                if (*(uint16_t *)(uintptr_t)(x + 0x20) && !strncmp((const char *)(uintptr_t)x, SPAWN_ARCS[i].arcs[k], 32)) e = x;
+            }
+            if (!e) { LOG("[coop] test: object archive %s isn't in the table\n", SPAWN_ARCS[i].arcs[k]); return -1; }
+            if (*(uint64_t *)(uintptr_t)(e + 0x30)) continue;  // (mounted)
             Cpu t = *c;
-            t.x[0] = mgr + 8, t.x[1] = (uint64_t)(uintptr_t)name;
-            guest_call(&t, MAIN_BASE + ARC_ENSURE);
+            t.x[0] = e, t.x[1] = callback;
+            guest_call(&t, MAIN_BASE + ARC_ENTRY_ENSURE);
             int r = (int)(int32_t)t.x[0];
-            if (r < 0) { LOG("[coop] test: object archive %s didn't load (%d)\n", name, r); return -1; }
-            if (r == 1) state = 1;
+            if (r < 0) { LOG("[coop] test: object archive %s didn't load (%d)\n", SPAWN_ARCS[i].arcs[k], r); return -1; }
+            if (r == 1 || !*(uint64_t *)(uintptr_t)(e + 0x30)) state = 1;
         }
     }
     return state;
@@ -1271,6 +1284,25 @@ void coop_game_tick(Cpu *c) {
         int r = spawn_arcs_ready(c, g_spawn_later[i].prof);
         if (r == 0) {
             LOG("[coop] test: archives ready after %d frames\n", SPAWN_LOAD_FRAMES - g_spawn_later[i].wait);
+            {  // (what a lookup finds: its model, and a model that's always loaded, for comparison)
+                uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ARC_MGR);
+                static char *q;
+                if (!q) q = hle_alloc(96);
+                const char *tries[][2] = {{"Bc", "g3d/model.brres"}, {NULL, "g3d/model.brres"}};
+                for (int k = 0; k < 2; k++) {
+                    const char *arc = tries[k][0];
+                    for (size_t j = 0; !arc && j < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; j++)
+                        if (SPAWN_ARCS[j].profile == g_spawn_later[i].prof) arc = SPAWN_ARCS[j].arcs[0];
+                    if (!arc) continue;
+                    snprintf(q, 32, "%s", arc), snprintf(q + 32, 64, "%s", tries[k][1]);
+                    Cpu t = *c;
+                    t.x[0] = mgr + 8, t.x[1] = (uint64_t)(uintptr_t)q, t.x[2] = (uint64_t)(uintptr_t)(q + 32);
+                    guest_call(&t, MAIN_BASE + ARC_GET_DATA);
+                    LOG("[coop] test: lookup %s / %s: %#llx\n", q, q + 32, (unsigned long long)t.x[0]);
+                    if (k == 1 && !t.x[0]) { toast("Its model isn't findable: not spawned"); g_spawn_later[i].wait = 0; }
+                }
+                if (!g_spawn_later[i].wait) continue;
+            }
             g_spawn_later[i].wait = 0;
             spawn_actor(c, g_spawn_later[i].prof, g_spawn_later[i].p1, g_spawn_later[i].p2, g_spawn_later[i].pos, g_spawn_later[i].yaw, room);
         } else if (r < 0 || !--g_spawn_later[i].wait) {
