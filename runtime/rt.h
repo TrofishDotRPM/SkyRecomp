@@ -54,6 +54,7 @@ GuestFn dispatch_lookup(uint64_t addr);
 uint64_t hle_register(const char *name, HostFn fn);  // returns fake guest address
 HostFn hle_lookup_impl(const char *name);
 void hle_override(uint64_t guest_addr, HostFn fn, const char *name);
+void hle_override_now(uint64_t guest_addr, HostFn fn, const char *name);  // (while running: on the thread that runs that code)
 void rt_fatal_trace(void) __attribute__((noreturn));
 void crash_handler_install(void);  // per thread (alternate signal stack)
 

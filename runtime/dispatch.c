@@ -145,6 +145,14 @@ GuestFn dispatch_lookup(uint64_t addr) {
 #define DCACHE 4096
 static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
 
+// An override added while the game runs: this thread's cached lookup of that address is dropped, so it takes effect now.
+// (Call it on the thread that runs that code: the cache is per thread.)
+void hle_override_now(uint64_t addr, HostFn fn, const char *name) {
+    hle_override(addr, fn, name);
+    unsigned h = (unsigned)(addr >> 2) & (DCACHE - 1);
+    if (dcache[h].addr == addr) dcache[h].addr = 0;
+}
+
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {

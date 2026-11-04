@@ -35,13 +35,15 @@ typedef struct {
     // other player's: those states act on the game's one Link (a chuchu's Absorption slows him and shows "Shake").
     const char *grab[2], *idle;
 } EnemyType;
-static const EnemyType TYPES[] = {
+#define MAX_TYPES 16
+static EnemyType TYPES[MAX_TYPES] = {
     {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
      0xd28, 0, {"Absorption", "Shake"}, "Wait"},
 };
-#define NTYPES (int)(sizeof TYPES / sizeof *TYPES)
+static int g_ntypes = 2;  // (the two above; more from coop_enemies.txt, or sent by the host: coop_enemy_add_type)
+#define NTYPES g_ntypes
 #define PLAYER_PTR 0x7001826AD0ull
 #define PLAYER_VTABLE 0x7001637D28ull
 #define PLAYER_CENTRE 0x7001829a30ull  // 3 f32: Link's middle, kept apart from him (the same as his +0x1c8)
@@ -84,7 +86,7 @@ static int g_nframes;
 static bool g_puppets;     // this player's bats follow the host's
 static bool g_hosting;     // this player's enemies are the ones the others' follow
 static uint8_t (*g_stage)(void);
-static GuestFn g_update[NTYPES];
+static GuestFn g_update[MAX_TYPES];
 // Enemies this player hurt: let go while they're hurt, so they're hurt and die here as the game has them (then their defeat
 // flag goes to the host as any kill does, and theirs is removed). One that gets over it follows the host's again.
 #define MAX_RELEASED 64
@@ -166,8 +168,8 @@ static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pai
 static int16_t lerp_angle(int16_t a, int16_t b, float t) { return (int16_t)(a + (int16_t)(b - a) * t); }
 
 #define SM_CHANGE_STATE 5  // sStateMgr_c's vtable: changeState(const sStateIDIf_c &)
-static uint64_t g_sleep_state[NTYPES], g_wake_state[NTYPES];  // (found by name at the start)
-static uint64_t g_grab_state[NTYPES][2], g_idle_state[NTYPES];
+static uint64_t g_sleep_state[MAX_TYPES], g_wake_state[MAX_TYPES];  // (found by name at the start)
+static uint64_t g_grab_state[MAX_TYPES][2], g_idle_state[MAX_TYPES];
 
 static bool grab_state(int ty, uint64_t st) { return st && (st == g_grab_state[ty][0] || st == g_grab_state[ty][1]); }
 
@@ -416,30 +418,108 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     *(float *)(uintptr_t)(an + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
 }
 
-static void update_0(Cpu *c) { puppet_update(0, c); }
-static void update_1(Cpu *c) { puppet_update(1, c); }
-static const HostFn UPDATES[NTYPES] = {update_0, update_1};
+#define U(n) static void update_##n(Cpu *c) { puppet_update(n, c); }
+U(0) U(1) U(2) U(3) U(4) U(5) U(6) U(7) U(8) U(9) U(10) U(11) U(12) U(13) U(14) U(15)
+#undef U
+static const HostFn UPDATES[MAX_TYPES] = {update_0, update_1, update_2, update_3, update_4, update_5, update_6, update_7,
+                                          update_8, update_9, update_10, update_11, update_12, update_13, update_14, update_15};
+
+// Its update taken over (vtable slot 20), and its named states found. now: while the game runs (on its thread).
+static bool install_type(int ty, bool now) {
+    const EnemyType *T = &TYPES[ty];
+    uint64_t fn = ((const uint64_t *)(uintptr_t)T->vtable)[UPDATE_SLOT];
+    g_update[ty] = dispatch_lookup(fn);
+    if (!g_update[ty]) { LOG("[coop] enemies: the %s's update isn't where it was (%llx)\n", T->name, (unsigned long long)fn); return false; }
+    if (now) hle_override_now(fn, UPDATES[ty], "coop enemy update");
+    else hle_override(fn, UPDATES[ty], "coop enemy update");
+    if (T->cls && T->grab[0]) {
+        for (int k = 0; k < 2; k++) g_grab_state[ty][k] = T->grab[k] ? find_state(T->cls, T->grab[k]) : 0;
+        g_idle_state[ty] = find_state(T->cls, T->idle);
+        LOG("[coop] enemies: the %s holds a Link in %llx / %llx, stands in %llx\n", T->name, (unsigned long long)g_grab_state[ty][0],
+            (unsigned long long)g_grab_state[ty][1], (unsigned long long)g_idle_state[ty]);
+    }
+    if (T->cls && T->sleep) {
+        g_sleep_state[ty] = find_state(T->cls, T->sleep);
+        g_wake_state[ty] = find_state(T->cls, T->wake);
+        LOG("[coop] enemies: the %s sleeps in %llx, wakes into %llx\n", T->name, (unsigned long long)g_sleep_state[ty],
+            (unsigned long long)g_wake_state[ty]);
+    }
+    return true;
+}
+
+// ---- more types without a rebuild: a line each (coop_enemies.txt in the data folder, read at the start; the host sends its
+// lines to whoever joins, who take them on as they come). Numbers in hex:
+//   name profile vtable state anim [extra] [w=word,word,word]
+// state: the slot holding its current state (the machine is 0x20 before it; the two after and the one 0x28 before go
+// with it, as in both types above); anim: its animation block (end, start, frame, mode, then its resource at +0x18).
+// Checked: a profile, a vtable in the game's data whose update the game has, offsets inside an actor.
+static char g_type_name[MAX_TYPES][24];
+static char g_type_lines[MAX_TYPES][160];  // (as given: what the host sends on)
+
+bool coop_enemy_add_type(const char *line) {
+    char name[24];
+    unsigned long long prof, vt, st, an, ex = 0;
+    int n = 0;
+    while (*line == ' ' || *line == '\t') line++;
+    if (!*line || *line == '#' || *line == '\n') return false;
+    if (sscanf(line, "%23s %llx %llx %llx %llx%n", name, &prof, &vt, &st, &an, &n) < 5) { LOG("[coop] enemies: can't read type line: %s\n", line); return false; }
+    const char *rest = line + n;
+    unsigned long long w[3] = {0};
+    char tok[64];
+    int m = 0;
+    while (sscanf(rest, "%63s%n", tok, &m) == 1) {
+        rest += m;
+        if (!strncmp(tok, "w=", 2)) sscanf(tok + 2, "%llx,%llx,%llx", &w[0], &w[1], &w[2]);
+        else sscanf(tok, "%llx", &ex);
+    }
+    bool sane = prof < 0x300 && vt >= 0x7001500000ull && vt < 0x7001700000ull && vt % 8 == 0 && st >= 0x28 && st < 0x4000 &&
+                st % 8 == 0 && an < 0x4000 && an % 4 == 0 && ex < 0x4000 && w[0] < 0x4000 && w[1] < 0x4000 && w[2] < 0x4000;
+    if (!sane) { LOG("[coop] enemies: type line out of range: %s\n", line); return false; }
+    for (int ty = 0; ty < g_ntypes; ty++)
+        if (TYPES[ty].profile == prof) return false;  // (known already)
+    if (g_ntypes == MAX_TYPES) return false;
+    int ty = g_ntypes;
+    snprintf(g_type_name[ty], sizeof g_type_name[ty], "%s", name);
+    snprintf(g_type_lines[ty], sizeof g_type_lines[ty], "%s", line);
+    char *nl = strchr(g_type_lines[ty], '\n');
+    if (nl) *nl = 0;
+    TYPES[ty] = (EnemyType){g_type_name[ty], (uint16_t)prof, vt, {(int)st - 0x28, (int)st, (int)st + 8, (int)st + 0x10}, (int)an, (int)ex,
+                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL};
+    g_ntypes++;
+    if (!install_type(ty, true)) { g_ntypes--; return false; }
+    LOG("[coop] enemies: %s (profile %#llx) now follows the host's too\n", name, prof);
+    return true;
+}
+
+// The host's added lines, for whoever joins: '\n' between. Returns the length.
+int coop_enemy_types_text(char *out, int cap) {
+    int n = 0;
+    for (int ty = 2; ty < g_ntypes && n < cap - 1; ty++) n += snprintf(out + n, (size_t)(cap - n), "%s\n", g_type_lines[ty]);
+    return n < cap ? n : cap - 1;
+}
 
 void coop_enemy_init(uint8_t (*stage)(void)) {
     g_stage = stage;
-    for (int ty = 0; ty < NTYPES; ty++) {
-        uint64_t fn = ((const uint64_t *)(uintptr_t)TYPES[ty].vtable)[UPDATE_SLOT];
-        g_update[ty] = dispatch_lookup(fn);
-        if (!g_update[ty]) { LOG("[coop] enemies: the %s's update isn't where it was (%llx)\n", TYPES[ty].name, (unsigned long long)fn); continue; }
-        hle_override(fn, UPDATES[ty], "coop enemy update");
-        if (TYPES[ty].cls && TYPES[ty].grab[0]) {
-            for (int k = 0; k < 2; k++) g_grab_state[ty][k] = TYPES[ty].grab[k] ? find_state(TYPES[ty].cls, TYPES[ty].grab[k]) : 0;
-            g_idle_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].idle);
-            LOG("[coop] enemies: the %s holds a Link in %llx / %llx, stands in %llx\n", TYPES[ty].name, (unsigned long long)g_grab_state[ty][0],
-                (unsigned long long)g_grab_state[ty][1], (unsigned long long)g_idle_state[ty]);
-        }
-        if (TYPES[ty].cls && TYPES[ty].sleep) {
-            g_sleep_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].sleep);
-            g_wake_state[ty] = find_state(TYPES[ty].cls, TYPES[ty].wake);
-            LOG("[coop] enemies: the %s sleeps in %llx, wakes into %llx\n", TYPES[ty].name, (unsigned long long)g_sleep_state[ty],
-                (unsigned long long)g_wake_state[ty]);
-        }
+    for (int ty = 0; ty < g_ntypes; ty++) install_type(ty, true);
+    FILE *f = fopen("coop_enemies.txt", "r");
+    if (!f && (f = fopen("coop_enemies.txt", "w"))) {  // (a start, saying how)
+        fputs("# Co-op: more enemies that follow the host's (runtime/hle/coop_enemy.c, coop_enemy_add_type). One a line, in hex:\n"
+              "#   name profile vtable state anim [extra] [w=word,word,word]\n"
+              "# The host's lines go to whoever joins.\n", f);
+        fclose(f);
+        f = NULL;
     }
+    if (f) fclose(f);
+    coop_enemy_read_types();
+}
+
+// coop_enemies.txt's lines not taken on yet (at the start, and again as a player joins the host: a line added meanwhile counts)
+void coop_enemy_read_types(void) {
+    FILE *f = fopen("coop_enemies.txt", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) coop_enemy_add_type(line);
+    fclose(f);
 }
 
 void coop_enemy_set_hosting(bool on) { g_hosting = on; }

@@ -5,7 +5,8 @@
 
 // Co-op's larger messages (coop_net_send_blob) start with what they are.
 // ENEMIES_BACK: a joining player's, of the enemies holding them (theirs to run while they do), to the host.
-enum { COOP_BLOB_POSE = 0, COOP_BLOB_ENEMIES = 1, COOP_BLOB_ENEMIES_BACK = 2 };
+// ENEMY_TYPES: the host's added enemy types (coop_enemies.txt), as text, to whoever joins.
+enum { COOP_BLOB_POSE = 0, COOP_BLOB_ENEMIES = 1, COOP_BLOB_ENEMIES_BACK = 2, COOP_BLOB_ENEMY_TYPES = 3 };
 
 void coop_enemy_init(uint8_t (*stage)(void));  // once, before the game's first bat (stage: a hash of this player's stage)
 void coop_enemy_set_puppets(bool on);          // this player's bats follow the host's (a joining player)
@@ -16,5 +17,9 @@ void coop_enemy_receive(const uint8_t *d, int size);
 // Deaths of enemies without a flag of their own: who to tell (the sender's), and one the other player's game says died here.
 void coop_enemy_set_gone_sender(void (*fn)(uint16_t profile, uint32_t id));
 void coop_enemy_gone(uint16_t profile, uint32_t id);
+// More types: a line (see coop_enemy.c), on the game thread. And the host's added lines, to send to whoever joins.
+bool coop_enemy_add_type(const char *line);
+int coop_enemy_types_text(char *out, int cap);
+void coop_enemy_read_types(void);  // coop_enemies.txt again (new lines only)
 // (runtime/hle/coop.c) where the other player's Link stands, if they're in this player's stage
 bool coop_other_feet(float out[3]);

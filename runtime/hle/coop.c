@@ -130,6 +130,13 @@ static void blob_received(const uint8_t *data, int size, void *user) {  // (what
     (void)user;
     if (size < 1) return;
     if (data[0] == COOP_BLOB_ENEMIES || data[0] == COOP_BLOB_ENEMIES_BACK) { coop_enemy_receive(data, size); return; }
+    if (data[0] == COOP_BLOB_ENEMY_TYPES && g_mode == 2) {  // (the host's added enemy types: each line, as text)
+        char text[2048];
+        int n = size - 1 < (int)sizeof text - 1 ? size - 1 : (int)sizeof text - 1;
+        memcpy(text, data + 1, (size_t)n), text[n] = 0;
+        for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) coop_enemy_add_type(line);
+        return;
+    }
     if (data[0] != COOP_BLOB_POSE) return;
     if (!coop_pose_receive(data + 1, (size_t)size - 1, SDL_GetTicks()) && g_test) LOG("[coop] ignored a malformed pose\n");
 }
@@ -844,6 +851,13 @@ static void on_joined(void *user) {
     if (g_mode == 2) g_copy_done = false, g_copy_started = false;  // (a new connection: a copy to come)
     coop_core_snapshot(&g_core);  // (nothing, without a save in play)
     if (g_mode == 1 && g_core.baselined) copy_send();
+    if (g_mode == 1) {  // (its added enemy types, for them to follow too: the file read again, for lines added meanwhile)
+        coop_enemy_read_types();
+        static uint8_t buf[2048];
+        buf[0] = COOP_BLOB_ENEMY_TYPES;
+        int n = coop_enemy_types_text((char *)buf + 1, (int)sizeof buf - 1);
+        if (n) coop_net_send_blob(buf, n + 1);
+    }
 }
 
 static bool save_in_play(void) {
