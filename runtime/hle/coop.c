@@ -1123,7 +1123,8 @@ static bool profile_here(uint64_t a, const char *name, void *user) {
 #define ARC_MGR 0x192fd50ull
 #define WORK2_HEAP 0x1830560ull
 #define ARC_LOAD 0xde7440ull
-#define SPAWN_LOAD_FRAMES 60  // (then spawned: the archives' loading given a second)
+#define ARC_ENSURE 0xde7a84ull  // dRawArcTable_c::ensureLoadedMaybe(table, name): 0 ready, 1 still reading, < 0 failed
+#define SPAWN_LOAD_FRAMES 300 // (given up on after this: 5 s)
 static const struct { uint16_t profile; const char *arcs[3]; } SPAWN_ARCS[] = {
     {0x16e, {"Degubaba"}}, {0x16d, {"Kiesu", "Kiesu_anime"}}, {0x155, {"Sm"}}, {0x184, {"Bocoburin_Z", "Skull"}},
     {0x17f, {"Bce"}}, {0x171, {"LizarufosA", "Liza_tail"}}, {0x167, {"Sf"}}, {0x168, {"Sf4", "Skull"}},
@@ -1136,6 +1137,29 @@ static const struct { uint16_t profile; const char *arcs[3]; } SPAWN_ARCS[] = {
 static bool spawn_known(uint16_t prof) {
     for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++) if (SPAWN_ARCS[i].profile == prof) return true;
     return false;
+}
+
+// Each of its archives read and mounted (the table's ensureLoadedMaybe, called until it's done, as a stage load does): 0 all
+// ready, 1 still loading, -1 failed.
+static int spawn_arcs_ready(Cpu *c, uint16_t prof) {
+    uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ARC_MGR);
+    if (!guest_ptr(mgr)) return -1;
+    static char *name;
+    if (!name) name = hle_alloc(32);
+    int state = 0;
+    for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++) {
+        if (SPAWN_ARCS[i].profile != prof) continue;
+        for (int k = 0; k < 3 && SPAWN_ARCS[i].arcs[k]; k++) {
+            snprintf(name, 32, "%s", SPAWN_ARCS[i].arcs[k]);
+            Cpu t = *c;
+            t.x[0] = mgr + 8, t.x[1] = (uint64_t)(uintptr_t)name;
+            guest_call(&t, MAIN_BASE + ARC_ENSURE);
+            int r = (int)(int32_t)t.x[0];
+            if (r < 0) { LOG("[coop] test: object archive %s didn't load (%d)\n", name, r); return -1; }
+            if (r == 1) state = 1;
+        }
+    }
+    return state;
 }
 
 static void spawn_load_arcs(Cpu *c, uint16_t prof) {
@@ -1242,9 +1266,19 @@ void coop_game_tick(Cpu *c) {
         }
         else LOG("[coop] test: the other player spawned profile %#x in another area\n", g_spawn_theirs.prof);
     }
-    for (int i = 0; i < 4; i++)  // (their archives loading: spawned once that's had its time)
-        if (g_spawn_later[i].wait && !--g_spawn_later[i].wait)
+    for (int i = 0; i < 4; i++) {  // (their archives loading: spawned once they're all mounted)
+        if (!g_spawn_later[i].wait) continue;
+        int r = spawn_arcs_ready(c, g_spawn_later[i].prof);
+        if (r == 0) {
+            LOG("[coop] test: archives ready after %d frames\n", SPAWN_LOAD_FRAMES - g_spawn_later[i].wait);
+            g_spawn_later[i].wait = 0;
             spawn_actor(c, g_spawn_later[i].prof, g_spawn_later[i].p1, g_spawn_later[i].p2, g_spawn_later[i].pos, g_spawn_later[i].yaw, room);
+        } else if (r < 0 || !--g_spawn_later[i].wait) {
+            if (r > 0) LOG("[coop] test: archives for %#x still not loaded: not spawned\n", g_spawn_later[i].prof);
+            g_spawn_later[i].wait = 0;
+            toast("Couldn't load its models");
+        }
+    }
 }
 
 // Once per frame, on the game thread (runtime/hle/input.c).
