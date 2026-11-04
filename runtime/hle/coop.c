@@ -928,9 +928,42 @@ static void stop(void) {
 
 void coop_apply_settings(void) { g_apply = 1; }
 
+// ---- "Wait for me!" (the Co-op tab): this player's Link to where the other player's stands, in the same area. Moved as the
+// enemies' update moves him for a moment (runtime/hle/coop_enemy.c): his position and the copies of it the game keeps
+// (last position, head, middle, dAcPy_c's own), his model's matrix and the global copy of his middle, all by the same amount.
+// To another area it would need the game's own stage change, not found yet for 1.0.0.
+static volatile int g_wait_req;
+void coop_wait_for_me(void) { g_wait_req = 1; }
+
+static void wait_tick(void) {
+    if (!g_wait_req) return;
+    g_wait_req = 0;
+    float other[3];
+    uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (in_boss() || in_event() || !coop_other_feet(other) || !guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) {
+        toast("Can't reach them from here");
+        return;
+    }
+    static const int SPOTS[] = {PLAYER_POS, 0x1b0, 0x1bc, 0x1c8, 0x3d48, 0x4124, 0x4140, 0x6654, 0x6660, 0x6678, 0x67d4};
+    static const int MTX_T[3] = {0x200, 0x210, 0x220};
+    float d[3];
+    const float *me = (const float *)(uintptr_t)(pl + PLAYER_POS);
+    for (int k = 0; k < 3; k++) d[k] = other[k] - me[k];
+    d[1] += 8;  // (a little above their feet: dropped onto the ground, not into it)
+    for (size_t i = 0; i < sizeof SPOTS / sizeof *SPOTS; i++)
+        for (int k = 0; k < 3; k++) ((float *)(uintptr_t)(pl + SPOTS[i]))[k] += d[k];
+    for (int k = 0; k < 3; k++) *(float *)(uintptr_t)(pl + MTX_T[k]) += d[k];
+    float *centre = (float *)(uintptr_t)0x7001829a30ull;  // (the global copy of his middle: coop_enemy.c PLAYER_CENTRE)
+    for (int k = 0; k < 3; k++) centre[k] += d[k];
+    LOG("[coop] wait for me: moved %.0f %.0f %.0f to the other player\n", d[0], d[1], d[2]);
+    toast("Caught up");
+}
+
 void coop_status(CoopStatus *out) {
     memset(out, 0, sizeof *out);
     out->mode = g_mode, out->from_env = g_from_env, out->port = g_port;
+    float o[3];
+    out->other_here = g_mode && coop_other_feet(o) && !in_boss();
     CoopNetStatus n;
     coop_net_status(&n);
     if (g_mode) out->peers = n.peers, out->joining = n.joining;
@@ -1063,6 +1096,7 @@ void coop_tick(void) {
     }
     chest_lids_tick();
     boss_room_tick();
+    wait_tick();
     pos_send_tick();
     pose_send_tick();
     coop_enemy_tick();

@@ -55,6 +55,8 @@ The other player appears as a second real Link when you're both in the same stag
 
 The other player's Link casts his own shadow: each frame his pieces are drawn again from the sun's direction (the game's own shadow pass for this Link gives the sun's view) into a texture of ours centred on his feet. In the pass where the game lays this Link's shadow, each pixel's place is worked out from the scene's depth and darkened where it falls inside his silhouette, so it follows slopes and steps as the game's own does (LARECOMP_DECAL_DEBUG=n paints each step of that). Indoors and at night, without a sun, a soft round one.
 
+**Wait for me!** (Co-op tab, while connected) takes your Link to where the other player's stands, when you're in the same area (not in a boss's): his position and the copies of it the game keeps are moved together, as the enemy sync moves them for a moment. To another area it would need the game's own stage change, not found yet.
+
 Boss areas are each player's own: in a stage named B... (B100 Ghirahim 1, B200 Scaldera, B300 Moldarach, B101 Koloktos, B301 Tentalus, B201 Ghirahim 2, and B210, B400 and the rooms after some of them) the other player isn't shown, nothing done there is sent (ever: the other fights that boss too), and the other's changes meanwhile wait until you leave. The Imprisoned fights aren't in B stages, so they're shared like anywhere else.
 
 During a cutscene (or anything the game runs as an event, Fi talking included) the other player's Link, name and marker are hidden, and come back half a second after it ends: the game's count of running events is at main+0x5b1f1c8 (v1.0.0).

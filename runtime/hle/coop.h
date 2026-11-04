@@ -16,11 +16,13 @@ typedef struct {
     int upnp;              // UpnpState (coop_upnp.h): the host's router port
     char address[64];      // the router's public address, once the port is open
     char upnp_note[192];   // why the port couldn't be opened, or a warning about the address
+    bool other_here;       // the other player is in this player's area (Wait for me! can take them there)
 } CoopStatus;
 
 void coop_status(CoopStatus *out);  // any thread
 void coop_apply_settings(void);     // any thread: stop, and start again from g_settings (coop_mode empty: stays off)
 const char *coop_other_name(void);
+void coop_wait_for_me(void);        // any thread: next frame, this player's Link goes to where the other's stands
 
 #ifdef __cplusplus
 }
