@@ -1144,7 +1144,7 @@ static const struct { uint16_t profile; const char *arcs[3]; uint32_t p1, p2; } 
     {0x190, {"StalWall"}, 0xfffffff1, 0x07ffffff}, {0x173, {"Hidokari", "HidokariS"}, 0xffeffff2, 0x25ffffff},
     {0x175, {"Hydra"}, 0xfff0703f, 0x14ffffff}, {0x163, {"Magma"}, 0xffffffff, 0xffffffff}, {0x164, {"Maguppo"}, 0xfff2efff, 0xffffffff},
     {0x185, {"Skytail"}, 0xffffffff, 0xffffffff}, {0x18d, {"Chaser_A", "Chaser_B"}, 0xf800ffff, 0xffffffff},
-    {0x17e, {NULL}, 0xd9ffd00d, 0x255fffff},  // (Bc: in ObjectPack, always loaded)
+    {0x17e, {NULL}, 0xf0ffff20, 0x255fffff},  // (Bc: in ObjectPack, always loaded. Faron Woods's: the commonest, d9ffd00d, are Lanayru's time-shift skeletons)
 };
 
 static bool spawn_known(uint16_t prof) {

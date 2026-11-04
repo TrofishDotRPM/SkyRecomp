@@ -117,7 +117,9 @@ static bool hurt_state(uint64_t st) {
     const char *n = strstr((const char *)(uintptr_t)name, "StateID_");
     if (!n) return false;
     n += 8;
-    return strstr(n, "Damage") || strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill");
+    // (a Bokoblin's dying state is "Fail": dAcEbc_c::StateID_Fail)
+    return strstr(n, "Damage") || strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill") ||
+           !strcmp(n, "Fail");
 }
 
 static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
