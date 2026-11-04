@@ -34,6 +34,7 @@ typedef struct {
     // States it holds a Link in (by name), and a harmless one to run its update in instead while the Link it holds is the
     // other player's: those states act on the game's one Link (a chuchu's Absorption slows him and shows "Shake").
     const char *grab[2], *idle;
+    bool no_res;  // its animation block has no resource of its own at +0x18 (another object's member is there): not copied
 } EnemyType;
 #define MAX_TYPES 16
 static EnemyType TYPES[MAX_TYPES] = {
@@ -408,7 +409,7 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     }
     for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
     uint64_t an = self + T->anim;
-    if (b->anim == 0 || guest_ptr(b->anim)) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
+    if (!T->no_res && (b->anim == 0 || guest_ptr(b->anim))) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
     if (T->extra && (b->extra == 0 || guest_ptr(b->extra))) *(uint64_t *)(uintptr_t)(self + T->extra) = b->extra;
     // (its length and mode with it: played with the last one's, the new one stops at the old end)
     *(float *)(uintptr_t)(an + ANIM_END) = b->end;
@@ -451,7 +452,7 @@ static bool install_type(int ty, bool now) {
 
 // ---- more types without a rebuild: a line each (coop_enemies.txt in the data folder, read at the start; the host sends its
 // lines to whoever joins, who take them on as they come). Numbers in hex:
-//   name profile vtable state anim [extra] [w=word,word,word]
+//   name profile vtable state anim [extra] [w=word,word,word] [nores]
 // state: the slot holding its current state (the machine is 0x20 before it; the two after and the one 0x28 before go
 // with it, as in both types above); anim: its animation block (end, start, frame, mode, then its resource at +0x18).
 // Checked: a profile, a vtable in the game's data whose update the game has, offsets inside an actor.
@@ -469,9 +470,11 @@ bool coop_enemy_add_type(const char *line) {
     unsigned long long w[3] = {0};
     char tok[64];
     int m = 0;
+    bool no_res = false;
     while (sscanf(rest, "%63s%n", tok, &m) == 1) {
         rest += m;
         if (!strncmp(tok, "w=", 2)) sscanf(tok + 2, "%llx,%llx,%llx", &w[0], &w[1], &w[2]);
+        else if (!strcmp(tok, "nores")) no_res = true;  // (its animation's +0x18 isn't a resource: a Deku Baba's)
         else sscanf(tok, "%llx", &ex);
     }
     bool sane = prof < 0x300 && vt >= 0x7001500000ull && vt < 0x7001700000ull && vt % 8 == 0 && st >= 0x28 && st < 0x4000 &&
@@ -486,7 +489,7 @@ bool coop_enemy_add_type(const char *line) {
     char *nl = strchr(g_type_lines[ty], '\n');
     if (nl) *nl = 0;
     TYPES[ty] = (EnemyType){g_type_name[ty], (uint16_t)prof, vt, {(int)st - 0x28, (int)st, (int)st + 8, (int)st + 0x10}, (int)an, (int)ex,
-                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL};
+                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL, no_res};
     g_ntypes++;
     if (!install_type(ty, true)) { g_ntypes--; return false; }
     LOG("[coop] enemies: %s (profile %#llx) now follows the host's too\n", name, prof);
