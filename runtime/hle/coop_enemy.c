@@ -587,10 +587,10 @@ int coop_enemy_take(uint8_t *out, int cap) {
     }
     uint8_t *w = out + 3;
     int count = 0;
-    const bool back = !g_hosting;  // (a joining player: only the ones holding them)
+    const bool back = !g_hosting;  // (a joining player: only theirs - holding them, or hurt by them)
     if (back) {
         pthread_mutex_lock(&g_lock);
-        int nh = g_nheld;
+        int nh = g_nheld + g_nreleased;
         pthread_mutex_unlock(&g_lock);
         if (!nh) return 0;
     }
@@ -606,9 +606,9 @@ int coop_enemy_take(uint8_t *out, int cap) {
         if (back) {
             pthread_mutex_lock(&g_lock);
             uint32_t k = map_key(a, prof, *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG), false);
-            int h = k ? held_find(prof, k) : -1;
+            bool theirs = k && (held_find(prof, k) >= 0 || released(prof, k));
             pthread_mutex_unlock(&g_lock);
-            if (h < 0) continue;
+            if (!theirs) continue;
             s.id = k;  // (the host's own, for theirs to find)
         } else {
             s.id = (uint32_t)a;
