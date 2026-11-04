@@ -188,8 +188,8 @@ extern "C" void coop_menu_draw(float scale) {
         static int pick;
         opt_choice("Enemy", &pick, names, N, 0, "Which enemy to spawn (test windows only).", true);
         static char p1[12] = "ffffffff", p2[12] = "ffffffff";
-        opt_text("Parameters", p1, sizeof p1, "ffffffff", "Its first parameter, in hex (what kind, weapon, path...): ffffffff is the "
-                 "game's \"none\" for most fields. Placed enemies' own are in the stage files.");
+        opt_text("Parameters", p1, sizeof p1, "ffffffff", "Its first parameter, in hex (what kind, weapon, path...). ffffffff (with ffffffff "
+                 "below): the ones it's most often placed with in the game.");
         opt_text("Parameters 2", p2, sizeof p2, "ffffffff", "Its second parameter, in hex.");
         if (opt_button("Spawn in front of Link", "In front of your Link, facing him; the other window spawns the same, at the same "
                        "spot, if it's in this area. Only kinds already in this area: each area's files carry the models of what's "

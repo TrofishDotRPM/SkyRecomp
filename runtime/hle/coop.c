@@ -1102,7 +1102,7 @@ static float *g_spawn_buf;  // (guest-visible: where and which way, for the cons
 RT_ON_RESET(coop_spawn_reset) { g_spawn_buf = NULL; }  // (reboot: the HLE heap it was in is gone)
 
 void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2) {
-    g_spawn_prof = profile, g_spawn_p1 = param1, g_spawn_p2 = param2;
+    g_spawn_prof = profile, g_spawn_p1 = param1, g_spawn_p2 = param2;  // (ffffffff for both: its usual ones, below)
     g_spawn_req = 1;
 }
 
@@ -1131,13 +1131,20 @@ static bool profile_here(uint64_t a, const char *name, void *user) {
 #define ARC_ENTRY_ENSURE 0xde71ecull
 #define ARC_ENTRY_SIZE 0x58
 #define SPAWN_LOAD_FRAMES 300 // (given up on after this: 5 s)
-static const struct { uint16_t profile; const char *arcs[3]; } SPAWN_ARCS[] = {
-    {0x16e, {"Degubaba"}}, {0x16d, {"Kiesu", "Kiesu_anime"}}, {0x155, {"Sm"}}, {0x184, {"Bocoburin_Z", "Skull"}},
-    {0x17f, {"Bce"}}, {0x171, {"LizarufosA", "Liza_tail"}}, {0x167, {"Sf"}}, {0x168, {"Sf4", "Skull"}},
-    {0x169, {"Staltula", "StalchulaThread"}}, {0x15c, {"Or", "OrCannon"}}, {0xc2, {"Ph"}}, {0x188, {"Gue"}},
-    {0x170, {"Remly"}}, {0x158, {"Geko"}}, {0x14f, {"Amos"}}, {0x156, {"Beamos"}}, {0x190, {"StalWall"}},
-    {0x173, {"Hidokari", "HidokariS"}}, {0x175, {"Hydra"}}, {0x163, {"Magma"}}, {0x164, {"Maguppo"}},
-    {0x185, {"Skytail"}}, {0x18d, {"Chaser_A", "Chaser_B"}}, {0x17e, {NULL}},  // (Bc: in ObjectPack, always loaded)
+// And the parameters each is most often placed with (the room files' object entries: params1 and params2 before the name):
+// spawned with ffffffff for both, a kind picks a variant from them, and a Keese read past its table of models and crashed.
+static const struct { uint16_t profile; const char *arcs[3]; uint32_t p1, p2; } SPAWN_ARCS[] = {
+    {0x16e, {"Degubaba"}, 0xfffffff0, 0x07ffffff}, {0x16d, {"Kiesu", "Kiesu_anime"}, 0x3fffffc0, 0x25dfffff},
+    {0x155, {"Sm"}, 0xffffffff, 0xffffffff}, {0x184, {"Bocoburin_Z", "Skull"}, 0xb37d97fd, 0x25ffffff},
+    {0x17f, {"Bce"}, 0xf0ffdfef, 0x21dfffff}, {0x171, {"LizarufosA", "Liza_tail"}, 0xf0affff1, 0x045fffff},
+    {0x167, {"Sf"}, 0xfffffff0, 0x26ffffff}, {0x168, {"Sf4", "Skull"}, 0xffffd4ff, 0x23ffffff},
+    {0x169, {"Staltula", "StalchulaThread"}, 0xffffff01, 0x25ffffff}, {0x15c, {"Or", "OrCannon"}, 0xfffffffc, 0x26ffffff},
+    {0xc2, {"Ph"}, 0xfffffff0, 0xffffffff}, {0x188, {"Gue"}, 0xfffffffc, 0x09ffffff}, {0x170, {"Remly"}, 0xfff14fff, 0xffffffff},
+    {0x158, {"Geko"}, 0xffffffff, 0xffffffff}, {0x14f, {"Amos"}, 0xf120cfff, 0x06ffffff}, {0x156, {"Beamos"}, 0xfcfc63ff, 0x07dfffff},
+    {0x190, {"StalWall"}, 0xfffffff1, 0x07ffffff}, {0x173, {"Hidokari", "HidokariS"}, 0xffeffff2, 0x25ffffff},
+    {0x175, {"Hydra"}, 0xfff0703f, 0x14ffffff}, {0x163, {"Magma"}, 0xffffffff, 0xffffffff}, {0x164, {"Maguppo"}, 0xfff2efff, 0xffffffff},
+    {0x185, {"Skytail"}, 0xffffffff, 0xffffffff}, {0x18d, {"Chaser_A", "Chaser_B"}, 0xf800ffff, 0xffffffff},
+    {0x17e, {NULL}, 0xd9ffd00d, 0x255fffff},  // (Bc: in ObjectPack, always loaded)
 };
 
 static bool spawn_known(uint16_t prof) {
@@ -1247,6 +1254,9 @@ void coop_game_tick(Cpu *c) {
     const int room = *(int8_t *)(uintptr_t)(pl + ACTOR_ROOM);
     if (g_spawn_req) {
         g_spawn_req = 0;
+        if (g_spawn_p1 == 0xffffffff && g_spawn_p2 == 0xffffffff)  // (its usual parameters)
+            for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++)
+                if (SPAWN_ARCS[i].profile == g_spawn_prof) g_spawn_p1 = SPAWN_ARCS[i].p1, g_spawn_p2 = SPAWN_ARCS[i].p2;
         const float *me = (const float *)(uintptr_t)(pl + PLAYER_POS);
         const int16_t yaw = *(int16_t *)(uintptr_t)(pl + 0x13e);
         const float a = yaw * (float)M_PI / 32768.0f;
