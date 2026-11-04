@@ -88,7 +88,17 @@ static GuestFn g_update[NTYPES];
 // Enemies this player hurt: let go while they're hurt, so they're hurt and die here as the game has them (then their defeat
 // flag goes to the host as any kill does, and theirs is removed). One that gets over it follows the host's again.
 #define MAX_RELEASED 64
-static struct { uint16_t profile; uint32_t flag; } g_released[MAX_RELEASED];  // (flag: the host's id for it)
+static struct { uint16_t profile; uint32_t flag; uint64_t seen; bool hurt; } g_released[MAX_RELEASED];  // (flag: the host's id)
+
+// ---- deaths by id: many enemies have no defeat flag, so a kill wasn't shared at all. One of the host's that's gone after
+// being hurt (or one a joining player hurt and killed) is gone from the other's game too: removed there, as a kill is (its
+// teardown drops its loot there too). Gone without being hurt (its room unloaded, say): nothing sent.
+#define GONE_AFTER_MS 300
+static void (*g_send_gone)(uint16_t profile, uint32_t id);
+void coop_enemy_set_gone_sender(void (*fn)(uint16_t profile, uint32_t id)) { g_send_gone = fn; }
+static struct { uint16_t profile; uint32_t id; bool hurt; } g_sent[64];  // (the host: its last message's)
+static int g_nsent;
+static uint8_t g_sent_stage;
 static int g_nreleased;
 
 static bool released(uint16_t profile, uint32_t flag) {
@@ -359,6 +369,14 @@ static void puppet_update(int ty, Cpu *c) {
                 nm >= 0x7001000000ull && nm < 0x7002000000ull ? (const char *)(uintptr_t)nm : "?");
         }
     }
+    // One let go: still here, and whether it's hurt (so its going is a death: coop_enemy_tick)
+    if (!driven && g_puppets && key) {
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < g_nreleased; i++)
+            if (g_released[i].profile == T->profile && g_released[i].flag == key)
+                g_released[i].seen = SDL_GetTicks(), g_released[i].hurt = hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]));
+        pthread_mutex_unlock(&g_lock);
+    }
     // One let go that got over it (hit, not killed): it follows the host's again
     if (!driven && g_puppets && key && released(T->profile, key) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
         pthread_mutex_lock(&g_lock);
@@ -371,6 +389,7 @@ static void puppet_update(int ty, Cpu *c) {
     if (driven && !host_hurt && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_nreleased < MAX_RELEASED) {
         pthread_mutex_lock(&g_lock);
         g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = key;
+        g_released[g_nreleased].seen = SDL_GetTicks(), g_released[g_nreleased].hurt = true;
         g_nreleased++;
         pthread_mutex_unlock(&g_lock);
         LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now\n", T->name, flag);
@@ -430,6 +449,20 @@ void coop_enemy_set_hosting(bool on) { g_hosting = on; }
 void coop_enemy_tick(void) {
     static int seen_stage = -1;
     int stage = g_stage ? g_stage() : 0;
+    if (stage == seen_stage && g_puppets) {  // (a joining player: one of theirs that died, hurt, is gone from the host's too)
+        uint16_t gone_p[MAX_RELEASED];
+        uint32_t gone_id[MAX_RELEASED];
+        int ngone = 0;
+        uint64_t now = SDL_GetTicks();
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < g_nreleased; i++) {
+            if (now - g_released[i].seen < GONE_AFTER_MS) continue;
+            if (g_released[i].hurt) gone_p[ngone] = g_released[i].profile, gone_id[ngone] = g_released[i].flag, ngone++;
+            g_released[i--] = g_released[--g_nreleased];
+        }
+        pthread_mutex_unlock(&g_lock);
+        for (int i = 0; i < ngone; i++) if (g_send_gone) g_send_gone(gone_p[i], gone_id[i]);
+    }
     if (stage == seen_stage) return;
     seen_stage = stage;
     pthread_mutex_lock(&g_lock);
@@ -512,9 +545,56 @@ int coop_enemy_take(uint8_t *out, int cap) {
         put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12), put(&w, &s.id, 4);
         count++;
     }
+    if (!back) {  // (the host: those of its last message gone since, after being hurt: killed)
+        const uint8_t stage = g_stage ? g_stage() : 0;
+        const uint8_t *r = out + 3;
+        typeof(g_sent[0]) cur[64];
+        int ncur = 0;
+        for (int i = 0; i < count && ncur < 64; i++, r += SNAP_BYTES) {
+            uint64_t st;
+            memcpy(&cur[ncur].profile, r, 2), memcpy(&cur[ncur].id, r + 110, 4), memcpy(&st, r + 22 + 8, 8);
+            cur[ncur].hurt = hurt_state(st);
+            ncur++;
+        }
+        if (stage == g_sent_stage && g_send_gone)
+            for (int i = 0; i < g_nsent; i++) {
+                bool still = false;
+                for (int j = 0; j < ncur && !still; j++) still = cur[j].profile == g_sent[i].profile && cur[j].id == g_sent[i].id;
+                if (!still && g_sent[i].hurt) g_send_gone(g_sent[i].profile, g_sent[i].id);
+            }
+        memcpy(g_sent, cur, sizeof cur[0] * (size_t)ncur), g_nsent = ncur, g_sent_stage = stage;
+    }
     if (!count) return 0;
     out[0] = back ? COOP_BLOB_ENEMIES_BACK : COOP_BLOB_ENEMIES, out[1] = g_stage ? g_stage() : 0, out[2] = (uint8_t)count;
     return (int)(w - out);
+}
+
+// The other player's killed one (by the host's id for it): this player's is removed, as a kill is.
+void coop_enemy_gone(uint16_t profile, uint32_t id) {
+    uint64_t self = 0;
+    if (g_hosting) {
+        uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+        if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return;
+        uint64_t n = pl + ACTOR_LIST;
+        for (int i = 0; i < 8192; i++) {
+            uint64_t prev = *(uint64_t *)(uintptr_t)(n + 8);
+            if (!guest_ptr(prev)) break;
+            n = prev;
+        }
+        for (int i = 0; i < 8192 && guest_ptr(n) && !self; i++, n = *(uint64_t *)(uintptr_t)n) {
+            uint64_t a = *(uint64_t *)(uintptr_t)(n + 16);
+            if (guest_ptr(a) && (uint32_t)a == id) self = a;
+        }
+    } else {
+        pthread_mutex_lock(&g_lock);
+        const uint64_t now = SDL_GetTicks();
+        for (int i = 0; i < g_nmap && !self; i++)
+            if (g_map[i].id == id && g_map[i].profile == profile && now - g_map[i].seen < MAP_FORGET_MS) self = g_map[i].self;
+        pthread_mutex_unlock(&g_lock);
+    }
+    if (!self || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != profile || *(uint8_t *)(uintptr_t)(self + ACTOR_LIFE) != 1) return;
+    *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (fBase_c's delete request, as coop.c removes a kill)
+    LOG("[coop] enemies: the other player killed one (profile %#x, id %#x): removed here too\n", profile, id);
 }
 
 // A joining player: the host's latest. Untrusted: sizes are checked, and pointers are only ever written into bats, where

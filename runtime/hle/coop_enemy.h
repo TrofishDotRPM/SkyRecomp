@@ -13,5 +13,8 @@ void coop_enemy_set_hosting(bool on);          // this player's enemies are the 
 void coop_enemy_tick(void);                    // once a frame, with a save in play
 int coop_enemy_take(uint8_t *out, int cap);    // once a frame: a message to send, or 0 (a joining player: only enemies holding them)
 void coop_enemy_receive(const uint8_t *d, int size);
+// Deaths of enemies without a flag of their own: who to tell (the sender's), and one the other player's game says died here.
+void coop_enemy_set_gone_sender(void (*fn)(uint16_t profile, uint32_t id));
+void coop_enemy_gone(uint16_t profile, uint32_t id);
 // (runtime/hle/coop.c) where the other player's Link stands, if they're in this player's stage
 bool coop_other_feet(float out[3]);

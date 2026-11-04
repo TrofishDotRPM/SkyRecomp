@@ -784,6 +784,12 @@ static void pouch_received(const CoopEvent *ev) {
 static CoopEvent g_deferred[DEFER_MAX];
 static int g_ndeferred;
 
+#define COOP_EV_ENEMY_GONE 15  // b: profile, c d: the host's id for it (low, high)
+static void send_gone(uint16_t profile, uint32_t id) {
+    CoopEvent ev = {COOP_EV_ENEMY_GONE, 0, profile, (uint16_t)(id & 0xffff), (uint16_t)(id >> 16)};
+    emit(&ev, NULL);
+}
+
 static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
@@ -805,6 +811,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     if (ev->type == COOP_EV_COPY) { copy_received(ev); return; }
     if (ev->type == COOP_EV_PART) { part_received(ev); return; }
     if (ev->type == COOP_EV_POUCH) { pouch_received(ev); return; }
+    if (ev->type == COOP_EV_ENEMY_GONE) { coop_enemy_gone(ev->b, (uint32_t)ev->c | (uint32_t)ev->d << 16); return; }
     if (ev->type == COOP_EV_COPY_END) { copy_end(); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
     uint16_t had = 0, hp = *g_core.health;
@@ -1055,6 +1062,7 @@ void coop_tick(void) {
     if (g_state == 0) {
         g_test = getenv("LARECOMP_COOP_TEST") != NULL;
         coop_enemy_init(stage_hash);
+        coop_enemy_set_gone_sender(send_gone);
         start(true);
     }
     if (g_apply) {
