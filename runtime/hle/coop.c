@@ -1105,7 +1105,23 @@ void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2) {
     g_spawn_req = 1;
 }
 
+// Only a kind already here: its models come with this area's own files (each stage's files carry the object archives of
+// what's placed in it); spawned where they aren't loaded, the game reads through an empty pointer and stops.
+static bool profile_here(uint64_t a, const char *name, void *user) {
+    (void)name;
+    uint16_t *want = user;
+    if (*(uint16_t *)(uintptr_t)(a + 0x10) == want[0]) { want[1] = 1; return false; }
+    return true;
+}
+
 static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw, int room) {
+    uint16_t want[2] = {prof, 0};
+    actors_each(profile_here, want);
+    if (!want[1]) {
+        LOG("[coop] test: no %#x here, so its models aren't loaded: not spawned\n", prof);
+        toast("Not loaded here: spawn only enemies already in this area");
+        return 0;
+    }
     uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ROOM_MGR);
     if (!guest_ptr(mgr) || room < 0 || room > 63) return 0;
     uint64_t room_actor = *(uint64_t *)(uintptr_t)(mgr + 0xf0 + 8ull * (uint64_t)room);

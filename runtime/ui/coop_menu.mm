@@ -192,7 +192,8 @@ extern "C" void coop_menu_draw(float scale) {
                  "game's \"none\" for most fields. Placed enemies' own are in the stage files.");
         opt_text("Parameters 2", p2, sizeof p2, "ffffffff", "Its second parameter, in hex.");
         if (opt_button("Spawn in front of Link", "In front of your Link, facing him; the other window spawns the same, at the same "
-                       "spot, if it's in this area.")) {
+                       "spot, if it's in this area. Only kinds already in this area: each area's files carry the models of what's "
+                       "placed in it.")) {
             coop_spawn_request(SPAWNS[pick].profile, (uint32_t)strtoul(p1, NULL, 16), (uint32_t)strtoul(p2, NULL, 16));
             extern void menu_close_now(void);
             menu_close_now();
