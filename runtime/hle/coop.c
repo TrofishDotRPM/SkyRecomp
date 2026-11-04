@@ -106,8 +106,8 @@ static uint8_t g_other_stage, g_my_stage;
 static bool g_in_play;
 
 // ---- boss areas are each player's own (the user's wish: every boss fought alone). Their stages are named B... (B100
-// Ghirahim, B101 Scaldera, B200 Moldarach, B201 Koloktos, B210 Tentalus, B300 Ghirahim, B400; B100_1, B101_1 and B201_1
-// the rooms after). While this player is in one: the other isn't shown, nothing this player does there is sent (ever: the
+// Ghirahim 1, B200 Scaldera, B300 Moldarach, B101 Koloktos, B301 Tentalus, B201 Ghirahim 2, as sshd-rando's heart
+// container locations have them; B210, B400, and B100_1, B101_1, B201_1 besides). While this player is in one: the other isn't shown, nothing this player does there is sent (ever: the
 // other fights it too), and what the other does meanwhile waits until this player leaves.
 static bool in_boss(void) {
     const char *s = (const char *)(uintptr_t)STAGE_NAME;
@@ -581,6 +581,24 @@ enum { COPY_ITEM, COPY_STORY, COPY_CAPACITY };
 #define STORY_IDS 1088
 static bool g_copy_done;     // a joining player: this connection's copy is in
 
+// Heart containers aren't shared, and a copy mustn't hand them over either: the host's capacity is copied less a heart for
+// each boss the host has beaten that the joining player hadn't (those count as beaten for them too: the story flags come
+// with the copy). Their own container is still in that boss's room. The story flags of the six bosses that leave one
+// (sshd-rando's fix-boss-doors.asm): Ghirahim 1, Scaldera, Moldarach, Koloktos, Ghirahim 2, Tentalus.
+static const int BOSS_DEFEATS[6] = {0x53, 0x7, 0x32C, 0x288, 0x54, 0x3A5};
+static bool g_copy_started;
+static uint8_t g_copy_mine, g_copy_hosts;  // (bit i: BOSS_DEFEATS[i]) the joining player's before the copy, the host's
+
+static const uint8_t *story_entry(int id) { return (const uint8_t *)(uintptr_t)(MAIN_BASE + T_STORY_TABLE + 2 * (uint64_t)id); }
+static uint8_t bosses_beaten(const uint16_t *story) {
+    uint8_t m = 0;
+    for (int i = 0; i < 6; i++) {
+        const uint8_t *e = story_entry(BOSS_DEFEATS[i]);
+        if (e[0] < 128 && (story[e[0]] >> (e[1] >> 4) & 1)) m |= (uint8_t)(1 << i);
+    }
+    return m;
+}
+
 // The game's fields in a region's word: their shift and width, from its flag table (word, shift << 4 | width - 1).
 static int word_fields(int copy, int word, uint8_t shift[16], uint8_t bits[16]) {
     const uint8_t *t = (const uint8_t *)(uintptr_t)(MAIN_BASE + (copy == COPY_ITEM ? T_ITEM_TABLE : T_STORY_TABLE));
@@ -613,8 +631,21 @@ static void copy_send(void) {  // (the host, to the player just arrived or just 
 
 static void copy_received(const CoopEvent *ev) {  // (a joining player)
     if (g_mode != 2 || g_copy_done) return;
+    if (!g_copy_started) {
+        g_copy_started = true;
+        g_copy_mine = bosses_beaten(g_core.region[COOP_R_STORY].live), g_copy_hosts = 0;
+    }
+    if (ev->a == COPY_STORY)
+        for (int i = 0; i < 6; i++) {
+            const uint8_t *e = story_entry(BOSS_DEFEATS[i]);
+            if (e[0] == ev->b && (ev->c >> (e[1] >> 4) & 1)) g_copy_hosts |= (uint8_t)(1 << i);
+        }
     if (ev->a == COPY_CAPACITY) {
-        if (ev->c > *g_core.capacity && ev->c <= 80 && ev->c % 4 == 0) *g_core.capacity = ev->c;
+        int theirs_only = __builtin_popcount(g_copy_hosts & ~g_copy_mine & 0x3f);
+        int cap = (int)ev->c - 4 * theirs_only;  // (their hearts from pieces, not their containers)
+        LOG("[coop] the host's heart capacity %d, less %d heart container(s) from bosses only they had beaten: %d (yours %d)\n",
+            ev->c, theirs_only, cap, *g_core.capacity);
+        if (cap > *g_core.capacity && cap <= 80 && cap % 4 == 0) *g_core.capacity = (uint16_t)cap;
         return;
     }
     if (ev->a > COPY_STORY) return;
@@ -802,7 +833,7 @@ static void on_event(const CoopEvent *ev, void *user) {
 static void on_joined(void *user) {
     (void)user;
     g_quiet_until = SDL_GetTicks() + QUIET_MS;
-    if (g_mode == 2) g_copy_done = false;     // (a new connection: a copy to come)
+    if (g_mode == 2) g_copy_done = false, g_copy_started = false;  // (a new connection: a copy to come)
     coop_core_snapshot(&g_core);  // (nothing, without a save in play)
     if (g_mode == 1 && g_core.baselined) copy_send();
 }

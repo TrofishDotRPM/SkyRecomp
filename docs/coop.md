@@ -27,7 +27,7 @@ Stop disconnects and sets the mode back to Off. It's all saved in `skyrecomp.ini
 
 The password is never sent: joining answers the host's random challenge with an HMAC of it. The game data itself isn't encrypted.
 
-When you join, you get a copy of the host's inventory and progress, once: every item, upgrade and story and dungeon flag the host has, and their rupees, ammo, treasures, bugs, heart pieces and heart capacity where those are larger than yours. You keep your own name and where you are, and nothing you had is taken away; what only you had reaches the host as usual. After that, the amounts are each player's own again. Pouch contents (shields, bottles) aren't copied.
+When you join, you get a copy of the host's inventory and progress, once: every item, upgrade and story and dungeon flag the host has, and their rupees, ammo, treasures, bugs, heart pieces and heart capacity where those are larger than yours. Heart containers aren't copied: the host's capacity comes less a heart for each boss they've beaten that you hadn't (those bosses count as beaten for you too, with the story flags; that boss's container is still in its room for you). You keep your own name and where you are, and nothing you had is taken away; what only you had reaches the host as usual. After that, the amounts are each player's own again. Pouch contents (shields, bottles) aren't copied.
 
 For testing, `LARECOMP_COOP_TEST=1` logs every event and adds keys in the focused window: F6 gives the next test item, F7 a heart piece, F5 a heart container (not shared), F8 a map and small key for the current scene. They change the same memory a real pickup does.
 
@@ -55,7 +55,7 @@ The other player appears as a second real Link when you're both in the same stag
 
 The other player's Link casts his own shadow: each frame his pieces are drawn again from the sun's direction (the game's own shadow pass for this Link gives the sun's view) into a texture of ours centred on his feet. In the pass where the game lays this Link's shadow, each pixel's place is worked out from the scene's depth and darkened where it falls inside his silhouette, so it follows slopes and steps as the game's own does (LARECOMP_DECAL_DEBUG=n paints each step of that). Indoors and at night, without a sun, a soft round one.
 
-Boss areas are each player's own: in a stage named B... (B100 Ghirahim, B101 Scaldera, B200 Moldarach, B201 Koloktos, B210 Tentalus, B300 Ghirahim, B400, and the rooms after them) the other player isn't shown, nothing done there is sent (ever: the other fights that boss too), and the other's changes meanwhile wait until you leave. The Imprisoned fights aren't in B stages, so they're shared like anywhere else.
+Boss areas are each player's own: in a stage named B... (B100 Ghirahim 1, B200 Scaldera, B300 Moldarach, B101 Koloktos, B301 Tentalus, B201 Ghirahim 2, and B210, B400 and the rooms after some of them) the other player isn't shown, nothing done there is sent (ever: the other fights that boss too), and the other's changes meanwhile wait until you leave. The Imprisoned fights aren't in B stages, so they're shared like anywhere else.
 
 During a cutscene (or anything the game runs as an event, Fi talking included) the other player's Link, name and marker are hidden, and come back half a second after it ends: the game's count of running events is at main+0x5b1f1c8 (v1.0.0).
 
