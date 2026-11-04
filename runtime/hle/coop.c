@@ -68,8 +68,14 @@ static void log_event(const char *dir, const CoopEvent *ev) {
 static bool g_treasure_known;     // (monster parts: their counts are known, so a rise is news)
 static bool g_pouch_known;        // (pouch items from chests: likewise)
 
+static bool in_boss(void);
 static void emit(const CoopEvent *ev, void *user) {
     (void)user;
+    if (in_boss()) {  // (a boss area's: this player's alone)
+        static int told;
+        if (told++ < 20) LOG("[coop] boss area: not sending type %d a %d b %d c %#x\n", ev->type, ev->a, ev->b, ev->c);
+        return;
+    }
     log_event("sent", ev);
     coop_net_send(ev);
 }
@@ -98,6 +104,15 @@ static float g_other[3];
 static uint64_t g_other_at;
 static uint8_t g_other_stage, g_my_stage;
 static bool g_in_play;
+
+// ---- boss areas are each player's own (the user's wish: every boss fought alone). Their stages are named B... (B100
+// Ghirahim, B101 Scaldera, B200 Moldarach, B201 Koloktos, B210 Tentalus, B300 Ghirahim, B400; B100_1, B101_1 and B201_1
+// the rooms after). While this player is in one: the other isn't shown, nothing this player does there is sent (ever: the
+// other fights it too), and what the other does meanwhile waits until this player leaves.
+static bool in_boss(void) {
+    const char *s = (const char *)(uintptr_t)STAGE_NAME;
+    return s[0] == 'B' && s[1] >= '0' && s[1] <= '9';
+}
 
 static uint8_t stage_hash(void) {
     const char *s = (const char *)(uintptr_t)STAGE_NAME;
@@ -194,7 +209,7 @@ static bool in_event(void) {
 
 // The other player's latest position, when they're in this player's stage and no cutscene is on. Any thread.
 bool coop_marker_target(float out[3]) {
-    if (in_event()) return false;
+    if (in_event() || in_boss()) return false;
     pthread_mutex_lock(&g_pos_lock);
     bool ok = g_in_play && g_other_at && SDL_GetTicks() - g_other_at < POS_STALE_MS && g_other_stage == g_my_stage;
     if (ok) {
@@ -733,9 +748,19 @@ static void pouch_received(const CoopEvent *ev) {
     toast(text);
 }
 
+#define DEFER_MAX 4096
+static CoopEvent g_deferred[DEFER_MAX];
+static int g_ndeferred;
+
 static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
+    // (in a boss area: the other's progress waits until this player leaves it; where they are, how they look, still come)
+    if (in_boss() && ev->type != COOP_EV_POS && ev->type != COOP_EV_LOOK && ev->type != COOP_EV_NAME && ev->type != COOP_EV_SYNC &&
+        ev->type != COOP_EV_COPY && ev->type != COOP_EV_COPY_END) {
+        if (g_ndeferred < DEFER_MAX) g_deferred[g_ndeferred++] = *ev;
+        return;
+    }
     if (ev->type == COOP_EV_POS) { pos_received(ev); return; }
     if (ev->type == COOP_EV_LOOK) { look_received(ev); return; }
     if (ev->type == COOP_EV_NAME) { name_received(ev); return; }
@@ -946,6 +971,12 @@ void coop_tick(void) {
     }
     if (g_state != 1) return;
     coop_net_poll();
+    if (g_ndeferred && !in_boss() && g_core.baselined) {  // (out of a boss area: what the other did meanwhile)
+        int n = g_ndeferred;
+        g_ndeferred = 0;
+        LOG("[coop] out of the boss area: %d of the other player's changes now\n", n);
+        for (int i = 0; i < n; i++) on_event(&g_deferred[i], NULL);
+    }
     if (!save_in_play()) {
         if (g_core.baselined) LOG("[coop] save left play\n");
         g_nlids = 0;
@@ -955,6 +986,7 @@ void coop_tick(void) {
         g_core.baselined = false;
         g_treasure_known = false;
         g_pouch_known = false;
+        g_ndeferred = 0;  // (a save coming into play asks for everything anyway)
         return;
     }
     if (!g_core.baselined) {
@@ -972,7 +1004,7 @@ void coop_tick(void) {
     pos_send_tick();
     pose_send_tick();
     coop_enemy_tick();
-    if (g_mode == 1 && g_kills_due && g_core.scene >= 0) {
+    if (g_mode == 1 && g_kills_due && g_core.scene >= 0 && !in_boss()) {
         g_kills_due = false;
         int n = 0;
         for (int w = 0; w < 4096; w++)
@@ -986,7 +1018,7 @@ void coop_tick(void) {
     }
     {  // (the host: its enemies, for the others' to follow; a joining player: those holding them, for the host's)
         static uint8_t ebuf[8192];
-        int n = coop_enemy_take(ebuf, sizeof ebuf);
+        int n = in_boss() ? 0 : coop_enemy_take(ebuf, sizeof ebuf);
         if (n) coop_net_send_blob(ebuf, n);
     }
     look_send_tick();
