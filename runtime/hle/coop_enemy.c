@@ -100,6 +100,30 @@ static struct { uint16_t profile; uint32_t flag; uint64_t seen; bool hurt; } g_r
 static void (*g_send_gone)(uint16_t profile, uint32_t id);
 void coop_enemy_set_gone_sender(void (*fn)(uint16_t profile, uint32_t id)) { g_send_gone = fn; }
 static struct { uint16_t profile; uint32_t id; bool hurt; } g_sent[64];  // (the host: its last message's)
+
+// ---- shared health: every enemy's u16 health (dAcEnBase_c::mHealth, +0x342 on the Wii; HD's offset measured in a running
+// game, given as a line "hp <offset>" in coop_enemies.txt: 0, none, nothing shared). Health only goes down: whenever either
+// game sees a paired enemy's drop, it sends the new value, and the other's copy is lowered to it. So hits from both players
+// add up, and whichever takes it to nothing kills it (and its death is shared as any is).
+static int g_hp_off;
+static void (*g_send_hp)(uint32_t id, uint16_t hp);
+void coop_enemy_set_hp_sender(void (*fn)(uint32_t id, uint16_t hp)) { g_send_hp = fn; }
+#define HP_TRACK 64
+static struct { uint64_t self; uint32_t id; uint16_t hp; uint64_t seen; } g_hp[HP_TRACK];
+
+static void hp_watch(uint64_t self, uint32_t id) {  // (after its update: a drop here is this player's hit)
+    if (!g_hp_off || !id || !g_send_hp) return;
+    const uint16_t hp = *(uint16_t *)(uintptr_t)(self + g_hp_off);
+    const uint64_t now = SDL_GetTicks();
+    int slot = -1, old = 0;
+    for (int i = 0; i < HP_TRACK; i++) {
+        if (g_hp[i].self == self && g_hp[i].id == id) { slot = i; break; }
+        if (g_hp[i].seen < g_hp[old].seen) old = i;
+    }
+    if (slot < 0) { g_hp[old] = (typeof(g_hp[0])){self, id, hp, now}; return; }
+    if (hp < g_hp[slot].hp) g_send_hp(id, hp);
+    g_hp[slot].hp = hp, g_hp[slot].seen = now;
+}
 static int g_nsent;
 static uint8_t g_sent_stage;
 static int g_nreleased;
@@ -374,6 +398,7 @@ static void puppet_update(int ty, Cpu *c) {
                 nm >= 0x7001000000ull && nm < 0x7002000000ull ? (const char *)(uintptr_t)nm : "?");
         }
     }
+    hp_watch(self, key);
     // One let go: still here, and whether it's hurt (so its going is a death: coop_enemy_tick)
     if (!driven && g_puppets && key) {
         pthread_mutex_lock(&g_lock);
@@ -453,6 +478,7 @@ static bool install_type(int ty, bool now) {
 // ---- more types without a rebuild: a line each (coop_enemies.txt in the data folder, read at the start; the host sends its
 // lines to whoever joins, who take them on as they come). Numbers in hex:
 //   name profile vtable state anim [extra] [w=word,word,word] [nores]
+// and once: "hp <offset>", where every enemy keeps its health (shared from then).
 // state: the slot holding its current state (the machine is 0x20 before it; the two after and the one 0x28 before go
 // with it, as in both types above); anim: its animation block (end, start, frame, mode, then its resource at +0x18).
 // Checked: a profile, a vtable in the game's data whose update the game has, offsets inside an actor.
@@ -465,6 +491,15 @@ bool coop_enemy_add_type(const char *line) {
     int n = 0;
     while (*line == ' ' || *line == '\t') line++;
     if (!*line || *line == '#' || *line == '\n') return false;
+    unsigned hp_off;
+    if (sscanf(line, "hp %x", &hp_off) == 1) {  // (where every enemy keeps its health: shared from now)
+        if (hp_off >= 0x200 && hp_off < 0x800 && hp_off % 2 == 0 && g_hp_off != (int)hp_off) {
+            g_hp_off = (int)hp_off;
+            snprintf(g_type_lines[0], sizeof g_type_lines[0], "hp %x", hp_off);
+            LOG("[coop] enemies: health at +%#x, shared\n", hp_off);
+        }
+        return false;
+    }
     if (sscanf(line, "%23s %llx %llx %llx %llx%n", name, &prof, &vt, &st, &an, &n) < 5) { LOG("[coop] enemies: can't read type line: %s\n", line); return false; }
     const char *rest = line + n;
     unsigned long long w[3] = {0};
@@ -499,6 +534,7 @@ bool coop_enemy_add_type(const char *line) {
 // The host's added lines, for whoever joins: '\n' between. Returns the length.
 int coop_enemy_types_text(char *out, int cap) {
     int n = 0;
+    if (g_hp_off) n += snprintf(out, (size_t)cap, "%s\n", g_type_lines[0]);  // (where health is, for theirs to share too)
     for (int ty = 2; ty < g_ntypes && n < cap - 1; ty++) n += snprintf(out + n, (size_t)(cap - n), "%s\n", g_type_lines[ty]);
     return n < cap ? n : cap - 1;
 }
@@ -652,6 +688,45 @@ int coop_enemy_take(uint8_t *out, int cap) {
     if (!count) return 0;
     out[0] = back ? COOP_BLOB_ENEMIES_BACK : COOP_BLOB_ENEMIES, out[1] = g_stage ? g_stage() : 0, out[2] = (uint8_t)count;
     return (int)(w - out);
+}
+
+static uint64_t actor_by_id(uint32_t id);
+// The other player's hit lowered one's health (by the host's id for it): this player's copy goes down to it too.
+void coop_enemy_hp(uint32_t id, uint16_t hp) {
+    if (!g_hp_off) return;
+    uint64_t self = actor_by_id(id);
+    if (!self || *(uint8_t *)(uintptr_t)(self + ACTOR_LIFE) != 1) return;
+    uint16_t *mine = (uint16_t *)(uintptr_t)(self + g_hp_off);
+    if (hp >= *mine) return;
+    LOG("[coop] enemies: the other player's hit: health %u -> %u (id %#x)\n", *mine, hp, id);
+    *mine = hp;
+    for (int i = 0; i < HP_TRACK; i++) if (g_hp[i].self == self) g_hp[i].hp = hp;  // (theirs: not sent back)
+}
+
+// The actor the host's id names in this game (the host: its own address; a joining player: the one paired with it)
+static uint64_t actor_by_id(uint32_t id) {
+    uint64_t self = 0;
+    if (g_hosting) {
+        uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+        if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return 0;
+        uint64_t n = pl + ACTOR_LIST;
+        for (int i = 0; i < 8192; i++) {
+            uint64_t prev = *(uint64_t *)(uintptr_t)(n + 8);
+            if (!guest_ptr(prev)) break;
+            n = prev;
+        }
+        for (int i = 0; i < 8192 && guest_ptr(n) && !self; i++, n = *(uint64_t *)(uintptr_t)n) {
+            uint64_t a = *(uint64_t *)(uintptr_t)(n + 16);
+            if (guest_ptr(a) && (uint32_t)a == id) self = a;
+        }
+    } else {
+        pthread_mutex_lock(&g_lock);
+        const uint64_t now = SDL_GetTicks();
+        for (int i = 0; i < g_nmap && !self; i++)
+            if (g_map[i].id == id && now - g_map[i].seen < MAP_FORGET_MS) self = g_map[i].self;
+        pthread_mutex_unlock(&g_lock);
+    }
+    return self;
 }
 
 // The other player's killed one (by the host's id for it): this player's is removed, as a kill is.
