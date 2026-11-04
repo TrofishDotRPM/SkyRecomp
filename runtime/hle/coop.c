@@ -581,13 +581,15 @@ enum { COPY_ITEM, COPY_STORY, COPY_CAPACITY };
 #define STORY_IDS 1088
 static bool g_copy_done;     // a joining player: this connection's copy is in
 
-// Heart containers aren't shared, and a copy mustn't hand them over either: the host's capacity is copied less a heart for
-// each boss the host has beaten that the joining player hadn't (those count as beaten for them too: the story flags come
-// with the copy). Their own container is still in that boss's room. The story flags of the six bosses that leave one
-// (sshd-rando's fix-boss-doors.asm): Ghirahim 1, Scaldera, Moldarach, Koloktos, Ghirahim 2, Tentalus.
+// Bosses the host has beaten count as beaten for a joining player (their story flags come with the copy), and the copy's heart
+// capacity includes those bosses' containers; the containers themselves are then gone from those rooms for them
+// (boss_room_tick). The story flags of the six bosses that leave one (sshd-rando's fix-boss-doors.asm), and their rooms
+// (sshd-rando's heart container locations): Ghirahim 1 B100, Scaldera B200, Moldarach B300, Koloktos B101, Ghirahim 2
+// B201, Tentalus B301.
 static const int BOSS_DEFEATS[6] = {0x53, 0x7, 0x32C, 0x288, 0x54, 0x3A5};
+static const char *const BOSS_ROOMS[6] = {"B100", "B200", "B300", "B101", "B201", "B301"};
 static bool g_copy_started;
-static uint8_t g_copy_mine, g_copy_hosts;  // (bit i: BOSS_DEFEATS[i]) the joining player's before the copy, the host's
+static uint8_t g_copy_mine, g_copy_hosts;  // (bit i: BOSS_DEFEATS[i]) the joining player's before the copy, the host's (log)
 
 static const uint8_t *story_entry(int id) { return (const uint8_t *)(uintptr_t)(MAIN_BASE + T_STORY_TABLE + 2 * (uint64_t)id); }
 static uint8_t bosses_beaten(const uint16_t *story) {
@@ -641,10 +643,9 @@ static void copy_received(const CoopEvent *ev) {  // (a joining player)
             if (e[0] == ev->b && (ev->c >> (e[1] >> 4) & 1)) g_copy_hosts |= (uint8_t)(1 << i);
         }
     if (ev->a == COPY_CAPACITY) {
-        int theirs_only = __builtin_popcount(g_copy_hosts & ~g_copy_mine & 0x3f);
-        int cap = (int)ev->c - 4 * theirs_only;  // (their hearts from pieces, not their containers)
-        LOG("[coop] the host's heart capacity %d, less %d heart container(s) from bosses only they had beaten: %d (yours %d)\n",
-            ev->c, theirs_only, cap, *g_core.capacity);
+        int cap = (int)ev->c;
+        LOG("[coop] the host's heart capacity %d (yours %d); bosses only the host had beaten, now beaten here too: %d\n", cap,
+            *g_core.capacity, __builtin_popcount(g_copy_hosts & ~g_copy_mine & 0x3f));
         if (cap > *g_core.capacity && cap <= 80 && cap % 4 == 0) *g_core.capacity = (uint16_t)cap;
         return;
     }
@@ -987,6 +988,35 @@ static void test_keys(void) {
     }
 }
 
+// A boss room whose boss was already beaten when this player came in (by the host, before they joined, as far as their save
+// knows): its heart container, if one appears, is taken away at once. (Fought here, it was beaten after they came in: theirs.)
+static bool remove_heart_container(uint64_t a, const char *name, void *user) {
+    (void)user;
+    // (its profile 0x282's name, as this table has it; "HeartCo" is its name in stage files: checked in the game's NSO)
+    if (!name || strcmp(name, "OBJ_ITEM_HEART_CONTAINER") || !alive(a)) return true;
+    *(uint8_t *)(uintptr_t)(a + ACTOR_DELETE) = 1;
+    LOG("[coop] boss room: its boss was beaten before this player came in: its heart container taken away\n");
+    return true;
+}
+
+static void boss_room_tick(void) {
+    static char seen[8];
+    static bool beaten_before;
+    const char *st = (const char *)(uintptr_t)STAGE_NAME;
+    if (strncmp(seen, st, sizeof seen - 1)) {
+        strncpy(seen, st, sizeof seen - 1);
+        beaten_before = false;
+        for (int i = 0; i < 6; i++) {
+            if (strcmp(seen, BOSS_ROOMS[i])) continue;
+            const uint8_t *e = story_entry(BOSS_DEFEATS[i]);
+            beaten_before = e[0] < 128 && (g_core.region[COOP_R_STORY].live[e[0]] >> (e[1] >> 4) & 1);
+            LOG("[coop] boss room %s: its boss %s\n", seen, beaten_before ? "was beaten already" : "isn't beaten yet");
+        }
+    }
+    static unsigned frame;
+    if (beaten_before && !(frame++ & 7)) actors_each(remove_heart_container, NULL);
+}
+
 // Once per frame, on the game thread (runtime/hle/input.c).
 void coop_tick(void) {
     if (g_state == 0) {
@@ -1032,6 +1062,7 @@ void coop_tick(void) {
         return;
     }
     chest_lids_tick();
+    boss_room_tick();
     pos_send_tick();
     pose_send_tick();
     coop_enemy_tick();
