@@ -1094,6 +1094,7 @@ static void boss_room_tick(void) {
 #define ACTOR_ROOM 0x17c         // s8
 #define SPAWN_AHEAD 250.0f
 static volatile int g_spawn_req;
+static struct { int wait; bool theirs; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; } g_spawn_later[4];
 static uint16_t g_spawn_prof;
 static uint32_t g_spawn_p1, g_spawn_p2;
 static struct { bool due; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; uint8_t stage; } g_spawn_theirs;
@@ -1114,10 +1115,51 @@ static bool profile_here(uint64_t a, const char *name, void *user) {
     return true;
 }
 
+// Kinds not placed here can still come, their models loaded first: each enemy's object archives (named in the stage files'
+// oarc folders: tools offline found which each needs) as loose files in a mod's romfs (Object/NX/<name>.arc; the test
+// windows have CoopTestEnemies), through the game's own loader: dRawArcTable_c::getArcOrLoadFromDisk(the object archive
+// manager's table, name, "Object/NX", the work-2 heap) - 1.0.0's at main+0xde7440, found by its callers that pass "Object",
+// the manager (main+0x192fd50, its table at +8) and heap (main+0x1830560) as in sshd-rando's symbols, 0x4000 lower.
+#define ARC_MGR 0x192fd50ull
+#define WORK2_HEAP 0x1830560ull
+#define ARC_LOAD 0xde7440ull
+#define SPAWN_LOAD_FRAMES 60  // (then spawned: the archives' loading given a second)
+static const struct { uint16_t profile; const char *arcs[3]; } SPAWN_ARCS[] = {
+    {0x16e, {"Degubaba"}}, {0x16d, {"Kiesu", "Kiesu_anime"}}, {0x155, {"Sm"}}, {0x184, {"Bocoburin_Z", "Skull"}},
+    {0x17f, {"Bce"}}, {0x171, {"LizarufosA", "Liza_tail"}}, {0x167, {"Sf"}}, {0x168, {"Sf4", "Skull"}},
+    {0x169, {"Staltula", "StalchulaThread"}}, {0x15c, {"Or", "OrCannon"}}, {0xc2, {"Ph"}}, {0x188, {"Gue"}},
+    {0x170, {"Remly"}}, {0x158, {"Geko"}}, {0x14f, {"Amos"}}, {0x156, {"Beamos"}}, {0x190, {"StalWall"}},
+    {0x173, {"Hidokari", "HidokariS"}}, {0x175, {"Hydra"}}, {0x163, {"Magma"}}, {0x164, {"Maguppo"}},
+    {0x185, {"Skytail"}}, {0x18d, {"Chaser_A", "Chaser_B"}}, {0x17e, {NULL}},  // (Bc: in ObjectPack, always loaded)
+};
+
+static bool spawn_known(uint16_t prof) {
+    for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++) if (SPAWN_ARCS[i].profile == prof) return true;
+    return false;
+}
+
+static void spawn_load_arcs(Cpu *c, uint16_t prof) {
+    uint64_t mgr = *(uint64_t *)(uintptr_t)(MAIN_BASE + ARC_MGR), heap = *(uint64_t *)(uintptr_t)(MAIN_BASE + WORK2_HEAP);
+    if (!guest_ptr(mgr) || !heap) return;
+    static char *strs;  // (guest-visible: the loader reads them)
+    if (!strs) strs = hle_alloc(64);
+    for (size_t i = 0; i < sizeof SPAWN_ARCS / sizeof *SPAWN_ARCS; i++) {
+        if (SPAWN_ARCS[i].profile != prof) continue;
+        for (int k = 0; k < 3 && SPAWN_ARCS[i].arcs[k]; k++) {
+            snprintf(strs, 32, "%s", SPAWN_ARCS[i].arcs[k]);
+            snprintf(strs + 32, 32, "Object/NX");
+            Cpu t = *c;
+            t.x[0] = mgr + 8, t.x[1] = (uint64_t)(uintptr_t)strs, t.x[2] = (uint64_t)(uintptr_t)(strs + 32), t.x[3] = heap;
+            guest_call(&t, MAIN_BASE + ARC_LOAD);
+            LOG("[coop] test: loaded object archive %s for profile %#x: %#llx\n", SPAWN_ARCS[i].arcs[k], prof, (unsigned long long)t.x[0]);
+        }
+    }
+}
+
 static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw, int room) {
     uint16_t want[2] = {prof, 0};
     actors_each(profile_here, want);
-    if (!want[1]) {
+    if (!want[1] && !spawn_known(prof)) {
         LOG("[coop] test: no %#x here, so its models aren't loaded: not spawned\n", prof);
         toast("Not loaded here: spawn only enemies already in this area");
         return 0;
@@ -1173,7 +1215,13 @@ void coop_game_tick(Cpu *c) {
         const float a = yaw * (float)M_PI / 32768.0f;
         float pos[3] = {me[0] + sinf(a) * SPAWN_AHEAD, me[1] + 20, me[2] + cosf(a) * SPAWN_AHEAD};
         const int16_t face = (int16_t)(yaw + 0x8000);  // (facing Link)
-        spawn_actor(c, g_spawn_prof, g_spawn_p1, g_spawn_p2, pos, face, room);
+        spawn_load_arcs(c, g_spawn_prof);
+        for (int i = 0; i < 4; i++)
+            if (!g_spawn_later[i].wait) {
+                g_spawn_later[i] = (typeof(g_spawn_later[0])){SPAWN_LOAD_FRAMES, false, g_spawn_prof, g_spawn_p1, g_spawn_p2,
+                                                               {pos[0], pos[1], pos[2]}, face};
+                break;
+            }
         uint8_t b[26];
         b[0] = COOP_BLOB_SPAWN, b[1] = stage_hash();
         memcpy(b + 2, &g_spawn_prof, 2), memcpy(b + 4, &g_spawn_p1, 4), memcpy(b + 8, &g_spawn_p2, 4), memcpy(b + 12, pos, 12),
@@ -1182,10 +1230,21 @@ void coop_game_tick(Cpu *c) {
     }
     if (g_spawn_theirs.due) {
         g_spawn_theirs.due = false;
-        if (g_spawn_theirs.stage == stage_hash())
-            spawn_actor(c, g_spawn_theirs.prof, g_spawn_theirs.p1, g_spawn_theirs.p2, g_spawn_theirs.pos, g_spawn_theirs.yaw, room);
+        if (g_spawn_theirs.stage == stage_hash()) {
+            spawn_load_arcs(c, g_spawn_theirs.prof);
+            for (int i = 0; i < 4; i++)
+                if (!g_spawn_later[i].wait) {
+                    g_spawn_later[i] = (typeof(g_spawn_later[0])){SPAWN_LOAD_FRAMES, true, g_spawn_theirs.prof, g_spawn_theirs.p1,
+                                                                   g_spawn_theirs.p2, {g_spawn_theirs.pos[0], g_spawn_theirs.pos[1],
+                                                                   g_spawn_theirs.pos[2]}, g_spawn_theirs.yaw};
+                    break;
+                }
+        }
         else LOG("[coop] test: the other player spawned profile %#x in another area\n", g_spawn_theirs.prof);
     }
+    for (int i = 0; i < 4; i++)  // (their archives loading: spawned once that's had its time)
+        if (g_spawn_later[i].wait && !--g_spawn_later[i].wait)
+            spawn_actor(c, g_spawn_later[i].prof, g_spawn_later[i].p1, g_spawn_later[i].p2, g_spawn_later[i].pos, g_spawn_later[i].yaw, room);
 }
 
 // Once per frame, on the game thread (runtime/hle/input.c).
