@@ -128,11 +128,14 @@ static int16_t pos_unit(float v) {
 }
 
 static void spawn_received(const uint8_t *d, int size);
+static void pins_received(const uint8_t *d, int size);
+static bool g_pins_known;  // (map pins: the save's are known, so a change is news; below)
 static void blob_received(const uint8_t *data, int size, void *user) {  // (what it is: its first byte)
     (void)user;
     if (size < 1) return;
     if (data[0] == COOP_BLOB_ENEMIES || data[0] == COOP_BLOB_ENEMIES_BACK) { coop_enemy_receive(data, size); return; }
     if (data[0] == COOP_BLOB_SPAWN) { spawn_received(data, size); return; }
+    if (data[0] == COOP_BLOB_PINS) { pins_received(data, size); return; }
     if (data[0] == COOP_BLOB_ENEMY_TYPES && g_mode == 2) {  // (the host's added enemy types: each line, as text)
         char text[2048];
         int n = size - 1 < (int)sizeof text - 1 ? size - 1 : (int)sizeof text - 1;
@@ -679,7 +682,7 @@ static void copy_end(void) {
     if (g_mode != 2 || g_copy_done) return;
     g_copy_done = true;
     coop_core_baseline(&g_core);  // (what came is the host's already: nothing in it to send back)
-    g_treasure_known = false;
+    g_treasure_known = false, g_pins_known = false;
     g_pouch_known = false;
     if (g_test) LOG("[coop] got the host's inventory and progress\n");
 }
@@ -744,6 +747,85 @@ static void part_received(const CoopEvent *ev) {
     g_treasure_shadow[ev->a] = treasure_get(ev->a);  // (theirs, not ours to send back)
     LOG("[coop] parts: the other player got %d of treasure %d: now %d here\n", ev->c, ev->a, g_treasure_shadow[ev->a]);
     toast("Monster part");
+}
+
+// ---- map pins (beacons): placing or removing one on the map is sent, and the other player's map gets it in the same
+// slot. SaveFile+0x34 holds five pin positions for each of 32 map areas (3 f32 each), +0x537c a byte per area with a bit
+// per placed pin (zeldaret/ss's beacon_pos and placed_beacon_flags; the layout matches HD's around them, as the pouch's).
+// A new pin goes into the area's first free slot, so the two players' pins fill different ones.
+#define S_BEACON_POS 0x0034
+#define S_BEACON_FLAGS 0x537C
+#define PIN_AREAS 32
+#define PIN_SLOTS 5
+#define PIN_BYTES 15  // (area, slot, placed, then x y z)
+static uint8_t g_pin_flags[PIN_AREAS];
+static float g_pin_pos[PIN_AREAS][PIN_SLOTS][3];
+static bool g_pins_known;
+static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_pin_in[PIN_AREAS * PIN_SLOTS * PIN_BYTES];  // (received, for the game's thread to put in)
+static int g_npin_in;
+
+static uint8_t *pin_flags(void) { return (uint8_t *)(uintptr_t)(SAVE + S_BEACON_FLAGS); }
+static float *pin_pos(int area, int slot) { return (float *)(uintptr_t)(SAVE + S_BEACON_POS + 12ull * (uint64_t)(area * PIN_SLOTS + slot)); }
+
+static void pins_received(const uint8_t *d, int size) {  // (the network's thread)
+    if (size < 2 || size != 2 + d[1] * PIN_BYTES) return;
+    pthread_mutex_lock(&g_pin_lock);
+    for (int i = 0; i < d[1] && g_npin_in < PIN_AREAS * PIN_SLOTS; i++) {
+        const uint8_t *e = d + 2 + i * PIN_BYTES;
+        float p[3];
+        memcpy(p, e + 3, 12);
+        if (e[0] >= PIN_AREAS || e[1] >= PIN_SLOTS || e[2] > 1 || !isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2])) continue;
+        memcpy(g_pin_in + g_npin_in++ * PIN_BYTES, e, PIN_BYTES);
+    }
+    pthread_mutex_unlock(&g_pin_lock);
+}
+
+static void pins_tick(void) {  // (once a frame, with a save in play)
+    uint8_t *flags = pin_flags();
+    if (!g_pins_known) {  // (the save's own, as loaded: not news)
+        memcpy(g_pin_flags, flags, sizeof g_pin_flags);
+        for (int a = 0; a < PIN_AREAS; a++)
+            for (int s = 0; s < PIN_SLOTS; s++) memcpy(g_pin_pos[a][s], pin_pos(a, s), 12);
+        g_pins_known = true;
+        return;
+    }
+    // The other player's, first: put in, and taken as already known (not sent back)
+    pthread_mutex_lock(&g_pin_lock);
+    int took = g_npin_in;
+    for (int i = 0; i < g_npin_in; i++) {
+        const uint8_t *e = g_pin_in + i * PIN_BYTES;
+        const int a = e[0], s = e[1];
+        if (e[2]) {
+            memcpy(pin_pos(a, s), e + 3, 12);
+            flags[a] |= (uint8_t)(1 << s);
+        } else {
+            flags[a] &= (uint8_t)~(1 << s);
+        }
+        g_pin_flags[a] = (uint8_t)((g_pin_flags[a] & ~(1 << s)) | (flags[a] & (1 << s)));
+        memcpy(g_pin_pos[a][s], pin_pos(a, s), 12);
+    }
+    g_npin_in = 0;
+    pthread_mutex_unlock(&g_pin_lock);
+    if (took) LOG("[coop] pins: %d of the other player's put on the map\n", took);
+    // This player's: placed, moved or taken away since
+    uint8_t out[2 + PIN_AREAS * PIN_SLOTS * PIN_BYTES];
+    int n = 0;
+    for (int a = 0; a < PIN_AREAS; a++)
+        for (int s = 0; s < PIN_SLOTS; s++) {
+            const bool now = flags[a] >> s & 1, was = g_pin_flags[a] >> s & 1;
+            const float *p = pin_pos(a, s);
+            if (now == was && (!now || !memcmp(p, g_pin_pos[a][s], 12))) continue;
+            uint8_t *e = out + 2 + n++ * PIN_BYTES;
+            e[0] = (uint8_t)a, e[1] = (uint8_t)s, e[2] = now;
+            memcpy(e + 3, p, 12);
+            memcpy(g_pin_pos[a][s], p, 12);
+        }
+    memcpy(g_pin_flags, flags, sizeof g_pin_flags);
+    if (!n) return;
+    out[0] = COOP_BLOB_PINS, out[1] = (uint8_t)n;
+    coop_net_send_blob(out, 2 + n * PIN_BYTES);
+    LOG("[coop] pins: %d of this player's placed or taken away, sent\n", n);
 }
 
 // ---- pouch items from chests: a potion, shield or medal that comes into this player's pouch while a chest they opened is
@@ -1372,7 +1454,7 @@ void coop_tick(void) {
         g_in_play = false;
         pthread_mutex_unlock(&g_pos_lock);
         g_core.baselined = false;
-        g_treasure_known = false;
+        g_treasure_known = false, g_pins_known = false;
         g_pouch_known = false;
         g_ndeferred = 0;  // (a save coming into play asks for everything anyway)
         return;
@@ -1419,7 +1501,7 @@ void coop_tick(void) {
     if (changed > JUMP_WORDS) {
         LOG("[coop] %d words changed at once: another save loaded? Taking it as the new start\n", changed);
         g_core.baselined = false;  // (next frame: baseline and snapshot, as for any save coming into play)
-        g_treasure_known = false;
+        g_treasure_known = false, g_pins_known = false;
         g_pouch_known = false;
         return;
     }
@@ -1436,4 +1518,5 @@ void coop_tick(void) {
     coop_core_poll(&g_core, scene);
     treasures_tick();
     pouch_tick();
+    pins_tick();
 }
