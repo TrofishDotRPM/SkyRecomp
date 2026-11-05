@@ -35,6 +35,7 @@ typedef struct {
     // other player's: those states act on the game's one Link (a chuchu's Absorption slows him and shows "Shake").
     const char *grab[2], *idle;
     bool no_res;  // its animation block has no resource of its own at +0x18 (another object's member is there): not copied
+    bool enter;   // a new state of the host's is gone into with its changeState (its start runs: a Bokoblin's draws its sword)
     int clip;     // where it keeps a pointer to a second animation, the one choosing its clip (a Deku Baba's: its mouth), 0: none
 } EnemyType;
 #define MAX_TYPES 16
@@ -339,7 +340,7 @@ static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
 
 // The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
-static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], uint64_t *die_into) {
+static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], uint64_t *die_into, uint64_t *enter_into) {
     const EnemyType *T = &TYPES[ty];
     bool ok = false;
     pthread_mutex_lock(&g_lock);
@@ -347,12 +348,33 @@ static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], 
     if (last && SDL_GetTicks() - last->at < STALE_MS && g_stage && last->stage == g_stage()) {
         const Snap *b = find(last, T->profile, flag);
         if (b && dying_state(b->state[1]) && !dying_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) *die_into = b->state[1];
-        else if (b) snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
+        else if (b) {
+            uint64_t had[4];
+            for (int k = 0; k < 4; k++) had[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
+            snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
+            if (T->enter && b->state[1] != had[1]) {
+                for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = had[k];
+                *enter_into = b->state[1];
+            }
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return ok;
 }
 
+// Into the state the other player's went into, with its state machine's changeState: the old one's end and the new one's start
+// run, as they would here. (Written in as it is, the new one's start never ran: a Bokoblin kept its sword on its back.)
+static bool change_state(const EnemyType *T, Cpu *c, uint64_t self, uint64_t st) {
+    uint64_t sm = self + (uint64_t)(T->state[1] - 0x20);
+    uint64_t vt = *(uint64_t *)(uintptr_t)sm;
+    GuestFn change = vt >= 0x7001000000ull && vt < 0x7002000000ull ? dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 8 * SM_CHANGE_STATE)) : NULL;
+    if (!change) return false;
+    Cpu tmp = *c;  // (before its update: the guest stack below is free)
+    tmp.x[0] = sm, tmp.x[1] = st;
+    g_block_sm = 0;
+    change(&tmp);
+    return true;
+}
 // An enemy's update, on a player whose enemies follow the host's: the host's where, which way, size, state and animation first.
 static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
@@ -371,12 +393,12 @@ static void puppet_update(int ty, Cpu *c) {
         pthread_mutex_unlock(&g_lock);
     }
     bool back = false;  // (the host's, following the joining player's that holds them)
-    uint64_t die_into = 0;  // (the other player's died: this one dies its own death, into the state theirs did)
+    uint64_t die_into = 0, enter_into = 0;  // (enter_into: a new state of the host's, gone into properly below)  // (the other player's died: this one dies its own death, into the state theirs did)
     if (dying(self, T->state[1])) {  // (dying here: its own, to the end)
         g_update[ty](c);
         return;
     }
-    if (g_hosting) back = back_apply(ty, self, key, host_words, &die_into);
+    if (g_hosting) back = back_apply(ty, self, key, host_words, &die_into, &enter_into);
     if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
@@ -400,22 +422,22 @@ static void puppet_update(int ty, Cpu *c) {
             } else {
                 a = b;
             }
+            uint64_t had[4];
+            for (int k = 0; k < 4; k++) had[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
             snap_apply(T, self, a, b, t);
+            if (T->enter && b->state[1] != had[1]) {
+                for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = had[k];
+                enter_into = b->state[1];
+            }
             driven = true;
             memcpy(host_words, b->words, sizeof host_words);
             host_hurt = hurt_state(b->state[1]);
         }
         pthread_mutex_unlock(&g_lock);
     }
+    if (enter_into && !change_state(T, c, self, enter_into)) *(uint64_t *)(uintptr_t)(self + T->state[1]) = enter_into;
     if (die_into) {
-        uint64_t sm = self + (uint64_t)(T->state[1] - 0x20);
-        uint64_t vt = *(uint64_t *)(uintptr_t)sm;
-        GuestFn change = vt >= 0x7001000000ull && vt < 0x7002000000ull ? dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 8 * SM_CHANGE_STATE)) : NULL;
-        if (change && g_ndying < MAX_DYING) {
-            Cpu tmp = *c;  // (before its update: the guest stack below is free)
-            tmp.x[0] = sm, tmp.x[1] = die_into;
-            g_block_sm = 0;
-            change(&tmp);
+        if (g_ndying < MAX_DYING && change_state(T, c, self, die_into)) {
             g_dying[g_ndying++] = self;
             uint64_t nm = *(uint64_t *)(uintptr_t)(die_into + 8);
             LOG("[coop] enemies: the other player's %s died: this one dies its own death (%s)\n", T->name, (const char *)(uintptr_t)nm);
@@ -653,7 +675,7 @@ static bool install_type(int ty, bool now) {
 
 // ---- more types without a rebuild: a line each (coop_enemies.txt in the data folder, read at the start; the host sends its
 // lines to whoever joins, who take them on as they come). Numbers in hex:
-//   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset]
+//   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset] [enter]
 // and once: "hp <offset>", where every enemy keeps its health (shared from then).
 // state: the slot holding its current state (the machine is 0x20 before it; the two after and the one 0x28 before go
 // with it, as in both types above); anim: its animation block (end, start, frame, mode, then its resource at +0x18).
@@ -681,11 +703,12 @@ bool coop_enemy_add_type(const char *line) {
     unsigned long long w[3] = {0};
     char tok[64];
     int m = 0;
-    bool no_res = false;
+    bool no_res = false, enter = false;
     while (sscanf(rest, "%63s%n", tok, &m) == 1) {
         rest += m;
         if (!strncmp(tok, "w=", 2)) sscanf(tok + 2, "%llx,%llx,%llx", &w[0], &w[1], &w[2]);
         else if (!strcmp(tok, "nores")) no_res = true;  // (its animation's +0x18 isn't a resource: a Deku Baba's)
+        else if (!strcmp(tok, "enter")) enter = true;
         else if (!strncmp(tok, "clip=", 5)) sscanf(tok + 5, "%llx", &clip);
         else sscanf(tok, "%llx", &ex);
     }
@@ -702,7 +725,7 @@ bool coop_enemy_add_type(const char *line) {
     char *nl = strchr(g_type_lines[ty], '\n');
     if (nl) *nl = 0;
     TYPES[ty] = (EnemyType){g_type_name[ty], (uint16_t)prof, vt, {(int)st - 0x28, (int)st, (int)st + 8, (int)st + 0x10}, (int)an, (int)ex,
-                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL, no_res, (int)clip};
+                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL, no_res, enter, (int)clip};
     g_ntypes++;
     if (!install_type(ty, true)) { g_ntypes--; return false; }
     LOG("[coop] enemies: %s (profile %#llx) now follows the host's too\n", name, prof);
@@ -723,7 +746,7 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
     FILE *f = fopen("coop_enemies.txt", "r");
     if (!f && (f = fopen("coop_enemies.txt", "w"))) {  // (a start, saying how)
         fputs("# Co-op: more enemies that follow the host's (runtime/hle/coop_enemy.c, coop_enemy_add_type). One a line, in hex:\n"
-              "#   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset]\n"
+              "#   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset] [enter]\n"
               "# The host's lines go to whoever joins.\n", f);
         fclose(f);
         f = NULL;
