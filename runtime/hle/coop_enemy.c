@@ -209,6 +209,10 @@ static bool grab_state(int ty, uint64_t st) { return st && (st == g_grab_state[t
 // ---- An enemy holding the joining player: theirs to run (they're the one held, and only their input shakes it off). While it
 // does, and a little after (so the host's ends in the state theirs ended in), they send it to the host, whose own follows it.
 #define HELD_AFTER_MS 600
+// Hit by the joining player: theirs the same way, and sent to the host, until this long after it last looked hurt. A Deku
+// Baba's Damage lasts a few frames; its knock-back and a shield's stun play on in Wait, and its death in DeadMouth: without
+// this the host's never saw them.
+#define HIT_KEEP_MS 1500
 #define MAX_HELD 16
 static struct { uint16_t profile; uint32_t flag; uint64_t until; } g_held[MAX_HELD];  // (the joining player's; flag: the host's id)
 static int g_nheld;
@@ -426,6 +430,7 @@ static void puppet_update(int ty, Cpu *c) {
     } else if (held) {
         pthread_mutex_lock(&g_lock);
         int h = held_find(T->profile, key);
+        if (h >= 0 && hurt_state(after) && g_held[h].until < SDL_GetTicks() + HIT_KEEP_MS) g_held[h].until = SDL_GetTicks() + HIT_KEEP_MS;
         if (h >= 0 && SDL_GetTicks() > g_held[h].until) {
             g_held[h] = g_held[--g_nheld];
             LOG("[coop] enemies: the %s with flag %#x let this player go: it follows the host's again\n", T->name, flag);
@@ -462,6 +467,8 @@ static void puppet_update(int ty, Cpu *c) {
     // One let go that got over it (hit, not killed): it follows the host's again
     if (!driven && g_puppets && key && released(T->profile, key) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
         pthread_mutex_lock(&g_lock);
+        const bool still = held_find(T->profile, key) >= 0;  // (still theirs, for the host to follow: not over it yet)
+        if (still) { pthread_mutex_unlock(&g_lock); return; }
         for (int i = 0; i < g_nreleased; i++)
             if (g_released[i].profile == T->profile && g_released[i].flag == key) { g_released[i] = g_released[--g_nreleased]; break; }
         pthread_mutex_unlock(&g_lock);
@@ -473,8 +480,11 @@ static void puppet_update(int ty, Cpu *c) {
         g_released[g_nreleased].profile = T->profile, g_released[g_nreleased].flag = key;
         g_released[g_nreleased].seen = SDL_GetTicks(), g_released[g_nreleased].hurt = true;
         g_nreleased++;
+        int h = held_find(T->profile, key);
+        if (h < 0 && g_nheld < MAX_HELD) h = g_nheld++, g_held[h].profile = T->profile, g_held[h].flag = key;
+        if (h >= 0) g_held[h].until = SDL_GetTicks() + HIT_KEEP_MS;
         pthread_mutex_unlock(&g_lock);
-        LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now\n", T->name, flag);
+        LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now, and the host's follows it\n", T->name, flag);
     }
 }
 // The second animation (behind a pointer): frame +0x28, speed +0x2c, first frame +0x30, last +0x34, its clip +0x40, a CHR0
