@@ -44,8 +44,15 @@ static EnemyType TYPES[MAX_TYPES] = {
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
      0xd28, 0, {"Absorption", "Shake"}, "Wait"},
+    // (as their coop_enemies.txt lines were: "dekubaba 16e 700157a670 1560 b78 nores clip=b38",
+    // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180 enter")
+    {"dekubaba", 0x16e, 0x700157a670ull, {0x1538, 0x1560, 0x1568, 0x1570}, 0xb78, 0, {0}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL,
+     true, false, 0xb38},
+    {"bokoblin", 0x17e, 0x7001573a90ull, {0x1920, 0x1948, 0x1950, 0x1958}, 0x510, 0, {0xf90, 0x1180, 0}, NULL, NULL, NULL, 0, 0,
+     {NULL, NULL}, NULL, false, true, 0x4d0},
 };
-static int g_ntypes = 2;  // (the two above; more from coop_enemies.txt, or sent by the host: coop_enemy_add_type)
+#define BUILTIN_TYPES 4
+static int g_ntypes = BUILTIN_TYPES;  // (the ones above; more from coop_enemies.txt, or sent by the host: coop_enemy_add_type)
 #define NTYPES g_ntypes
 #define PLAYER_PTR 0x7001826AD0ull
 #define PLAYER_VTABLE 0x7001637D28ull
@@ -112,7 +119,7 @@ static struct { uint16_t profile; uint32_t id; bool hurt; } g_sent[64];  // (the
 // game, given as a line "hp <offset>" in coop_enemies.txt: 0, none, nothing shared). Health only goes down: whenever either
 // game sees a paired enemy's drop, it sends the new value, and the other's copy is lowered to it. So hits from both players
 // add up, and whichever takes it to nothing kills it (and its death is shared as any is).
-static int g_hp_off;
+static int g_hp_off = 0x42e;  // (measured in 1.0.0: a Bokoblin's 12, 4 a sword hit; an "hp" line can still move it)
 static void (*g_send_hp)(uint32_t id, uint16_t hp);
 void coop_enemy_set_hp_sender(void (*fn)(uint32_t id, uint16_t hp)) { g_send_hp = fn; }
 #define HP_TRACK 64
@@ -740,8 +747,8 @@ bool coop_enemy_add_type(const char *line) {
 // The host's added lines, for whoever joins: '\n' between. Returns the length.
 int coop_enemy_types_text(char *out, int cap) {
     int n = 0;
-    if (g_hp_off) n += snprintf(out, (size_t)cap, "%s\n", g_type_lines[0]);  // (where health is, for theirs to share too)
-    for (int ty = 2; ty < g_ntypes && n < cap - 1; ty++) n += snprintf(out + n, (size_t)(cap - n), "%s\n", g_type_lines[ty]);
+    if (g_hp_off && g_type_lines[0][0]) n += snprintf(out, (size_t)cap, "%s\n", g_type_lines[0]);  // (where health is, for theirs to share too)
+    for (int ty = BUILTIN_TYPES; ty < g_ntypes && n < cap - 1; ty++) n += snprintf(out + n, (size_t)(cap - n), "%s\n", g_type_lines[ty]);
     return n < cap ? n : cap - 1;
 }
 
