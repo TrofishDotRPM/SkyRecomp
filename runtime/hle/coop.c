@@ -1004,6 +1004,9 @@ void coop_status(CoopStatus *out) {
     out->mode = g_mode, out->from_env = g_from_env, out->port = g_port;
     float o[3];
     out->other_here = g_mode && coop_other_feet(o) && !in_boss();
+    float me[3];
+    if (out->other_here && coop_my_position(me))
+        out->other_distance = sqrtf((o[0] - me[0]) * (o[0] - me[0]) + (o[1] - me[1]) * (o[1] - me[1]) + (o[2] - me[2]) * (o[2] - me[2]));
     CoopNetStatus n;
     coop_net_status(&n);
     if (g_mode) out->peers = n.peers, out->joining = n.joining;

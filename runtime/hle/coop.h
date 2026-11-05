@@ -18,6 +18,7 @@ typedef struct {
     char address[64];      // the router's public address, once the port is open
     char upnp_note[192];   // why the port couldn't be opened, or a warning about the address
     bool other_here;       // the other player is in this player's area (Wait for me! can take them there)
+    float other_distance;  // how far away they are then, in the game's units (about a centimetre each)
 } CoopStatus;
 
 void coop_status(CoopStatus *out);  // any thread

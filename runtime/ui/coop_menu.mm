@@ -166,8 +166,16 @@ extern "C" void coop_menu_draw(float scale) {
     // How it's going: short on the row, the rest in its description
     if (running && st.peers) {
         if (!st.other_here) opt_disable_next();
-        if (opt_button("Wait for me!", st.other_here ? "Go to where the other player stands, right now."
-                                                     : "Go to where the other player stands: only in the same area as them (not a boss's or a Silent Realm)."))  {
+        char away[32] = "";  // (how far they are: on the row's right)
+        if (st.other_here) {
+            const float m = st.other_distance / 100.0f;
+            if (m < 10) snprintf(away, sizeof away, "%.1f m away", m);
+            else snprintf(away, sizeof away, "%.0f m away", m);
+        } else {
+            snprintf(away, sizeof away, "elsewhere");
+        }
+        if (opt_action("Wait for me!", away, st.other_here ? "Go to where the other player stands, right now."
+                                                     : "Go to where the other player stands: only in the same area as them (not a boss's or a Silent Realm).", false))  {
             coop_wait_for_me();
             extern void menu_close_now(void);
             menu_close_now();
