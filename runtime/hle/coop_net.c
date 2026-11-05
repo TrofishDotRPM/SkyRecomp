@@ -29,9 +29,15 @@ typedef int sock_t;
 #define sock_close close
 #define WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
 #define IN_PROGRESS() (errno == EINPROGRESS)
-#ifndef MSG_NOSIGNAL
+#endif
+#ifndef MSG_NOSIGNAL  // (Linux's: no SIGPIPE from a closed connection; Windows sends no signal anyway)
 #define MSG_NOSIGNAL 0
 #endif
+#ifdef IN  // (Windows' headers define IN and OUT, empty, for annotating parameters: a phase is named IN here)
+#undef IN
+#endif
+#ifdef OUT
+#undef OUT
 #endif
 
 #include "coop_sha256.h"
