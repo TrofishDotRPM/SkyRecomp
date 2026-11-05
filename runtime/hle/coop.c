@@ -130,6 +130,8 @@ static int16_t pos_unit(float v) {
 static void spawn_received(const uint8_t *d, int size);
 static void pins_received(const uint8_t *d, int size);
 static bool g_pins_known;  // (map pins: the save's are known, so a change is news; below)
+static void pins_copy_send(void);
+static uint32_t *pouch(int i);
 static void blob_received(const uint8_t *data, int size, void *user) {  // (what it is: its first byte)
     (void)user;
     if (size < 1) return;
@@ -589,7 +591,7 @@ static void enemy_remove_live(uint16_t flag) {
 // aren't in these tables, and aren't copied.
 #define COOP_EV_COPY 11      // a: COPY_ITEM / COPY_STORY / COPY_CAPACITY, b: word, c: the host's value
 #define COOP_EV_COPY_END 12
-enum { COPY_ITEM, COPY_STORY, COPY_CAPACITY };
+enum { COPY_ITEM, COPY_STORY, COPY_CAPACITY, COPY_POUCH };  // (COPY_POUCH: b the slot, c d its value, low and high)
 #define ITEM_IDS 512         // (the table goes on into other data after the items)
 #define STORY_IDS 1088
 static bool g_copy_done;     // a joining player: this connection's copy is in
@@ -639,6 +641,13 @@ static void copy_send(void) {  // (the host, to the player just arrived or just 
             coop_net_reply(&ev);
         }
     }
+    for (int i = 0; i < 8; i++) {  // (the pouch: into the same slot of theirs, where theirs is empty)
+        const uint32_t v = *pouch(i);
+        if (!v) continue;
+        CoopEvent ev = {COOP_EV_COPY, COPY_POUCH, (uint16_t)i, (uint16_t)(v & 0xffff), (uint16_t)(v >> 16)};
+        coop_net_reply(&ev);
+    }
+    pins_copy_send();  // (before the end: they take it only while their copy is coming in)
     CoopEvent cap = {COOP_EV_COPY, COPY_CAPACITY, 0, *g_core.capacity, 0}, end = {COOP_EV_COPY_END, 0, 0, 0, 0};
     coop_net_reply(&cap);
     coop_net_reply(&end);
@@ -660,6 +669,14 @@ static void copy_received(const CoopEvent *ev) {  // (a joining player)
         LOG("[coop] the host's heart capacity %d (yours %d); bosses only the host had beaten, now beaten here too: %d\n", cap,
             *g_core.capacity, __builtin_popcount(g_copy_hosts & ~g_copy_mine & 0x3f));
         if (cap > *g_core.capacity && cap <= 80 && cap % 4 == 0) *g_core.capacity = (uint16_t)cap;
+        return;
+    }
+    if (ev->a == COPY_POUCH) {
+        const uint32_t v = (uint32_t)ev->c | (uint32_t)ev->d << 16;
+        if (ev->b < 8 && v && !*pouch(ev->b)) {
+            *pouch(ev->b) = v;
+            LOG("[coop] the host's pouch slot %d (item %u) is in yours\n", ev->b, ev->c);
+        }
         return;
     }
     if (ev->a > COPY_STORY) return;
@@ -783,10 +800,27 @@ static void pins_received(const uint8_t *d, int size) {  // (the network's threa
         const uint8_t *e = d + 2 + i * PIN_BYTES;
         float p[3];
         memcpy(p, e + 3, 12);
-        if (e[0] >= PIN_AREAS || e[1] >= PIN_SLOTS || e[2] > 1 || !isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2])) continue;
+        if (e[0] >= PIN_AREAS || e[1] >= PIN_SLOTS || e[2] > 2 || !isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2])) continue;
+        if (e[2] == 2 && (g_mode != 2 || g_copy_done)) continue;  // (the host's, for a joining player's copy: not for the others)
         memcpy(g_pin_in + g_npin_in++ * PIN_BYTES, e, PIN_BYTES);
     }
     pthread_mutex_unlock(&g_pin_lock);
+}
+
+static void pins_copy_send(void) {  // (the host, in a joining player's copy: its placed pins, marked so; network thread)
+    uint8_t out[2 + PIN_AREAS * PIN_SLOTS * PIN_BYTES];
+    int n = 0;
+    const uint8_t *flags = pin_flags();
+    for (int a = 0; a < PIN_AREAS; a++)
+        for (int s = 0; s < PIN_SLOTS; s++) {
+            if (!(flags[a] >> s & 1)) continue;
+            uint8_t *e = out + 2 + n++ * PIN_BYTES;
+            e[0] = (uint8_t)a, e[1] = (uint8_t)s, e[2] = 2;
+            memcpy(e + 3, pin_pos(a, s), 12);
+        }
+    if (!n) return;
+    out[0] = COOP_BLOB_PINS, out[1] = (uint8_t)n;
+    coop_net_send_blob(out, 2 + n * PIN_BYTES);
 }
 
 static void pins_tick(void) {  // (once a frame, with a save in play)
@@ -804,6 +838,7 @@ static void pins_tick(void) {  // (once a frame, with a save in play)
     for (int i = 0; i < g_npin_in; i++) {
         const uint8_t *e = g_pin_in + i * PIN_BYTES;
         const int a = e[0], s = e[1];
+        if (e[2] == 2 && flags[a] >> s & 1) continue;  // (the join copy: only into a free slot, theirs stay)
         if (e[2]) {
             memcpy(pin_pos(a, s), e + 3, 12);
             flags[a] |= (uint8_t)(1 << s);
