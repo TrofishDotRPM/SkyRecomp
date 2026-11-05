@@ -3571,11 +3571,11 @@ static void dup_tint_for(uint32_t vertices, bool rigid) {
 #define KEEP_PARTS 48
 #define KEEP_BUFFERS (2 * 18)
 #define KEEP_BYTES (256u << 10)
-typedef __typeof__(st) DrawState;
+typedef __typeof__(st) DupDrawState;
 #define KEEP_RECORD 512  // bytes of a draw's command record, with what follows its header
 typedef struct {
     _Alignas(8) uint8_t record[KEEP_RECORD];
-    DrawState state;
+    DupDrawState state;
     bool indexed, skinned;
     uint32_t vertices, nbones;
     uint16_t tag;
@@ -3622,7 +3622,7 @@ static void link_replay(void) {
     if (!figure_state(feet, &yaw, &swing, view, &px, &py)) return;
     replayed = frame;
     active = true;
-    static DrawState saved;
+    static DupDrawState saved;
     saved = st;
     const uint64_t now = SDL_GetTicks();
     for (int i = 0; i < kept_n; i++) {
