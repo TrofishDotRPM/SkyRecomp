@@ -1,6 +1,30 @@
-# Sky Recomp - Native PC Recompilation
+# Sky Recomp Co-op - Online Co-op for Skyward Sword HD
 
-**Sky Recomp** is a native cross-platform port (**Windows**, **Linux**, and **macOS**) based on static AArch64 -> C recompilation of *The Legend of Zelda: Skyward Sword HD*.
+**Sky Recomp Co-op** is a fork of [Sky Recomp](https://github.com/Apolinario-coder/SkyRecomp) (a native PC recompilation of *The Legend of Zelda: Skyward Sword HD*) that adds **online two-player co-op**. Each player runs their own game and their own save, and the two games stay in step: you see each other in the world, and what one player does counts for both.
+
+**Status: experimental, in active playtesting.** Things go wrong, and enemy sync in particular is being built one enemy at a time. **Back up your saves first**: joining merges progress into your save permanently.
+
+| Two players in Skyloft | Each Link with its own shadow |
+| --- | --- |
+| ![Two Links, one red and one blue, standing together in Skyloft](docs/coop-two-links.jpg) | ![The two Links from above, each with its own shadow](docs/coop-shadows.jpg) |
+
+## What co-op adds
+
+- **See each other**: the other player is a real Link in the world, in their own colours (picked in the Co-op tab), with their pose, sword, shield and shadow, and a name tag. They're hidden during cutscenes.
+- **Shared progress**: items and upgrades, heart pieces, story and dungeon flags, dungeon maps and keys (not yet tried in a dungeon), monster parts, rupees and pouch items from chests, and chests opening live in front of you. Health, stamina, spending and heart containers stay each player's own.
+- **Joining catches you up**: the joining player gets a one-time copy of the host's items and progress.
+- **Shared enemies**: the joining player's enemies follow the host's (position, AI state, animation), damage from both players adds up, and kills count for both. Synced so far: Keese, Chuchus, Deku Babas and Bokoblins. See the [enemy notes in the co-op docs](docs/coop.md).
+- **Bosses and Silent Realms are solo**: each player takes them alone; nothing is shared while you're in one.
+- **"Wait for me!"**: a button in the Co-op tab that takes you to the other player when you're in the same area.
+- **Online play**: host or join from the in-game menu (F1 > Co-op > Online). Direct connection with automatic port forwarding (UPnP) and a password; no relay server.
+
+Both players need the **same build** of this fork; a different one is refused when connecting. Setup, how it works and known gaps: [docs/coop.md](docs/coop.md).
+
+---
+
+## About Sky Recomp
+
+**Sky Recomp** is a native cross-platform port (**Windows**, **Linux**, and **macOS**) based on static AArch64 -> C recompilation of *The Legend of Zelda: Skyward Sword HD*. Everything below is from the original project; the co-op work above is tested on Linux (Bazzite / Fedora) only.
 
 **Development status: experimental.** Full-game stability has not been established. Crashes, menu freezes and rendering differences are still being investigated. Use the [diagnostic log](docs/diagnostics.md) to report a problem; see the [review of reported issues](docs/video-review.md) for confirmed changes and remaining checks.
 

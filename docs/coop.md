@@ -1,6 +1,6 @@
 # Co-op progress sync
 
-Each player runs their own game with their own save. Progress is shared; bodies are not: you won't see the other player, only what they did.
+Each player runs their own game with their own save. Progress is shared, and each player sees the other as a second Link in the world.
 
 **Status: partly confirmed in the game (2026-11-01), with two copies on one machine.** Working: connecting, items and heart pieces (given with the test keys below), recovery hearts, chest rupees, popups, small chests opening live, the player marker, and the other player's figure. Health stays private and heart containers aren't shared. Enemy kills are shared live (bats and chuchus). Not yet tried: full-size chests opening live, both players opening a chest at once, maps and keys in a dungeon, and playing over a real network.
 
