@@ -10,13 +10,23 @@
 
 ## What co-op adds
 
-- **See each other**: the other player is a real Link in the world, in their own colours (picked in the Co-op tab), with their pose, sword, shield and shadow, and a name tag. They're hidden during cutscenes.
+- **See each other**: the other player is a real Link in the world, in the colours they picked (see [Character customization](#character-customization)), with their pose, sword, shield and shadow, and their name above them. They're hidden during cutscenes.
 - **Shared progress**: items and upgrades, heart pieces, story and dungeon flags, dungeon maps and keys (not yet tried in a dungeon), monster parts, rupees and pouch items from chests, and chests opening live in front of you. Health, stamina, spending and heart containers stay each player's own.
 - **Joining catches you up**: the joining player gets a one-time copy of the host's items and progress.
 - **Shared enemies**: the joining player's enemies follow the host's (position, AI state, animation), damage from both players adds up, and kills count for both. Synced so far: Keese, Chuchus, Deku Babas and Bokoblins. See the [enemy notes in the co-op docs](docs/coop.md).
 - **Bosses and Silent Realms are solo**: each player takes them alone; nothing is shared while you're in one.
 - **"Wait for me!"**: a button in the Co-op tab that takes you to the other player when you're in the same area.
 - **Online play**: host or join from the in-game menu (F1 > Co-op > Online). Direct connection with automatic port forwarding (UPnP) and a password; no relay server.
+
+## Character customization
+
+Each player makes their Link their own, and the other player sees it. Open the menu (F1) and go to the **Customize** tab, next to Co-op. The menu stays to the left with the game undimmed, so your Link shows each change as you pick it.
+
+- **Link**: hair, eyes, earrings and skin.
+- **Skyloft clothes** (the outfit you start in): shirt, shirt details, tabard, tabard design, trousers, boots and belt.
+- **Classic tunic** (the green Knight's uniform): tunic, hat, undershirt, gloves, trousers, boots and belt.
+
+Each part has a colour wheel, a row of quick colours (red, orange, yellow, green, teal, blue, navy, purple, pink, brown, black, grey, white) and **Original** for the game's own colour. Each page also has an **All original** button. Your colours are sent to the other player when you connect and whenever you change them, so you can tell each other apart at a glance (red and blue in the pictures above). Your **name**, set in the Co-op tab, is shown above your Link on their screen. Everything is saved in `skyrecomp.ini`.
 
 Both players need the **same build** of this fork; a different one is refused when connecting. Setup, how it works and known gaps: [docs/coop.md](docs/coop.md).
 
