@@ -250,6 +250,46 @@ static void wake_for_other(int ty, Cpu *c, uint64_t self) {
     change(&tmp);
     LOG("[coop] enemies: woke the %s with flag %#x for the other player\n", T->name, *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG));
 }
+// ---- a joining player's copies don't change state by themselves: their state comes from the host's. Run in the host's
+// state with this player's Link close, one's own AI would switch on the spot (a Deku Baba into Attack, each frame, as the
+// host's came back to Wait 70 ms late): each switch ran that state's start (its purple spray). So their state machine's
+// changeState (its vtable slot 5) is taken over too, and during a following copy's update a switch is ignored - unless
+// into being hurt or dying (this player's hits, and kills, are still theirs to make) or into holding a Link (a chuchu
+// catching them). One per type, found from its first actor's state machine.
+static GuestFn g_sm_change[MAX_TYPES];
+static uint64_t g_sm_change_at[MAX_TYPES];
+static uint64_t g_block_sm;  // (the state machine of the copy updating now, while it follows the host's)
+static int g_blocked;
+static void sm_change(int ty, Cpu *c) {
+    if (g_block_sm && c->x[0] == g_block_sm && !hurt_state(c->x[1]) && !grab_state(ty, c->x[1])) {
+        if (g_blocked++ < 6) LOG("[coop] enemies: a %s's own switch ignored: it follows the host's\n", TYPES[ty].name);
+        c->x[0] = 0;
+        return;
+    }
+    g_sm_change[ty](c);
+}
+#define SMC(n) static void sm_change_##n(Cpu *c) { sm_change(n, c); }
+SMC(0) SMC(1) SMC(2) SMC(3) SMC(4) SMC(5) SMC(6) SMC(7) SMC(8) SMC(9) SMC(10) SMC(11) SMC(12) SMC(13) SMC(14) SMC(15)
+#undef SMC
+static const HostFn SM_CHANGES[MAX_TYPES] = {sm_change_0, sm_change_1, sm_change_2, sm_change_3, sm_change_4, sm_change_5,
+                                             sm_change_6, sm_change_7, sm_change_8, sm_change_9, sm_change_10, sm_change_11,
+                                             sm_change_12, sm_change_13, sm_change_14, sm_change_15};
+
+static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
+    if (g_sm_change_at[ty]) return;
+    const uint64_t sm = self + (uint64_t)(TYPES[ty].state[1] - 0x20), vt = *(uint64_t *)(uintptr_t)sm;
+    if (vt < 0x7001000000ull || vt >= 0x7002000000ull) { g_sm_change_at[ty] = 1; return; }
+    const uint64_t fn = *(uint64_t *)(uintptr_t)(vt + 8 * SM_CHANGE_STATE);
+    g_sm_change_at[ty] = fn;
+    for (int o = 0; o < g_ntypes; o++)
+        if (o != ty && g_sm_change_at[o] == fn && g_sm_change[o]) { g_sm_change[ty] = g_sm_change[o]; return; }  // (shared: one hook)
+    g_sm_change[ty] = dispatch_lookup(fn);
+    if (!g_sm_change[ty]) { LOG("[coop] enemies: the %s's changeState isn't the game's (%llx)\n", TYPES[ty].name, (unsigned long long)fn); return; }
+    hle_override_now(fn, SM_CHANGES[ty], "coop enemy changeState");
+    LOG("[coop] enemies: the %s's own state switches are the host's while it follows (changeState %llx)\n", TYPES[ty].name,
+        (unsigned long long)fn);
+}
+
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
 
 // The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
@@ -353,7 +393,13 @@ static void puppet_update(int ty, Cpu *c) {
         if (T->extra) keep_ex = *(uint64_t *)(uintptr_t)(self + T->extra);
         *(uint64_t *)(uintptr_t)(self + T->state[1]) = g_idle_state[ty];
     }
+    const bool follow = driven && !g_hosting && !stand_in;
+    if (follow) {
+        sm_change_install(ty, self);
+        if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20);
+    }
     g_update[ty](c);
+    g_block_sm = 0;
     if (stand_in) {
         for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = keep_st[k];
         memcpy((void *)(uintptr_t)(self + T->anim), keep_an, sizeof keep_an);
