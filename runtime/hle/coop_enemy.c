@@ -623,10 +623,12 @@ int coop_enemy_take(uint8_t *out, int cap) {
     }
     uint8_t *w = out + 3;
     int count = 0;
-    const bool back = !g_hosting;  // (a joining player: only theirs - holding them, or hurt by them)
+    // (a joining player: only those holding them. Not those they've hurt: forced into the host's own, the host's AI stuck -
+    // stomping and swinging in place - its state machine never entering those states itself)
+    const bool back = !g_hosting;
     if (back) {
         pthread_mutex_lock(&g_lock);
-        int nh = g_nheld + g_nreleased;
+        int nh = g_nheld;
         pthread_mutex_unlock(&g_lock);
         if (!nh) return 0;
     }
@@ -642,7 +644,7 @@ int coop_enemy_take(uint8_t *out, int cap) {
         if (back) {
             pthread_mutex_lock(&g_lock);
             uint32_t k = map_key(a, prof, *(uint16_t *)(uintptr_t)(a + ENEMY_FLAG), false);
-            bool theirs = k && (held_find(prof, k) >= 0 || released(prof, k));
+            bool theirs = k && held_find(prof, k) >= 0;
             pthread_mutex_unlock(&g_lock);
             if (!theirs) continue;
             s.id = k;  // (the host's own, for theirs to find)
