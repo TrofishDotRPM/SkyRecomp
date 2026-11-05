@@ -51,6 +51,7 @@ static int g_ntypes = 2;  // (the two above; more from coop_enemies.txt, or sent
 #define PLAYER_CENTRE 0x7001829a30ull  // 3 f32: Link's middle, kept apart from him (the same as his +0x1c8)
 #define ACTOR_PROFILE 0x10
 #define ACTOR_LIFE 0x12
+#define ACTOR_DELETE 0x13  // u8: fBase_c's delete request
 #define ACTOR_LIST 0x40
 #define ENEMY_FLAG 0x136
 #define ACTOR_ROT 0x13c
@@ -338,6 +339,7 @@ static void puppet_update(int ty, Cpu *c) {
     uint64_t self = c->x[0];
     if (!guest_ptr(self) || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != T->profile) { g_update[ty](c); return; }
     bool driven = false, host_hurt = false;
+    uint32_t host_words[3] = {0};  // (the host's, put back after its own update: it sets its own each frame)
     const uint16_t flag = *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG);
     // key: which of the host's this is (the host: its own address; a joining player: the one it's paired with, 0 for none)
     uint32_t key = g_hosting ? (uint32_t)self : 0;
@@ -371,6 +373,7 @@ static void puppet_update(int ty, Cpu *c) {
             }
             snap_apply(T, self, a, b, t);
             driven = true;
+            memcpy(host_words, b->words, sizeof host_words);
             host_hurt = hurt_state(b->state[1]);
         }
         pthread_mutex_unlock(&g_lock);
@@ -425,7 +428,19 @@ static void puppet_update(int ty, Cpu *c) {
         sm_change_install(ty, self);
         if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20);
     }
+    const uint8_t del_before = *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE);
     g_update[ty](c);
+    if (follow) {
+        for (int k = 0; k < 3; k++)
+            if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = host_words[k];
+        // Following the host's into its death (a Bokoblin's Fail), its own update ends it at once: that state's start never ran
+        // here. It plays the host's to the end instead, and goes when the host's has (coop_enemy_gone).
+        if (!del_before && *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE)) {
+            *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE) = 0;
+            static int told;
+            if (told++ < 8) LOG("[coop] enemies: a %s following the host's ended itself: kept, to play the host's\n", T->name);
+        }
+    }
     g_block_sm = 0;
     if (stand_in) {
         for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = keep_st[k];
