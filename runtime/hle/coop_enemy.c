@@ -188,7 +188,8 @@ static const Snap *find(const Frame *f, uint16_t profile, uint32_t id) {
 #define MAX_MAP 128
 #define MAP_NEAR 2000.0f   // farther than this from any of the host's: none of them
 #define MAP_FORGET_MS 1000 // one not updated this long is gone (its memory may be another's later)
-static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; } g_map[MAX_MAP];
+static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; bool entered; } g_map[MAX_MAP];  // (entered: its
+// state's start has run here, once paired: in the state the host's is already in, there's no change to run it)
 static int g_nmap;
 
 static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pair) {
@@ -215,7 +216,7 @@ static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pai
     for (int i = 0; i < g_nmap && slot < 0; i++) if (g_map[i].self == self || now - g_map[i].seen >= MAP_FORGET_MS) slot = i;
     if (slot < 0 && g_nmap < MAX_MAP) slot = g_nmap++;
     if (slot < 0) return 0;
-    g_map[slot].self = self, g_map[slot].profile = profile, g_map[slot].id = best->id, g_map[slot].seen = now;
+    g_map[slot].self = self, g_map[slot].profile = profile, g_map[slot].id = best->id, g_map[slot].seen = now, g_map[slot].entered = false;
     return best->id;
 }
 
@@ -425,7 +426,11 @@ static void puppet_update(int ty, Cpu *c) {
             uint64_t had[4];
             for (int k = 0; k < 4; k++) had[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
             snap_apply(T, self, a, b, t);
-            if (T->enter && b->state[1] != had[1]) {
+            bool first = false;
+            if (T->enter)
+                for (int i = 0; i < g_nmap; i++)
+                    if (g_map[i].self == self && g_map[i].id == key && !g_map[i].entered) g_map[i].entered = true, first = true;
+            if (T->enter && (b->state[1] != had[1] || first)) {
                 for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = had[k];
                 enter_into = b->state[1];
             }
