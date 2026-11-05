@@ -722,8 +722,17 @@ static void treasures_tick(void) {  // (once a frame, with a save in play)
         int v = treasure_get(i), d = v - g_treasure_shadow[i];
         g_treasure_shadow[i] = v;
         if (!g_treasure_known || d <= 0) continue;
+        LOG("[coop] parts: this player got %d of treasure %d (item %d): now %d, sent\n", d, i, TREASURE_FIRST + i, v);
         CoopEvent ev = {COOP_EV_PART, (uint8_t)i, 0, (uint16_t)d, 0};
         emit(&ev, NULL);
+    }
+    if (!g_treasure_known) {
+        char held[160];
+        int n = 0;
+        held[0] = 0;
+        for (int i = 0; i < TREASURES && n < (int)sizeof held - 12; i++)
+            if (g_treasure_shadow[i]) n += snprintf(held + n, sizeof held - (size_t)n, " %d:%d", TREASURE_FIRST + i, g_treasure_shadow[i]);
+        LOG("[coop] parts: held (item:count):%s\n", n ? held : " none");
     }
     g_treasure_known = true;
 }
@@ -733,6 +742,7 @@ static void part_received(const CoopEvent *ev) {
     int v = treasure_get(ev->a) + ev->c;
     treasure_set(ev->a, v > TREASURE_MAX ? TREASURE_MAX : v);
     g_treasure_shadow[ev->a] = treasure_get(ev->a);  // (theirs, not ours to send back)
+    LOG("[coop] parts: the other player got %d of treasure %d: now %d here\n", ev->c, ev->a, g_treasure_shadow[ev->a]);
     toast("Monster part");
 }
 

@@ -35,6 +35,7 @@ typedef struct {
     // other player's: those states act on the game's one Link (a chuchu's Absorption slows him and shows "Shake").
     const char *grab[2], *idle;
     bool no_res;  // its animation block has no resource of its own at +0x18 (another object's member is there): not copied
+    int clip;     // where it keeps a pointer to a second animation, the one choosing its clip (a Deku Baba's: its mouth), 0: none
 } EnemyType;
 #define MAX_TYPES 16
 static EnemyType TYPES[MAX_TYPES] = {
@@ -75,10 +76,13 @@ typedef struct {
     uint64_t state[4], anim, extra;
     float frame, end, start;
     uint32_t mode, words[3];
+    uint64_t clip_res;  // (the second animation: its clip, the clip's size to check it by, and where it's at)
+    uint32_t clip_size;
+    float clip_frame, clip_end, clip_start, clip_rate;
 } Snap;
 
 // ---- wire: kind byte (COOP_BLOB_ENEMIES), stage u8, count u8, then count Snaps packed little-endian
-#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12 + 4)
+#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12 + 4 + 8 + 4 + 16)
 
 typedef struct { uint64_t at; uint8_t stage; int n; Snap s[MAX_ENEMIES]; } Frame;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -143,9 +147,10 @@ static bool hurt_state(uint64_t st) {
     const char *n = strstr((const char *)(uintptr_t)name, "StateID_");
     if (!n) return false;
     n += 8;
-    // (a Bokoblin's dying state is "Fail": dAcEbc_c::StateID_Fail)
+    // (a Bokoblin's dying state is "Fail": dAcEbc_c::StateID_Fail; a Deku Baba hit goes Damage -> Blow / Stun before
+    // it's back to Wait, and following the host's in the middle of that flips its states and sprays its hit effect)
     return strstr(n, "Damage") || strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill") ||
-           !strcmp(n, "Fail");
+           !strcmp(n, "Fail") || !strcmp(n, "Stun") || !strcmp(n, "Blow");
 }
 
 static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
@@ -472,6 +477,41 @@ static void puppet_update(int ty, Cpu *c) {
         LOG("[coop] enemies: this player hit the %s with flag %#x: it's theirs now\n", T->name, flag);
     }
 }
+// The second animation (behind a pointer): frame +0x28, speed +0x2c, first frame +0x30, last +0x34, its clip +0x40, a CHR0
+// in the object's archive. Archives are loaded at the same place in each game, but the clip is only taken if this game has
+// the same one there (the magic and size match).
+#define CLIP_FRAME 0x28
+#define CLIP_RATE 0x2c
+#define CLIP_START 0x30
+#define CLIP_END 0x34
+#define CLIP_RES 0x40
+static uint64_t clip_obj(uint64_t at) {
+    uint64_t p = *(uint64_t *)(uintptr_t)at;
+    if (!guest_ptr(p)) return 0;
+    uint64_t vt = *(uint64_t *)(uintptr_t)p;
+    return vt >= 0x7001000000ull && vt < 0x7002000000ull ? p : 0;
+}
+static bool clip_ok(uint64_t res, uint32_t size) {
+    return res >= 0x7002000000ull && res < 0x7100000000ull && res % 4 == 0 && !memcmp((const void *)(uintptr_t)res, "CHR0", 4) &&
+           *(uint32_t *)(uintptr_t)(res + 4) == size;
+}
+static void clip_apply(uint64_t at, const Snap *a, const Snap *b, float t) {
+    uint64_t o = clip_obj(at);
+    if (!o || !b->clip_res) return;
+    uint64_t *res = (uint64_t *)(uintptr_t)(o + CLIP_RES);
+    const bool was = *res == b->clip_res;
+    if (!was) {
+        if (!clip_ok(b->clip_res, b->clip_size)) return;
+        *res = b->clip_res;
+    }
+    *(float *)(uintptr_t)(o + CLIP_END) = b->clip_end, *(float *)(uintptr_t)(o + CLIP_START) = b->clip_start;
+    *(float *)(uintptr_t)(o + CLIP_RATE) = b->clip_rate;
+    bool same = a->clip_res == b->clip_res && b->clip_frame >= a->clip_frame;
+    const float want = same ? a->clip_frame + (b->clip_frame - a->clip_frame) * t : b->clip_frame;
+    float *fr = (float *)(uintptr_t)(o + CLIP_FRAME);
+    const float ahead = *fr - want;
+    if (!(was && ahead > 0 && ahead < FRAME_LEAD_MAX)) *fr = want;  // (never a little back, as the first one)
+}
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t) {
     float *pos = (float *)(uintptr_t)(self + ACTOR_POS), *scale = (float *)(uintptr_t)(self + ACTOR_SCALE);
     int16_t *rot = (int16_t *)(uintptr_t)(self + ACTOR_ROT);
@@ -498,6 +538,7 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     float *fr = (float *)(uintptr_t)(an + ANIM_FRAME);
     const float ahead = *fr - want;
     if (!(old_end == b->end && ahead > 0 && ahead < FRAME_LEAD_MAX)) *fr = want;
+    if (T->clip) clip_apply(self + T->clip, a, b, t);
 }
 
 #define U(n) static void update_##n(Cpu *c) { puppet_update(n, c); }
@@ -531,7 +572,7 @@ static bool install_type(int ty, bool now) {
 
 // ---- more types without a rebuild: a line each (coop_enemies.txt in the data folder, read at the start; the host sends its
 // lines to whoever joins, who take them on as they come). Numbers in hex:
-//   name profile vtable state anim [extra] [w=word,word,word] [nores]
+//   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset]
 // and once: "hp <offset>", where every enemy keeps its health (shared from then).
 // state: the slot holding its current state (the machine is 0x20 before it; the two after and the one 0x28 before go
 // with it, as in both types above); anim: its animation block (end, start, frame, mode, then its resource at +0x18).
@@ -541,7 +582,7 @@ static char g_type_lines[MAX_TYPES][160];  // (as given: what the host sends on)
 
 bool coop_enemy_add_type(const char *line) {
     char name[24];
-    unsigned long long prof, vt, st, an, ex = 0;
+    unsigned long long prof, vt, st, an, ex = 0, clip = 0;
     int n = 0;
     while (*line == ' ' || *line == '\t') line++;
     if (!*line || *line == '#' || *line == '\n') return false;
@@ -564,10 +605,12 @@ bool coop_enemy_add_type(const char *line) {
         rest += m;
         if (!strncmp(tok, "w=", 2)) sscanf(tok + 2, "%llx,%llx,%llx", &w[0], &w[1], &w[2]);
         else if (!strcmp(tok, "nores")) no_res = true;  // (its animation's +0x18 isn't a resource: a Deku Baba's)
+        else if (!strncmp(tok, "clip=", 5)) sscanf(tok + 5, "%llx", &clip);
         else sscanf(tok, "%llx", &ex);
     }
     bool sane = prof < 0x300 && vt >= 0x7001500000ull && vt < 0x7001700000ull && vt % 8 == 0 && st >= 0x28 && st < 0x4000 &&
-                st % 8 == 0 && an < 0x4000 && an % 4 == 0 && ex < 0x4000 && w[0] < 0x4000 && w[1] < 0x4000 && w[2] < 0x4000;
+                st % 8 == 0 && an < 0x4000 && an % 4 == 0 && ex < 0x4000 && w[0] < 0x4000 && w[1] < 0x4000 && w[2] < 0x4000 &&
+                clip < 0x4000 && clip % 8 == 0;
     if (!sane) { LOG("[coop] enemies: type line out of range: %s\n", line); return false; }
     for (int ty = 0; ty < g_ntypes; ty++)
         if (TYPES[ty].profile == prof) return false;  // (known already)
@@ -578,7 +621,7 @@ bool coop_enemy_add_type(const char *line) {
     char *nl = strchr(g_type_lines[ty], '\n');
     if (nl) *nl = 0;
     TYPES[ty] = (EnemyType){g_type_name[ty], (uint16_t)prof, vt, {(int)st - 0x28, (int)st, (int)st + 8, (int)st + 0x10}, (int)an, (int)ex,
-                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL, no_res};
+                            {(int)w[0], (int)w[1], (int)w[2]}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL, no_res, (int)clip};
     g_ntypes++;
     if (!install_type(ty, true)) { g_ntypes--; return false; }
     LOG("[coop] enemies: %s (profile %#llx) now follows the host's too\n", name, prof);
@@ -599,7 +642,7 @@ void coop_enemy_init(uint8_t (*stage)(void)) {
     FILE *f = fopen("coop_enemies.txt", "r");
     if (!f && (f = fopen("coop_enemies.txt", "w"))) {  // (a start, saying how)
         fputs("# Co-op: more enemies that follow the host's (runtime/hle/coop_enemy.c, coop_enemy_add_type). One a line, in hex:\n"
-              "#   name profile vtable state anim [extra] [w=word,word,word]\n"
+              "#   name profile vtable state anim [extra] [w=word,word,word] [nores] [clip=offset]\n"
               "# The host's lines go to whoever joins.\n", f);
         fclose(f);
         f = NULL;
@@ -717,9 +760,21 @@ int coop_enemy_take(uint8_t *out, int cap) {
         s.end = *(float *)(uintptr_t)(an + ANIM_END), s.start = *(float *)(uintptr_t)(an + ANIM_START);
         s.mode = *(uint32_t *)(uintptr_t)(an + ANIM_MODE);
         for (int k = 0; k < 3; k++) s.words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(a + T->words[k]) : 0;
+        s.clip_res = 0, s.clip_size = 0, s.clip_frame = s.clip_end = s.clip_start = s.clip_rate = 0;
+        uint64_t co = T->clip ? clip_obj(a + T->clip) : 0;
+        if (co) {
+            s.clip_res = *(uint64_t *)(uintptr_t)(co + CLIP_RES);
+            const bool in = s.clip_res >= 0x7002000000ull && s.clip_res < 0x7100000000ull && s.clip_res % 4 == 0;
+            if (in && clip_ok(s.clip_res, *(uint32_t *)(uintptr_t)(s.clip_res + 4))) s.clip_size = *(uint32_t *)(uintptr_t)(s.clip_res + 4);
+            else s.clip_res = 0;
+            s.clip_frame = *(float *)(uintptr_t)(co + CLIP_FRAME), s.clip_rate = *(float *)(uintptr_t)(co + CLIP_RATE);
+            s.clip_start = *(float *)(uintptr_t)(co + CLIP_START), s.clip_end = *(float *)(uintptr_t)(co + CLIP_END);
+        }
         put(&w, &s.profile, 2), put(&w, &s.flag, 2), put(&w, s.pos, 12), put(&w, s.rot, 6), put(&w, s.state, 32);
         put(&w, &s.anim, 8), put(&w, &s.frame, 4), put(&w, &s.end, 4), put(&w, &s.start, 4), put(&w, &s.mode, 4);
         put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12), put(&w, &s.id, 4);
+        put(&w, &s.clip_res, 8), put(&w, &s.clip_size, 4), put(&w, &s.clip_frame, 4), put(&w, &s.clip_end, 4);
+        put(&w, &s.clip_start, 4), put(&w, &s.clip_rate, 4);
         count++;
     }
     if (!back) {  // (the host: those of its last message gone since, after being hurt: killed)
@@ -829,10 +884,13 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         memcpy(s.state, r + 22, 32), memcpy(&s.anim, r + 54, 8), memcpy(&s.frame, r + 62, 4);
         memcpy(&s.end, r + 66, 4), memcpy(&s.start, r + 70, 4), memcpy(&s.mode, r + 74, 4);
         memcpy(s.scale, r + 78, 12), memcpy(&s.extra, r + 90, 8), memcpy(s.words, r + 98, 12), memcpy(&s.id, r + 110, 4);
+        memcpy(&s.clip_res, r + 114, 8), memcpy(&s.clip_size, r + 122, 4), memcpy(&s.clip_frame, r + 126, 4);
+        memcpy(&s.clip_end, r + 130, 4), memcpy(&s.clip_start, r + 134, 4), memcpy(&s.clip_rate, r + 138, 4);
         r += SNAP_BYTES;
         bool known = false;
         for (int ty = 0; ty < NTYPES; ty++) known |= TYPES[ty].profile == s.profile;
-        bool sane = known && s.mode <= 1 && isfinite(s.frame) && isfinite(s.end) && isfinite(s.start);
+        bool sane = known && s.mode <= 1 && isfinite(s.frame) && isfinite(s.end) && isfinite(s.start) && isfinite(s.clip_frame) &&
+                    isfinite(s.clip_end) && isfinite(s.clip_start) && isfinite(s.clip_rate) && fabsf(s.clip_rate) < 100;
         for (int k = 0; k < 3; k++) sane &= isfinite(s.pos[k]) && isfinite(s.scale[k]) && fabsf(s.scale[k]) < 100;
         for (int k = 0; k < 4; k++) sane &= s.state[k] >= 0x7001500000ull && s.state[k] < 0x7001700000ull;
         if (sane) f.s[f.n++] = s;
