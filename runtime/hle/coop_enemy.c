@@ -320,14 +320,14 @@ static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
 
 // The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
-static bool back_apply(int ty, uint64_t self, uint32_t flag) {
+static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3]) {
     const EnemyType *T = &TYPES[ty];
     bool ok = false;
     pthread_mutex_lock(&g_lock);
     const Frame *last = g_nback ? &g_back[g_nback - 1] : NULL;
     if (last && SDL_GetTicks() - last->at < STALE_MS && g_stage && last->stage == g_stage()) {
         const Snap *b = find(last, T->profile, flag);
-        if (b) snap_apply(T, self, b, b, 1), ok = true;
+        if (b) snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
     }
     pthread_mutex_unlock(&g_lock);
     return ok;
@@ -351,7 +351,7 @@ static void puppet_update(int ty, Cpu *c) {
         pthread_mutex_unlock(&g_lock);
     }
     bool back = false;  // (the host's, following the joining player's that holds them)
-    if (g_hosting) back = back_apply(ty, self, key);
+    if (g_hosting) back = back_apply(ty, self, key, host_words);
     if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
@@ -430,7 +430,7 @@ static void puppet_update(int ty, Cpu *c) {
     }
     const uint8_t del_before = *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE);
     g_update[ty](c);
-    if (follow) {
+    if (follow || back) {  // (back: the host's, following the joining player's: theirs, then, in place of the host's)
         for (int k = 0; k < 3; k++)
             if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = host_words[k];
         // Following the host's into its death (a Bokoblin's Fail), its own update ends it at once: that state's start never ran
@@ -438,7 +438,7 @@ static void puppet_update(int ty, Cpu *c) {
         if (!del_before && *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE)) {
             *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE) = 0;
             static int told;
-            if (told++ < 8) LOG("[coop] enemies: a %s following the host's ended itself: kept, to play the host's\n", T->name);
+            if (told++ < 8) LOG("[coop] enemies: a %s following the other player's ended itself: kept, to play theirs\n", T->name);
         }
     }
     g_block_sm = 0;
