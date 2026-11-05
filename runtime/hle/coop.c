@@ -696,6 +696,11 @@ static void copy_end(void) {
 #define TREASURES 16
 #define TREASURE_MAX 99      // (as the game lets them go)
 static int g_treasure_shadow[TREASURES];
+// (their names, in item flag order from 421 = 0x1a5: zeldaret/ss's counters.cpp)
+static const char *const TREASURE_NAMES[TREASURES] = {
+    "Hornet Larvae", "Bird Feather", "Tumbleweed", "Lizalfos Tail", "Eldin Ore", "Ancient Flower", "Amber Relic", "Dusk Relic",
+    "Jelly Blob", "Monster Claw", "Monster Horn", "Ornamental Skull", "Evil Crystal", "Blue Bird Feather", "Golden Skull",
+    "Goddess Plume"};
 
 static uint16_t *treasure_word(int i, int *shift, int *bits, uint16_t **mirror) {
     const uint8_t *e = (const uint8_t *)(uintptr_t)(MAIN_BASE + T_ITEM_TABLE + 2 * (uint64_t)(TREASURE_FIRST + i));
@@ -725,7 +730,7 @@ static void treasures_tick(void) {  // (once a frame, with a save in play)
         int v = treasure_get(i), d = v - g_treasure_shadow[i];
         g_treasure_shadow[i] = v;
         if (!g_treasure_known || d <= 0) continue;
-        LOG("[coop] parts: this player got %d of treasure %d (item %d): now %d, sent\n", d, i, TREASURE_FIRST + i, v);
+        LOG("[coop] parts: this player got %d %s (treasure %d, item %d): now %d, sent\n", d, TREASURE_NAMES[i], i, TREASURE_FIRST + i, v);
         CoopEvent ev = {COOP_EV_PART, (uint8_t)i, 0, (uint16_t)d, 0};
         emit(&ev, NULL);
     }
@@ -745,8 +750,11 @@ static void part_received(const CoopEvent *ev) {
     int v = treasure_get(ev->a) + ev->c;
     treasure_set(ev->a, v > TREASURE_MAX ? TREASURE_MAX : v);
     g_treasure_shadow[ev->a] = treasure_get(ev->a);  // (theirs, not ours to send back)
-    LOG("[coop] parts: the other player got %d of treasure %d: now %d here\n", ev->c, ev->a, g_treasure_shadow[ev->a]);
-    toast("Monster part");
+    LOG("[coop] parts: the other player got %d %s (treasure %d): now %d here\n", ev->c, TREASURE_NAMES[ev->a], ev->a,
+        g_treasure_shadow[ev->a]);
+    char what[64];
+    snprintf(what, sizeof what, "%s from the other player", TREASURE_NAMES[ev->a]);
+    toast(what);
 }
 
 // ---- map pins (beacons): placing or removing one on the map is sent, and the other player's map gets it in the same
