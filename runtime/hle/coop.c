@@ -1404,7 +1404,7 @@ void coop_tick(void) {
         if (g_test) LOG("[coop] another player came into this stage: sent its %d kills again\n", n);
     }
     {  // (the host: its enemies, for the others' to follow; a joining player: those holding them, for the host's)
-        static uint8_t ebuf[8192];
+        static uint8_t ebuf[16384];  // (3 + MAX_ENEMIES * SNAP_BYTES: coop_enemy_take sends nothing if they might not fit)
         int n = in_boss() ? 0 : coop_enemy_take(ebuf, sizeof ebuf);
         if (n) coop_net_send_blob(ebuf, n);
     }
