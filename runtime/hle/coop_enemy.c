@@ -60,6 +60,7 @@ static int g_ntypes = 2;  // (the two above; more from coop_enemies.txt, or sent
 #define ANIM_FRAME 0x8
 #define ANIM_MODE 0xc     // u32 (once or looping, as the animation was set)
 #define ANIM_RES 0x18
+#define FRAME_LEAD_MAX 6.0f  // frames a copy may be ahead of the host's before it's put back
 
 #define MAX_ENEMIES 64
 #define SEND_MS 33
@@ -480,6 +481,7 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     }
     for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
     uint64_t an = self + T->anim;
+    const float old_end = *(float *)(uintptr_t)(an + ANIM_END);  // (before the host's: whether it's the same animation)
     if (!T->no_res && (b->anim == 0 || guest_ptr(b->anim))) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
     if (T->extra && (b->extra == 0 || guest_ptr(b->extra))) *(uint64_t *)(uintptr_t)(self + T->extra) = b->extra;
     // (its length and mode with it: played with the last one's, the new one stops at the old end)
@@ -489,7 +491,13 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     for (int k = 0; k < 3; k++)
         if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = b->words[k];
     bool same = a->anim == b->anim && a->end == b->end && b->frame >= a->frame;  // (not across a change or a wrap)
-    *(float *)(uintptr_t)(an + ANIM_FRAME) = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+    const float want = same ? a->frame + (b->frame - a->frame) * t : b->frame;
+    // Never a little back: each step back made it cross the same frames again, and what a frame sets off (a Deku Baba's
+    // purple splash, on each attack and hit) went off again and again. Ahead of the host's by a little on the same
+    // animation, it plays on; a new animation, a wrap or a real gap is taken.
+    float *fr = (float *)(uintptr_t)(an + ANIM_FRAME);
+    const float ahead = *fr - want;
+    if (!(old_end == b->end && ahead > 0 && ahead < FRAME_LEAD_MAX)) *fr = want;
 }
 
 #define U(n) static void update_##n(Cpu *c) { puppet_update(n, c); }
