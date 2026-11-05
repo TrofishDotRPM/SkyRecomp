@@ -2,6 +2,8 @@
 
 **Sky Recomp Co-op** is a fork of [Sky Recomp](https://github.com/Apolinario-coder/SkyRecomp) (a native PC recompilation of *The Legend of Zelda: Skyward Sword HD*) that adds **online two-player co-op**. Each player runs their own game and their own save, and the two games stay in step: you see each other in the world, and what one player does counts for both.
 
+**Download:** the latest test build is on the [Releases page](https://github.com/TrofishDotRPM/SkyRecomp/releases) (Bazzite / Fedora, x86-64 Linux; it needs the official Sky Recomp v2.1.0 and your own game, see the release notes).
+
 **Status: experimental, in active playtesting.** Things go wrong, and enemy sync in particular is being built one enemy at a time. **Back up your saves first**: joining merges progress into your save permanently.
 
 | Two players in Skyloft | Each Link with its own shadow |
