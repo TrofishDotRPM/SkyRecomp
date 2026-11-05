@@ -154,6 +154,25 @@ static bool hurt_state(uint64_t st) {
            !strcmp(n, "Fail") || !strcmp(n, "Stun") || !strcmp(n, "Blow");
 }
 
+// A death (not a hurt it gets over): the state it dies in. Followed into, its own update ends it at once (that state's start
+// never ran) and again each frame, each time with its effects and drops: so it's put into it as its own death instead.
+static bool dying_state(uint64_t st) {
+    if (!hurt_state(st)) return false;
+    const char *n = strstr((const char *)(uintptr_t)*(uint64_t *)(uintptr_t)(st + 8), "StateID_") + 8;
+    return strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill") || !strcmp(n, "Fail");
+}
+#define MAX_DYING 16
+static uint64_t g_dying[MAX_DYING];  // (actors dying their own death here, after the other player's: not followed again)
+static int g_ndying;
+static bool dying(uint64_t self, int state_off) {  // (one there since, at the same address, in another state: a new one)
+    for (int i = 0; i < g_ndying; i++) {
+        if (g_dying[i] != self) continue;
+        if (dying_state(*(uint64_t *)(uintptr_t)(self + state_off))) return true;
+        g_dying[i] = g_dying[--g_ndying];
+        return false;
+    }
+    return false;
+}
 static bool guest_ptr(uint64_t p) { return p >= 0x7002000000ull && p < 0x7100000000ull && p % 8 == 0; }
 
 static const Snap *find(const Frame *f, uint16_t profile, uint32_t id) {
@@ -320,14 +339,15 @@ static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
 
 // The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
-static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3]) {
+static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], uint64_t *die_into) {
     const EnemyType *T = &TYPES[ty];
     bool ok = false;
     pthread_mutex_lock(&g_lock);
     const Frame *last = g_nback ? &g_back[g_nback - 1] : NULL;
     if (last && SDL_GetTicks() - last->at < STALE_MS && g_stage && last->stage == g_stage()) {
         const Snap *b = find(last, T->profile, flag);
-        if (b) snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
+        if (b && dying_state(b->state[1]) && !dying_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) *die_into = b->state[1];
+        else if (b) snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
     }
     pthread_mutex_unlock(&g_lock);
     return ok;
@@ -351,7 +371,12 @@ static void puppet_update(int ty, Cpu *c) {
         pthread_mutex_unlock(&g_lock);
     }
     bool back = false;  // (the host's, following the joining player's that holds them)
-    if (g_hosting) back = back_apply(ty, self, key, host_words);
+    uint64_t die_into = 0;  // (the other player's died: this one dies its own death, into the state theirs did)
+    if (dying(self, T->state[1])) {  // (dying here: its own, to the end)
+        g_update[ty](c);
+        return;
+    }
+    if (g_hosting) back = back_apply(ty, self, key, host_words, &die_into);
     if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
@@ -363,6 +388,10 @@ static void puppet_update(int ty, Cpu *c) {
         const Snap *b = last ? find(&g_frames[later], T->profile, key) : NULL, *a = NULL;
         bool ok = b && now - last->at < STALE_MS && g_stage && last->stage == g_stage() &&
                   !handing_back(T->profile, key, g_frames[later].at);
+        if (ok && dying_state(b->state[1]) && !dying_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+            die_into = b->state[1];
+            ok = false;
+        }
         if (ok) {
             float t = 1;
             if (earlier != later && (a = find(&g_frames[earlier], T->profile, key))) {
@@ -377,6 +406,22 @@ static void puppet_update(int ty, Cpu *c) {
             host_hurt = hurt_state(b->state[1]);
         }
         pthread_mutex_unlock(&g_lock);
+    }
+    if (die_into) {
+        uint64_t sm = self + (uint64_t)(T->state[1] - 0x20);
+        uint64_t vt = *(uint64_t *)(uintptr_t)sm;
+        GuestFn change = vt >= 0x7001000000ull && vt < 0x7002000000ull ? dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 8 * SM_CHANGE_STATE)) : NULL;
+        if (change && g_ndying < MAX_DYING) {
+            Cpu tmp = *c;  // (before its update: the guest stack below is free)
+            tmp.x[0] = sm, tmp.x[1] = die_into;
+            g_block_sm = 0;
+            change(&tmp);
+            g_dying[g_ndying++] = self;
+            uint64_t nm = *(uint64_t *)(uintptr_t)(die_into + 8);
+            LOG("[coop] enemies: the other player's %s died: this one dies its own death (%s)\n", T->name, (const char *)(uintptr_t)nm);
+            g_update[ty](c);
+            return;
+        }
     }
     if (g_hosting) wake_for_other(ty, c, self);
     // Its own update, with Link at whichever player is nearer it (the game knows of one Link): so the host's enemies wake for,
@@ -428,18 +473,10 @@ static void puppet_update(int ty, Cpu *c) {
         sm_change_install(ty, self);
         if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20);
     }
-    const uint8_t del_before = *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE);
     g_update[ty](c);
     if (follow || back) {  // (back: the host's, following the joining player's: theirs, then, in place of the host's)
         for (int k = 0; k < 3; k++)
             if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = host_words[k];
-        // Following the host's into its death (a Bokoblin's Fail), its own update ends it at once: that state's start never ran
-        // here. It plays the host's to the end instead, and goes when the host's has (coop_enemy_gone).
-        if (!del_before && *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE)) {
-            *(uint8_t *)(uintptr_t)(self + ACTOR_DELETE) = 0;
-            static int told;
-            if (told++ < 8) LOG("[coop] enemies: a %s following the other player's ended itself: kept, to play theirs\n", T->name);
-        }
     }
     g_block_sm = 0;
     if (stand_in) {
@@ -729,7 +766,7 @@ void coop_enemy_tick(void) {
     seen_stage = stage;
     pthread_mutex_lock(&g_lock);
     g_nreleased = 0;
-    g_nheld = 0, g_nhandback = 0;
+    g_nheld = 0, g_nhandback = 0, g_ndying = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
@@ -740,7 +777,7 @@ void coop_enemy_set_puppets(bool on) {
     g_puppets = on;
     g_nframes = 0;
     g_nreleased = 0;
-    g_nheld = 0, g_nhandback = 0;
+    g_nheld = 0, g_nhandback = 0, g_ndying = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
@@ -908,6 +945,8 @@ void coop_enemy_gone(uint16_t profile, uint32_t id) {
         pthread_mutex_unlock(&g_lock);
     }
     if (!self || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != profile || *(uint8_t *)(uintptr_t)(self + ACTOR_LIFE) != 1) return;
+    for (int ty = 0; ty < NTYPES; ty++)  // (dying its own death already, after theirs: it goes when that's done)
+        if (TYPES[ty].profile == profile && dying(self, TYPES[ty].state[1])) return;
     *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (fBase_c's delete request, as coop.c removes a kill)
     LOG("[coop] enemies: the other player killed one (profile %#x, id %#x): removed here too\n", profile, id);
 }
