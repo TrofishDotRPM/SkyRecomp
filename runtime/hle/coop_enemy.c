@@ -219,6 +219,22 @@ static int g_nheld;
 static Frame g_back[RING];  // (the host's: what the joining player sent of the ones holding them)
 static int g_nback;
 
+// Given back to the host: the host's frames still on the way were echoes of this player's own, shown DELAY_MS late, and
+// following them played it back a little (a jitter at the end of each hit). It runs on here until the host's shown are its own.
+#define HANDBACK_MS 150  // (after it was given back: the host's frame of then sent, and come)
+static struct { uint16_t profile; uint32_t flag; uint64_t at; } g_handback[MAX_HELD];
+static int g_nhandback;
+static bool handing_back(uint16_t profile, uint32_t flag, uint64_t shown_at) {  // (g_lock held)
+    for (int i = 0; i < g_nhandback; i++) {
+        if (g_handback[i].profile != profile || g_handback[i].flag != flag) continue;
+        if (shown_at >= g_handback[i].at + HANDBACK_MS || SDL_GetTicks() - g_handback[i].at > STALE_MS) {
+            g_handback[i] = g_handback[--g_nhandback];
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
 static int held_find(uint16_t profile, uint32_t flag) {
     for (int i = 0; i < g_nheld; i++)
         if (g_held[i].profile == profile && g_held[i].flag == flag) return i;
@@ -343,7 +359,8 @@ static void puppet_update(int ty, Cpu *c) {
         for (int i = 0; i < g_nframes; i++)
             if (g_frames[i].at >= now - DELAY_MS) { later = i, earlier = i ? i - 1 : i; break; }
         const Snap *b = last ? find(&g_frames[later], T->profile, key) : NULL, *a = NULL;
-        bool ok = b && now - last->at < STALE_MS && g_stage && last->stage == g_stage();
+        bool ok = b && now - last->at < STALE_MS && g_stage && last->stage == g_stage() &&
+                  !handing_back(T->profile, key, g_frames[later].at);
         if (ok) {
             float t = 1;
             if (earlier != later && (a = find(&g_frames[earlier], T->profile, key))) {
@@ -433,6 +450,8 @@ static void puppet_update(int ty, Cpu *c) {
         if (h >= 0 && hurt_state(after) && g_held[h].until < SDL_GetTicks() + HIT_KEEP_MS) g_held[h].until = SDL_GetTicks() + HIT_KEEP_MS;
         if (h >= 0 && SDL_GetTicks() > g_held[h].until) {
             g_held[h] = g_held[--g_nheld];
+            if (g_nhandback < MAX_HELD)
+                g_handback[g_nhandback].profile = T->profile, g_handback[g_nhandback].flag = key, g_handback[g_nhandback++].at = SDL_GetTicks();
             LOG("[coop] enemies: the %s with flag %#x let this player go: it follows the host's again\n", T->name, flag);
         }
         pthread_mutex_unlock(&g_lock);
@@ -695,7 +714,7 @@ void coop_enemy_tick(void) {
     seen_stage = stage;
     pthread_mutex_lock(&g_lock);
     g_nreleased = 0;
-    g_nheld = 0;
+    g_nheld = 0, g_nhandback = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
@@ -706,7 +725,7 @@ void coop_enemy_set_puppets(bool on) {
     g_puppets = on;
     g_nframes = 0;
     g_nreleased = 0;
-    g_nheld = 0;
+    g_nheld = 0, g_nhandback = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
