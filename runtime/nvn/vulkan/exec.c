@@ -1151,7 +1151,7 @@ static const char BLOB_FS[] =
     "layout(push_constant) uniform P { mat4 mvp; vec4 color; vec4 turn; } p;\n"
     "layout(location = 0) in vec2 v_uv;\n"
     "layout(location = 0) out vec4 o_color;\n"
-    "void main() { float r = length(v_uv); o_color = vec4(0.0, 0.0, 0.0, p.color.a * (1.0 - smoothstep(0.35, 1.0, r))); }\n";
+    "void main() { float r = length(v_uv); o_color = vec4(0.04, 0.07, 0.20, p.color.a * (1.0 - smoothstep(0.35, 1.0, r))); }\n";  // (the game's own is a little blue)
 
 static VkPipelineLayout blob_layout(void) {
     static VkPipelineLayout l;
@@ -1273,7 +1273,7 @@ static const char DECAL_FS[] =
     "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) a += texture(sil, uv + vec2(x, y) * px).r;\n"
     "    a /= 9.0;\n"
     "    if (a <= 0.0) discard;\n"
-    "    o_color = vec4(0.0, 0.0, 0.0, a * 0.38);\n"  // (0.5 looked a little darker than the game's own)
+    "    o_color = vec4(0.04, 0.07, 0.20, a * 0.38);\n"  /* (blue-ish, as the game's own) */  // (0.5 looked a little darker than the game's own)
     "}\n";
 typedef struct { float t0[4], t1[4], t2[4], fc[4], up[4], proj[4]; } DecalPush;
 static struct { bool due; DecalPush push; uint32_t w, h; NvnTexture *color, *depth; } decal;
@@ -1430,8 +1430,10 @@ static void decal_draw(VkCommandBuffer cb) {
 }
 
 
+extern bool coop_map_open(void);
 static void blob_draw(VkCommandBuffer cb) {
     float feet[3], yaw, swing, view[12], px, py;
+    if (coop_map_open()) return;  // (the map's open: the world behind it shows no shadows of its own)
     if (!pass_depth || !figure_state(feet, &yaw, &swing, view, &px, &py)) return;
     const uint64_t f = renderer_present_count();
     int w, h;

@@ -222,9 +222,24 @@ static bool in_event(void) {
     return now < until;
 }
 
+// The map open: the HUD's controller (dLytControlGame_c, its instance's pointer at main+0x183ac40 in 1.0.0) in one of
+// its Map states (its current state's pointer at +0x110; the states are the game's own objects, at fixed places).
+#define LYT_CONTROL_GAME 0x700183ac40ull
+#define LYT_STATE 0x110
+bool coop_map_open(void) {
+    static const uint64_t MAP_STATES[] = {0x700164fbf0ull, 0x700164fb60ull, 0x700164fba8ull, 0x700164fc38ull};  // Map, _SetRes,
+    if (!g_in_play) return false;                                                                         // _SyncRes, _DelRes
+    uint64_t c = *(volatile uint64_t *)(uintptr_t)LYT_CONTROL_GAME;
+    if (c < 0x7002000000ull || c >= 0x7100000000ull || c % 8) return false;
+    uint64_t st = *(volatile uint64_t *)(uintptr_t)(c + LYT_STATE);
+    for (size_t i = 0; i < sizeof MAP_STATES / sizeof *MAP_STATES; i++)
+        if (st == MAP_STATES[i]) return true;
+    return false;
+}
+
 // The other player's latest position, when they're in this player's stage and no cutscene is on. Any thread.
 bool coop_marker_target(float out[3]) {
-    if (in_event() || in_boss()) return false;
+    if (in_event() || in_boss() || coop_map_open()) return false;  // (the map: the name tag isn't on it)
     pthread_mutex_lock(&g_pos_lock);
     bool ok = g_in_play && g_other_at && SDL_GetTicks() - g_other_at < POS_STALE_MS && g_other_stage == g_my_stage;
     if (ok) {
@@ -712,6 +727,7 @@ static void copy_end(void) {
 #define TREASURE_FIRST 421
 #define TREASURES 16
 #define TREASURE_MAX 99      // (as the game lets them go)
+#define TREASURE_ITEM_FIRST 161  // (the treasures' items, whose flags say they've been obtained: zeldaret/ss's ITEM_HORNET_LARVAE on)
 static int g_treasure_shadow[TREASURES];
 // (their names, in item flag order from 421 = 0x1a5: zeldaret/ss's counters.cpp)
 static const char *const TREASURE_NAMES[TREASURES] = {
@@ -740,6 +756,14 @@ static void treasure_set(int i, int v) {
     uint16_t m = (uint16_t)(((1 << b) - 1) << sh);
     *w = (uint16_t)((*w & ~m) | ((v << sh) & m));
     if (mirror) *mirror = (uint16_t)((*mirror & ~m) | ((v << sh) & m));
+    // ... and the item's own "obtained" flag (its item id: 161 Hornet Larvae to 176 Goddess Plume, in the counters' order):
+    // the Collection screen only lists a treasure that has it, whatever its count
+    const uint8_t *e = (const uint8_t *)(uintptr_t)(MAIN_BASE + T_ITEM_TABLE + 2 * (uint64_t)(TREASURE_ITEM_FIRST + i));
+    const int fsh = e[1] >> 4;
+    if (v > 0 && e[0] < 64 && (e[1] & 15) == 0) {
+        g_core.region[COOP_R_ITEM].live[e[0]] |= (uint16_t)(1 << fsh);
+        if (g_core.region[COOP_R_ITEM].mirror) g_core.region[COOP_R_ITEM].mirror[e[0]] |= (uint16_t)(1 << fsh);
+    }
 }
 
 static void treasures_tick(void) {  // (once a frame, with a save in play)
