@@ -729,6 +729,7 @@ static void copy_end(void) {
 #define TREASURE_FIRST 421
 #define TREASURES 16
 #define TREASURE_MAX 99      // (as the game lets them go)
+#define STORY_ON_COLLECTION_SCREEN 847  // (its word and bit from the game's table: 46, bit 5 in 1.0.0)
 #define TREASURE_ITEM_FIRST 161  // (the treasures' items, whose flags say they've been obtained: zeldaret/ss's ITEM_HORNET_LARVAE on)
 static int g_treasure_shadow[TREASURES];
 // (their names, in item flag order from 421 = 0x1a5: zeldaret/ss's counters.cpp)
@@ -765,6 +766,13 @@ static void treasure_set(int i, int v) {
     if (v > 0 && e[0] < 64 && (e[1] & 15) == 0) {
         g_core.region[COOP_R_ITEM].live[e[0]] |= (uint16_t)(1 << fsh);
         if (g_core.region[COOP_R_ITEM].mirror) g_core.region[COOP_R_ITEM].mirror[e[0]] |= (uint16_t)(1 << fsh);
+        // and the Collection screen's treasures shown at all (story flag 847, ON_COLLECTION_SCREEN in zeldaret/ss): the game
+        // sets it on a player's first treasure, so one who'd only been given theirs had nowhere to see them
+        const uint8_t *se = (const uint8_t *)(uintptr_t)(MAIN_BASE + T_STORY_TABLE + 2 * (uint64_t)STORY_ON_COLLECTION_SCREEN);
+        if (se[0] < 128 && (se[1] & 15) == 0) {
+            g_core.region[COOP_R_STORY].live[se[0]] |= (uint16_t)(1 << (se[1] >> 4));
+            if (g_core.region[COOP_R_STORY].mirror) g_core.region[COOP_R_STORY].mirror[se[0]] |= (uint16_t)(1 << (se[1] >> 4));
+        }
     }
 }
 
