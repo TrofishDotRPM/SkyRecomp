@@ -222,13 +222,15 @@ static bool in_event(void) {
     return now < until;
 }
 
-// The map open: the HUD's controller (dLytControlGame_c, its instance's pointer at main+0x183ac40 in 1.0.0) in one of
+// The map or the pause menu open: the HUD's controller (dLytControlGame_c, its instance's pointer at main+0x183ac40 in 1.0.0) in one of
 // its Map states (its current state's pointer at +0x110; the states are the game's own objects, at fixed places).
 #define LYT_CONTROL_GAME 0x700183ac40ull
 #define LYT_STATE 0x110
 bool coop_map_open(void) {
-    static const uint64_t MAP_STATES[] = {0x700164fbf0ull, 0x700164fb60ull, 0x700164fba8ull, 0x700164fc38ull};  // Map, _SetRes,
-    if (!g_in_play) return false;                                                                         // _SyncRes, _DelRes
+    // (Map, _SetRes, _SyncRes, _DelRes; then the pause menu's, the same: Pause, _SetRes, _SyncRes, _DelRes)
+    static const uint64_t MAP_STATES[] = {0x700164fbf0ull, 0x700164fb60ull, 0x700164fba8ull, 0x700164fc38ull,
+                                          0x700164fad0ull, 0x700164fa40ull, 0x700164fa88ull, 0x700164fb18ull};
+    if (!g_in_play) return false;
     uint64_t c = *(volatile uint64_t *)(uintptr_t)LYT_CONTROL_GAME;
     if (c < 0x7002000000ull || c >= 0x7100000000ull || c % 8) return false;
     uint64_t st = *(volatile uint64_t *)(uintptr_t)(c + LYT_STATE);
