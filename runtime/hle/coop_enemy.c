@@ -45,10 +45,11 @@ static EnemyType TYPES[MAX_TYPES] = {
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
      0xd28, 0, {"Absorption", "Shake"}, "Wait"},
     // (as their coop_enemies.txt lines were: "dekubaba 16e 700157a670 1560 b78 nores clip=b38",
-    // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180 enter")
+    // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180,1aac enter"; +0x1aac: 255, then the angle it aims its body and
+    // sword at, worked out each frame from the Link it faces - a copy aimed its own way, its sword sometimes behind its back)
     {"dekubaba", 0x16e, 0x700157a670ull, {0x1538, 0x1560, 0x1568, 0x1570}, 0xb78, 0, {0}, NULL, NULL, NULL, 0, 0, {NULL, NULL}, NULL,
      true, false, 0xb38},
-    {"bokoblin", 0x17e, 0x7001573a90ull, {0x1920, 0x1948, 0x1950, 0x1958}, 0x510, 0, {0xf90, 0x1180, 0}, NULL, NULL, NULL, 0, 0,
+    {"bokoblin", 0x17e, 0x7001573a90ull, {0x1920, 0x1948, 0x1950, 0x1958}, 0x510, 0, {0xf90, 0x1180, 0x1aac}, NULL, NULL, NULL, 0, 0,
      {NULL, NULL}, NULL, false, true, 0x4d0},
 };
 #define BUILTIN_TYPES 4
