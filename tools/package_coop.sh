@@ -1,6 +1,6 @@
 #!/bin/bash
 # Package the current build/skyrecomp for players (Bazzite / Fedora, x86-64) and put it, alone, in the shared folder:
-#   tools/package_coop.sh            -> build/dist/coop/SkyRecomp-coop-<commit>-bazzite-x86_64.tar.gz
+#   [B=build-f45] tools/package_coop.sh         -> build/dist/coop/SkyRecomp-coop-<commit>-bazzite-x86_64.tar.gz
 #                                       and "../Co-op build (latest)/" with only that package and VERSION.txt
 set -eu
 src="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,7 +13,7 @@ tmpl="$dist/Sky Recomp coop 0e749ee"  # (the readme, icon, font and licences eve
 name="Sky Recomp coop $h"
 rm -rf "$dist/$name"
 cp -a "$tmpl" "$dist/$name"
-cp build/skyrecomp "$dist/$name/skyrecomp"
+cp "${B:-build}/skyrecomp" "$dist/$name/skyrecomp"  # B=build-f45 for the Fedora 45 build
 cp docs/coop.md "$dist/$name/COOP.md"
 tar czf "$dist/SkyRecomp-coop-$h-bazzite-x86_64.tar.gz" -C "$dist" "$name"
 rm -rf "$dist/$name"
