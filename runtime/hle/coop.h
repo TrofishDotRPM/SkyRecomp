@@ -25,7 +25,7 @@ void coop_status(CoopStatus *out);  // any thread
 void coop_apply_settings(void);     // any thread: stop, and start again from g_settings (coop_mode empty: stays off)
 const char *coop_other_name(void);
 void coop_wait_for_me(void);
-void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2);  // (testing) an actor in front of Link, in both games        // any thread: next frame, this player's Link goes to where the other's stands
+void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2, float size);  // (testing) an actor in front of Link, in both games        // any thread: next frame, this player's Link goes to where the other's stands
 
 #ifdef __cplusplus
 }

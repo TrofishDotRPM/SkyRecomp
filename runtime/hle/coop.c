@@ -1274,15 +1274,16 @@ static void boss_room_tick(void) {
 #define ACTOR_ROOM 0x17c         // s8
 #define SPAWN_AHEAD 250.0f
 static volatile int g_spawn_req;
-static struct { int wait; bool theirs; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; } g_spawn_later[4];
+static struct { int wait; bool theirs; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; float size; } g_spawn_later[4];
 static uint16_t g_spawn_prof;
 static uint32_t g_spawn_p1, g_spawn_p2;
-static struct { bool due; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; uint8_t stage; } g_spawn_theirs;
+static float g_spawn_size = 1;  // (its scale's x, as the room files place them: a chuchu's size, 1-4)
+static struct { bool due; uint16_t prof; uint32_t p1, p2; float pos[3]; int16_t yaw; uint8_t stage; float size; } g_spawn_theirs;
 static float *g_spawn_buf;  // (guest-visible: where and which way, for the constructor to read)
 RT_ON_RESET(coop_spawn_reset) { g_spawn_buf = NULL; }  // (reboot: the HLE heap it was in is gone)
 
-void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2) {
-    g_spawn_prof = profile, g_spawn_p1 = param1, g_spawn_p2 = param2;  // (ffffffff for both: its usual ones, below)
+void coop_spawn_request(uint16_t profile, uint32_t param1, uint32_t param2, float size) {
+    g_spawn_prof = profile, g_spawn_p1 = param1, g_spawn_p2 = param2, g_spawn_size = isfinite(size) && size > 0 ? size : 1;  // (ffffffff for both: its usual ones, below)
     g_spawn_req = 1;
 }
 
@@ -1380,7 +1381,7 @@ static void spawn_load_arcs(Cpu *c, uint16_t prof) {
     }
 }
 
-static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw, int room) {
+static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw, float size, int room) {
     uint16_t want[2] = {prof, 0};
     actors_each(profile_here, want);
     if (!want[1] && !spawn_known(prof)) {
@@ -1392,13 +1393,14 @@ static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, con
     if (!guest_ptr(mgr) || room < 0 || room > 63) return 0;
     uint64_t room_actor = *(uint64_t *)(uintptr_t)(mgr + 0xf0 + 8ull * (uint64_t)room);
     if (!guest_ptr(room_actor)) return 0;
-    if (!g_spawn_buf) g_spawn_buf = hle_alloc(32);
+    if (!g_spawn_buf) g_spawn_buf = hle_alloc(48);
     float *p = g_spawn_buf;
     int16_t *r = (int16_t *)(p + 4);
     memcpy(p, pos, 12), r[0] = 0, r[1] = yaw, r[2] = 0;
+    p[8] = size, p[9] = 1, p[10] = 1;  // (scale: x only, as the room files have it)
     *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_POS) = (uint64_t)(uintptr_t)p;
     *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_ROT) = (uint64_t)(uintptr_t)r;
-    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_SCALE) = 0;
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_SCALE) = size != 1 ? (uint64_t)(uintptr_t)(p + 8) : 0;
     *(uint16_t *)(uintptr_t)(MAIN_BASE + SP_OBJFLAG) = 0xFFFF;
     *(uint8_t *)(uintptr_t)(MAIN_BASE + SP_VIEWCLIP) = 0xFF;
     *(uint32_t *)(uintptr_t)(MAIN_BASE + SP_PARAM2) = p2;
@@ -1411,18 +1413,20 @@ static uint64_t spawn_actor(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, con
     guest_call(&t, MAIN_BASE + ALLOCATE_NEW_ACTOR);
     *(uint32_t *)(uintptr_t)(MAIN_BASE + SP_PARAM2) = 0xFFFFFFFF;  // (as the game leaves them)
     *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_POS) = 0, *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_ROT) = 0;
-    LOG("[coop] test: spawned profile %#x (params %#x %#x) in room %d at %.0f %.0f %.0f: %llx\n", prof, p1, p2, room, pos[0], pos[1],
-        pos[2], (unsigned long long)t.x[0]);
+    *(uint64_t *)(uintptr_t)(MAIN_BASE + SP_SCALE) = 0;
+    LOG("[coop] test: spawned profile %#x (params %#x %#x, size %g) in room %d at %.0f %.0f %.0f: %llx\n", prof, p1, p2, size, room,
+        pos[0], pos[1], pos[2], (unsigned long long)t.x[0]);
     return t.x[0];
 }
 
-static void spawn_received(const uint8_t *d, int size) {  // [kind][stage][prof u16][p1 u32][p2 u32][pos 3 f32][yaw s16]
-    if (size != 1 + 1 + 2 + 4 + 4 + 12 + 2) return;
+static void spawn_received(const uint8_t *d, int size) {  // [kind][stage][prof u16][p1 u32][p2 u32][pos 3 f32][yaw s16][size f32]
+    if (size != 1 + 1 + 2 + 4 + 4 + 12 + 2 + 4) return;
     g_spawn_theirs.stage = d[1];
     memcpy(&g_spawn_theirs.prof, d + 2, 2), memcpy(&g_spawn_theirs.p1, d + 4, 4), memcpy(&g_spawn_theirs.p2, d + 8, 4);
-    memcpy(g_spawn_theirs.pos, d + 12, 12), memcpy(&g_spawn_theirs.yaw, d + 24, 2);
+    memcpy(g_spawn_theirs.pos, d + 12, 12), memcpy(&g_spawn_theirs.yaw, d + 24, 2), memcpy(&g_spawn_theirs.size, d + 26, 4);
     bool sane = g_spawn_theirs.prof < 0x300;
     for (int k = 0; k < 3; k++) sane &= isfinite(g_spawn_theirs.pos[k]);
+    sane &= isfinite(g_spawn_theirs.size) && g_spawn_theirs.size > 0 && g_spawn_theirs.size <= 8;
     g_spawn_theirs.due = sane;
 }
 
@@ -1446,13 +1450,13 @@ void coop_game_tick(Cpu *c) {
         for (int i = 0; i < 4; i++)
             if (!g_spawn_later[i].wait) {
                 g_spawn_later[i] = (typeof(g_spawn_later[0])){SPAWN_LOAD_FRAMES, false, g_spawn_prof, g_spawn_p1, g_spawn_p2,
-                                                               {pos[0], pos[1], pos[2]}, face};
+                                                               {pos[0], pos[1], pos[2]}, face, g_spawn_size};
                 break;
             }
-        uint8_t b[26];
+        uint8_t b[30];
         b[0] = COOP_BLOB_SPAWN, b[1] = stage_hash();
         memcpy(b + 2, &g_spawn_prof, 2), memcpy(b + 4, &g_spawn_p1, 4), memcpy(b + 8, &g_spawn_p2, 4), memcpy(b + 12, pos, 12),
-            memcpy(b + 24, &face, 2);
+            memcpy(b + 24, &face, 2), memcpy(b + 26, &g_spawn_size, 4);
         coop_net_send_blob(b, sizeof b);
     }
     if (g_spawn_theirs.due) {
@@ -1463,7 +1467,7 @@ void coop_game_tick(Cpu *c) {
                 if (!g_spawn_later[i].wait) {
                     g_spawn_later[i] = (typeof(g_spawn_later[0])){SPAWN_LOAD_FRAMES, true, g_spawn_theirs.prof, g_spawn_theirs.p1,
                                                                    g_spawn_theirs.p2, {g_spawn_theirs.pos[0], g_spawn_theirs.pos[1],
-                                                                   g_spawn_theirs.pos[2]}, g_spawn_theirs.yaw};
+                                                                   g_spawn_theirs.pos[2]}, g_spawn_theirs.yaw, g_spawn_theirs.size};
                     break;
                 }
         }
@@ -1494,7 +1498,8 @@ void coop_game_tick(Cpu *c) {
                 if (!g_spawn_later[i].wait) continue;
             }
             g_spawn_later[i].wait = 0;
-            spawn_actor(c, g_spawn_later[i].prof, g_spawn_later[i].p1, g_spawn_later[i].p2, g_spawn_later[i].pos, g_spawn_later[i].yaw, room);
+            spawn_actor(c, g_spawn_later[i].prof, g_spawn_later[i].p1, g_spawn_later[i].p2, g_spawn_later[i].pos, g_spawn_later[i].yaw,
+                        g_spawn_later[i].size, room);
         } else if (r < 0 || !--g_spawn_later[i].wait) {
             if (r > 0) LOG("[coop] test: archives for %#x still not loaded: not spawned\n", g_spawn_later[i].prof);
             g_spawn_later[i].wait = 0;

@@ -199,10 +199,13 @@ extern "C" void coop_menu_draw(float scale) {
         opt_text("Parameters", p1, sizeof p1, "ffffffff", "Its first parameter, in hex (what kind, weapon, path...). ffffffff (with ffffffff "
                  "below): the ones it's most often placed with in the game.");
         opt_text("Parameters 2", p2, sizeof p2, "ffffffff", "Its second parameter, in hex.");
+        static char size[8] = "1";
+        opt_text("Size", size, sizeof size, "1", "Its scale (the room files' x scale). A chuchu's size: 4 biggest, 1 large, 2 middle, 3 small. 1 for the rest.");
         if (opt_button("Spawn in front of Link", "In front of your Link, facing him; the other window spawns the same, at the same "
                        "spot, if it's in this area. Only kinds already in this area: each area's files carry the models of what's "
                        "placed in it.")) {
-            coop_spawn_request(SPAWNS[pick].profile, (uint32_t)strtoul(p1, NULL, 16), (uint32_t)strtoul(p2, NULL, 16));
+            coop_spawn_request(SPAWNS[pick].profile, (uint32_t)strtoul(p1, NULL, 16), (uint32_t)strtoul(p2, NULL, 16),
+                               strtof(size, NULL));
             extern void menu_close_now(void);
             menu_close_now();
         }

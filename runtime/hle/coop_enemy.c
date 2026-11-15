@@ -37,13 +37,22 @@ typedef struct {
     bool no_res;  // its animation block has no resource of its own at +0x18 (another object's member is there): not copied
     bool enter;   // a new state of the host's is gone into with its changeState (its start runs: a Bokoblin's draws its sword)
     int clip;     // where it keeps a pointer to a second animation, the one choosing its clip (a Deku Baba's: its mouth), 0: none
+    // Its attack collider's flags (u32, bit 0: on; 0: none). Off on a copy standing in for one holding the other player: the
+    // game turns it off when the hold starts, but a copy only takes the hold's state, so its collider still caught this
+    // player's Link if he came near (a chuchu's: dCcD_Sph's mObjAt, +0x638, 0xd from its source, 0x4c while it holds Link).
+    // co: its body's (mObjCo, bit 0 on), off too: touching it slowed this player all the same (a chuchu's +0x754, 0xc5 from
+    // its source, 0xc4 while it holds Link)
+    int at, co;
+    // pin: a following copy stays where the host's is through its own update (its own speed, from a state it never really
+    // ran, moved it on: after a chuchu was shaken off and flew, its copy overshot and was pulled back each frame)
+    bool pin;
 } EnemyType;
 #define MAX_TYPES 16
 static EnemyType TYPES[MAX_TYPES] = {
     {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
-     0xd28, 0, {"Absorption", "Shake"}, "Wait"},
+     0xd28, 0, {"Absorption", "Shake"}, "Wait", false, false, 0, 0x638, 0x754, true},
     // (as their coop_enemies.txt lines were: "dekubaba 16e 700157a670 1560 b78 nores clip=b38",
     // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180,1aac enter"; +0x1aac: 255, then the angle it aims its body and
     // sword at, worked out each frame from the Link it faces - a copy aimed its own way, its sword sometimes behind its back)
@@ -139,6 +148,12 @@ static void hp_watch(uint64_t self, uint32_t id) {  // (after its update: a drop
     if (hp < g_hp[slot].hp) g_send_hp(id, hp);
     g_hp[slot].hp = hp, g_hp[slot].seen = now;
 }
+// (gone with its health at nothing: killed, though no message caught it hurt - a chuchu dies within one of them)
+static bool hp_zero(uint32_t id) {
+    for (int i = 0; i < HP_TRACK; i++)
+        if (g_hp[i].id == id && g_hp[i].self && g_hp[i].hp == 0) return true;
+    return false;
+}
 static int g_nsent;
 static uint8_t g_sent_stage;
 static int g_nreleased;
@@ -196,16 +211,28 @@ static const Snap *find(const Frame *f, uint16_t profile, uint32_t id) {
 #define MAX_MAP 128
 #define MAP_NEAR 2000.0f   // farther than this from any of the host's: none of them
 #define MAP_FORGET_MS 1000 // one not updated this long is gone (its memory may be another's later)
-static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; bool entered; } g_map[MAX_MAP];  // (entered: its
+static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; bool entered; uint64_t in_frame; } g_map[MAX_MAP];
+// (in_frame: when the host's last sent the one it's paired with. Gone from them this long (died, or unloaded there): paired
+// anew with another of the host's, if one's free; still none a while later, it's one the host hasn't got, and it's removed)
+#define LOST_MS 800
+#define ORPHAN_MS 2000  // (entered: its
 // state's start has run here, once paired: in the state the host's is already in, there's no change to run it)
 static int g_nmap;
 
 static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pair) {
     const uint64_t now = SDL_GetTicks();
+    const Frame *f = g_nframes ? &g_frames[g_nframes - 1] : NULL;
+    const bool fresh = f && now - f->at < STALE_MS && g_stage && f->stage == g_stage();
+    int lost = -1;
     for (int i = 0; i < g_nmap; i++)
-        if (g_map[i].self == self && g_map[i].profile == profile && now - g_map[i].seen < MAP_FORGET_MS) { g_map[i].seen = now; return g_map[i].id; }
-    if (!pair || !g_nframes) return 0;
-    const Frame *f = &g_frames[g_nframes - 1];
+        if (g_map[i].self == self && g_map[i].profile == profile && now - g_map[i].seen < MAP_FORGET_MS) {
+            g_map[i].seen = now;
+            if (!fresh || find(f, profile, g_map[i].id)) { g_map[i].in_frame = now; return g_map[i].id; }
+            if (now - g_map[i].in_frame < LOST_MS || !pair) return g_map[i].id;
+            lost = i;
+            break;
+        }
+    if (!pair || !f) return 0;
     const float *at = (const float *)(uintptr_t)(self + ACTOR_POS);
     const Snap *best = NULL;
     float best_d = MAP_NEAR * MAP_NEAR;
@@ -219,12 +246,20 @@ static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pai
         for (int j = 0; j < 3; j++) d += (c->pos[j] - at[j]) * (c->pos[j] - at[j]);
         if (d < best_d) best_d = d, best = c;
     }
-    if (!best) return 0;
-    int slot = -1;
+    if (!best) {
+        if (lost >= 0 && now - g_map[lost].in_frame >= ORPHAN_MS && *(uint8_t *)(uintptr_t)(self + 0x13) == 0) {
+            *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (fBase_c's delete request, as a kill's removal)
+            LOG("[coop] enemies: a %#x the host hasn't got any more (its was %#x): removed here\n", profile, g_map[lost].id);
+        }
+        return lost >= 0 ? g_map[lost].id : 0;
+    }
+    if (lost >= 0) LOG("[coop] enemies: a %#x's partner %#x is gone from the host's: paired with %#x now\n", profile, g_map[lost].id, best->id);
+    int slot = lost;
     for (int i = 0; i < g_nmap && slot < 0; i++) if (g_map[i].self == self || now - g_map[i].seen >= MAP_FORGET_MS) slot = i;
     if (slot < 0 && g_nmap < MAX_MAP) slot = g_nmap++;
     if (slot < 0) return 0;
     g_map[slot].self = self, g_map[slot].profile = profile, g_map[slot].id = best->id, g_map[slot].seen = now, g_map[slot].entered = false;
+    g_map[slot].in_frame = now;
     return best->id;
 }
 
@@ -315,9 +350,10 @@ static void wake_for_other(int ty, Cpu *c, uint64_t self) {
 static GuestFn g_sm_change[MAX_TYPES];
 static uint64_t g_sm_change_at[MAX_TYPES];
 static uint64_t g_block_sm;  // (the state machine of the copy updating now, while it follows the host's)
+static bool g_block_grab;    // (it holds the other player, in a stand-in state: it can't catch this one too)
 static int g_blocked;
 static void sm_change(int ty, Cpu *c) {
-    if (g_block_sm && c->x[0] == g_block_sm && !hurt_state(c->x[1]) && !grab_state(ty, c->x[1])) {
+    if (g_block_sm && c->x[0] == g_block_sm && !hurt_state(c->x[1]) && (g_block_grab || !grab_state(ty, c->x[1]))) {
         if (g_blocked++ < 6) LOG("[coop] enemies: a %s's own switch ignored: it follows the host's\n", TYPES[ty].name);
         c->x[0] = 0;
         return;
@@ -384,6 +420,24 @@ static bool change_state(const EnemyType *T, Cpu *c, uint64_t self, uint64_t st)
     change(&tmp);
     return true;
 }
+// Copies whose colliders were turned off while they stood in: as they were again once they don't (the game's own, after a
+// hold). (Left off, a copy could never catch this player again: it tried, and nothing happened.)
+#define MAX_CO_OFF 16
+static struct { uint64_t self; uint32_t at, co; } g_co_off[MAX_CO_OFF];
+static int g_nco_off;
+static void co_off_note(uint64_t self, bool off, const EnemyType *T) {  // (the game's thread; off: before they're turned off)
+    int i = 0;
+    while (i < g_nco_off && g_co_off[i].self != self) i++;
+    if (off) {
+        if (i == g_nco_off && g_nco_off < MAX_CO_OFF)
+            g_co_off[g_nco_off].self = self, g_co_off[g_nco_off].at = *(uint32_t *)(uintptr_t)(self + T->at) & 1u,
+            g_co_off[g_nco_off++].co = *(uint32_t *)(uintptr_t)(self + T->co) & 1u;
+        return;
+    }
+    if (i == g_nco_off) return;
+    *(uint32_t *)(uintptr_t)(self + T->at) |= g_co_off[i].at, *(uint32_t *)(uintptr_t)(self + T->co) |= g_co_off[i].co;
+    g_co_off[i] = g_co_off[--g_nco_off];
+}
 // An enemy's update, on a player whose enemies follow the host's: the host's where, which way, size, state and animation first.
 static void puppet_update(int ty, Cpu *c) {
     const EnemyType *T = &TYPES[ty];
@@ -395,11 +449,21 @@ static void puppet_update(int ty, Cpu *c) {
     // key: which of the host's this is (the host: its own address; a joining player: the one it's paired with, 0 for none)
     uint32_t key = g_hosting ? (uint32_t)self : 0;
     bool held = false;  // (the joining player's own, holding them)
+    bool freed_by_host = false;
     if (g_puppets) {
         pthread_mutex_lock(&g_lock);
         key = map_key(self, T->profile, flag, true);
         held = key && held_find(T->profile, key) >= 0;
+        // (the host hit the one holding this player: the host's is hurt or dying. Theirs again, into the host's state)
+        const Frame *last = g_nframes ? &g_frames[g_nframes - 1] : NULL;
+        const Snap *hs = held && last && SDL_GetTicks() - last->at < STALE_MS ? find(last, T->profile, key) : NULL;
+        if (hs && hurt_state(hs->state[1]) && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+            int h = held_find(T->profile, key);
+            g_held[h] = g_held[--g_nheld];
+            held = false, freed_by_host = true;
+        }
         pthread_mutex_unlock(&g_lock);
+        if (freed_by_host) LOG("[coop] enemies: the other player hit the %s with flag %#x holding this player: it lets go\n", T->name, flag);
     }
     bool back = false;  // (the host's, following the joining player's that holds them)
     uint64_t die_into = 0, enter_into = 0;  // (enter_into: a new state of the host's, gone into properly below)  // (the other player's died: this one dies its own death, into the state theirs did)
@@ -407,6 +471,8 @@ static void puppet_update(int ty, Cpu *c) {
         g_update[ty](c);
         return;
     }
+    uint32_t own_words[3];  // (its own, before the other's are taken: kept while it stands in)
+    for (int k = 0; k < 3; k++) own_words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(self + T->words[k]) : 0;
     if (g_hosting) back = back_apply(ty, self, key, host_words, &die_into, &enter_into);
     if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
@@ -438,7 +504,7 @@ static void puppet_update(int ty, Cpu *c) {
             if (T->enter)
                 for (int i = 0; i < g_nmap; i++)
                     if (g_map[i].self == self && g_map[i].id == key && !g_map[i].entered) g_map[i].entered = true, first = true;
-            if (T->enter && (b->state[1] != had[1] || first)) {
+            if ((T->enter || freed_by_host) && (b->state[1] != had[1] || first)) {  // (freed: the hold's end runs, letting go)
                 for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = had[k];
                 enter_into = b->state[1];
             }
@@ -462,9 +528,15 @@ static void puppet_update(int ty, Cpu *c) {
     // Its own update, with Link at whichever player is nearer it (the game knows of one Link): so the host's enemies wake for,
     // chase and attack either player, and a joining player's react as the host's did (rather than start for this player's Link
     // only to be put back next frame, stuck on the first frame of waking). Its attacks hit only the player really there.
+    // Holding the other player: its update in a harmless state, then as it was, so its hold doesn't slow this player's Link nor
+    // show them "Shake". A game only ever catches its own player: one following the host's that holds a Link holds the host's,
+    // and one of the host's following the joining player's (g_back) holds theirs.
+    const uint64_t before = *(uint64_t *)(uintptr_t)(self + T->state[1]);
+    const bool stand_in = (driven || back) && g_idle_state[ty] && grab_state(ty, before);
     float other[3];
     uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
-    bool swap = (driven || g_hosting) && guest_ptr(self) && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE &&
+    // (not while it stands in: this player's Link moved onto it, its stand-in state caught him, and slowed him for good)
+    bool swap = (driven || g_hosting) && !stand_in && guest_ptr(self) && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE &&
                 coop_other_feet(other);
     if (swap) {
         const float *me = (const float *)(uintptr_t)(pl + ACTOR_POS), *it = (const float *)(uintptr_t)(self + ACTOR_POS);
@@ -489,11 +561,6 @@ static void puppet_update(int ty, Cpu *c) {
         for (int k = 0; k < 3; k++) keep_t[k] = *(float *)(uintptr_t)(pl + MTX_T[k]), *(float *)(uintptr_t)(pl + MTX_T[k]) += d[k];
         for (int k = 0; k < 3; k++) keep_c[k] = centre[k], centre[k] += d[k];
     }
-    // Holding the other player: its update in a harmless state, then as it was, so its hold doesn't slow this player's Link nor
-    // show them "Shake". A game only ever catches its own player: one following the host's that holds a Link holds the host's,
-    // and one of the host's following the joining player's (g_back) holds theirs.
-    const uint64_t before = *(uint64_t *)(uintptr_t)(self + T->state[1]);
-    const bool stand_in = (driven || back) && g_idle_state[ty] && grab_state(ty, before);
     uint64_t keep_st[4];
     uint8_t keep_an[0x20];
     uint64_t keep_ex = 0;
@@ -502,21 +569,45 @@ static void puppet_update(int ty, Cpu *c) {
         memcpy(keep_an, (const void *)(uintptr_t)(self + T->anim), sizeof keep_an);
         if (T->extra) keep_ex = *(uint64_t *)(uintptr_t)(self + T->extra);
         *(uint64_t *)(uintptr_t)(self + T->state[1]) = g_idle_state[ty];
+        if (T->at && T->co) co_off_note(self, true, T);
+        if (T->at) *(uint32_t *)(uintptr_t)(self + T->at) &= ~1u;
+        if (T->co) *(uint32_t *)(uintptr_t)(self + T->co) &= ~1u;
+    } else if (T->at && T->co) {
+        co_off_note(self, false, T);
     }
     const bool follow = driven && !g_hosting && !stand_in;
-    if (follow) {
+    if (follow || stand_in) {  // (standing in: no switch of its own but a hit, so no state's start acts on this player's Link)
         sm_change_install(ty, self);
-        if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20);
+        if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20), g_block_grab = stand_in;
     }
+    float pinned[3];
+    const bool pin = T->pin && (follow || stand_in);
+    if (pin) memcpy(pinned, (const void *)(uintptr_t)(self + ACTOR_POS), 12);
     g_update[ty](c);
+    if (pin && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) memcpy((void *)(uintptr_t)(self + ACTOR_POS), pinned, 12);
     if (follow || back) {  // (back: the host's, following the joining player's: theirs, then, in place of the host's)
         for (int k = 0; k < 3; k++)
             if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = host_words[k];
     }
-    g_block_sm = 0;
-    if (stand_in) {
-        for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = keep_st[k];
+    g_block_sm = 0, g_block_grab = false;
+    // Hit here while it stands in (this player's sword, on the one holding the other player): the hit stands. It's hurt or dies
+    // here, and that goes to the other game, whose own lets its player go (into the same state, with its changeState).
+    const bool freed = stand_in && hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]));
+    if (freed) {
+        LOG("[coop] enemies: this player hit the %s with flag %#x holding the other player: it lets them go\n", T->name, flag);
+        if (g_hosting && dying_state(*(uint64_t *)(uintptr_t)(self + T->state[1])) && g_ndying < MAX_DYING) g_dying[g_ndying++] = self;
+    }
+    if (stand_in && !freed) {
+        if (T->at) *(uint32_t *)(uintptr_t)(self + T->at) &= ~1u;  // (as the game has it, holding a Link)
+        if (T->co) *(uint32_t *)(uintptr_t)(self + T->co) &= ~1u;
+        // (its state stays the stand-in one until the next frame takes the other's again: left in the hold between updates,
+        // this player's Link took it for one holding him if he came near, and was slowed. Only its look is the hold's.)
+        (void)keep_st;
         memcpy((void *)(uintptr_t)(self + T->anim), keep_an, sizeof keep_an);
+        // (and its own flag words, not the holder's: a chuchu's +0xb8 holding Link made this player's Link, it the nearest
+        // enemy to him, act held: his action flags (+0x460) went from 0x90081185 to 0x84000001 with nothing touching him)
+        for (int k = 0; k < 3; k++)
+            if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = own_words[k];
         if (T->extra) *(uint64_t *)(uintptr_t)(self + T->extra) = keep_ex;
         static int told;
         if (told++ < 8) LOG("[coop] enemies: the %s with flag %#x holds the other player: not this one\n", T->name, flag);
@@ -802,7 +893,7 @@ void coop_enemy_tick(void) {
     seen_stage = stage;
     pthread_mutex_lock(&g_lock);
     g_nreleased = 0;
-    g_nheld = 0, g_nhandback = 0, g_ndying = 0;
+    g_nheld = 0, g_nhandback = 0, g_ndying = 0, g_nco_off = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
@@ -813,7 +904,7 @@ void coop_enemy_set_puppets(bool on) {
     g_puppets = on;
     g_nframes = 0;
     g_nreleased = 0;
-    g_nheld = 0, g_nhandback = 0, g_ndying = 0;
+    g_nheld = 0, g_nhandback = 0, g_ndying = 0, g_nco_off = 0;
     g_nback = 0;
     g_nmap = 0;
     pthread_mutex_unlock(&g_lock);
@@ -909,7 +1000,7 @@ int coop_enemy_take(uint8_t *out, int cap) {
             for (int i = 0; i < g_nsent; i++) {
                 bool still = false;
                 for (int j = 0; j < ncur && !still; j++) still = cur[j].profile == g_sent[i].profile && cur[j].id == g_sent[i].id;
-                if (!still && g_sent[i].hurt) g_send_gone(g_sent[i].profile, g_sent[i].id);
+                if (!still && (g_sent[i].hurt || hp_zero(g_sent[i].id))) g_send_gone(g_sent[i].profile, g_sent[i].id);
             }
         memcpy(g_sent, cur, sizeof cur[0] * (size_t)ncur), g_nsent = ncur, g_sent_stage = stage;
     }
