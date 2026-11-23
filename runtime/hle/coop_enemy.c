@@ -18,6 +18,7 @@
 #include "coop_enemy.h"
 
 #define UPDATE_SLOT 20
+#define SHAPE_N 20
 typedef struct {
     const char *name;
     uint16_t profile;
@@ -50,13 +51,20 @@ typedef struct {
     // one holding a Link walks slowly (the speed cap +0x64e8 fell from 23 to 3.6): this player's did by a copy holding the
     // other player, with its colliders off (a chuchu's +0xfdf; with it held at 1, he walked at full speed at once)
     int free;
+    // shape: u32s (floats) taken from the host's while a copy stands in for one holding the other player, after its own update
+    // (0: none). A chuchu's update shapes it around the Link it holds: its model's matrix (+0x1f4, rows of 4 with the
+    // translation last), its up (+0x24c, tilted with him), its offset from him (+0x8a8) and +0xcb8. A copy's update ran
+    // its stand-in state, so on this player's screen it floated upright on the other player instead of wrapping him
+    int shape[SHAPE_N];
 } EnemyType;
 #define MAX_TYPES 16
 static EnemyType TYPES[MAX_TYPES] = {
     {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
-     0xd28, 0, {"Absorption", "Shake"}, "Wait", false, false, 0, 0x638, 0x754, true, 0xfdf},
+     0xd28, 0, {"Absorption", "Shake"}, "Wait", false, false, 0, 0x638, 0x754, true, 0xfdf,
+     {0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x24c, 0x250, 0x254, 0x8a8, 0x8ac, 0x8b0,
+      0xcb8}},
     // (as their coop_enemies.txt lines were: "dekubaba 16e 700157a670 1560 b78 nores clip=b38",
     // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180,1aac enter"; +0x1aac: 255, then the angle it aims its body and
     // sword at, worked out each frame from the Link it faces - a copy aimed its own way, its sword sometimes behind its back)
@@ -102,10 +110,11 @@ typedef struct {
     uint64_t clip_res;  // (the second animation: its clip, the clip's size to check it by, and where it's at)
     uint32_t clip_size;
     float clip_frame, clip_end, clip_start, clip_rate;
+    uint32_t shape[SHAPE_N];  // (its type's shape words, 0 past them)
 } Snap;
 
 // ---- wire: kind byte (COOP_BLOB_ENEMIES), stage u8, count u8, then count Snaps packed little-endian
-#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12 + 4 + 8 + 4 + 16)
+#define SNAP_BYTES (2 + 2 + 12 + 6 + 32 + 8 + 4 + 12 + 12 + 8 + 12 + 4 + 8 + 4 + 16 + SHAPE_N * 4)
 
 typedef struct { uint64_t at; uint8_t stage; int n; Snap s[MAX_ENEMIES]; } Frame;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -450,6 +459,7 @@ static void puppet_update(int ty, Cpu *c) {
     if (!guest_ptr(self) || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != T->profile) { g_update[ty](c); return; }
     bool driven = false, host_hurt = false;
     uint32_t host_words[3] = {0};  // (the host's, put back after its own update: it sets its own each frame)
+    uint32_t host_shape[SHAPE_N] = {0};
     const uint16_t flag = *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG);
     // key: which of the host's this is (the host: its own address; a joining player: the one it's paired with, 0 for none)
     uint32_t key = g_hosting ? (uint32_t)self : 0;
@@ -515,6 +525,7 @@ static void puppet_update(int ty, Cpu *c) {
             }
             driven = true;
             memcpy(host_words, b->words, sizeof host_words);
+            memcpy(host_shape, b->shape, sizeof host_shape);
             host_hurt = hurt_state(b->state[1]);
         }
         pthread_mutex_unlock(&g_lock);
@@ -638,6 +649,10 @@ static void puppet_update(int ty, Cpu *c) {
         for (int k = 0; k < 3; k++)
             if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = own_words[k];
         if (T->extra) *(uint64_t *)(uintptr_t)(self + T->extra) = keep_ex;
+        bool shaped = false;
+        for (int k = 0; k < SHAPE_N; k++) shaped |= host_shape[k] != 0;
+        if (shaped && driven)  // (the host's shape, wrapped around the Link it holds there)
+            for (int k = 0; k < SHAPE_N && T->shape[k]; k++) *(uint32_t *)(uintptr_t)(self + T->shape[k]) = host_shape[k];
         static int told;
         if (told++ < 8) LOG("[coop] enemies: the %s with flag %#x holds the other player: not this one\n", T->name, flag);
     }
@@ -1012,6 +1027,8 @@ int coop_enemy_take(uint8_t *out, int cap) {
         put(&w, s.scale, 12), put(&w, &s.extra, 8), put(&w, s.words, 12), put(&w, &s.id, 4);
         put(&w, &s.clip_res, 8), put(&w, &s.clip_size, 4), put(&w, &s.clip_frame, 4), put(&w, &s.clip_end, 4);
         put(&w, &s.clip_start, 4), put(&w, &s.clip_rate, 4);
+        for (int k = 0; k < SHAPE_N; k++) s.shape[k] = T->shape[k] ? *(uint32_t *)(uintptr_t)(a + T->shape[k]) : 0;
+        put(&w, s.shape, sizeof s.shape);
         count++;
     }
     if (!back) {  // (the host: those of its last message gone since, after being hurt: killed)
@@ -1125,6 +1142,7 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         memcpy(s.scale, r + 78, 12), memcpy(&s.extra, r + 90, 8), memcpy(s.words, r + 98, 12), memcpy(&s.id, r + 110, 4);
         memcpy(&s.clip_res, r + 114, 8), memcpy(&s.clip_size, r + 122, 4), memcpy(&s.clip_frame, r + 126, 4);
         memcpy(&s.clip_end, r + 130, 4), memcpy(&s.clip_start, r + 134, 4), memcpy(&s.clip_rate, r + 138, 4);
+        memcpy(s.shape, r + 142, sizeof s.shape);
         r += SNAP_BYTES;
         bool known = false;
         for (int ty = 0; ty < NTYPES; ty++) known |= TYPES[ty].profile == s.profile;
@@ -1132,6 +1150,11 @@ void coop_enemy_receive(const uint8_t *d, int size) {
                     isfinite(s.clip_end) && isfinite(s.clip_start) && isfinite(s.clip_rate) && fabsf(s.clip_rate) < 100;
         for (int k = 0; k < 3; k++) sane &= isfinite(s.pos[k]) && isfinite(s.scale[k]) && fabsf(s.scale[k]) < 100;
         for (int k = 0; k < 4; k++) sane &= s.state[k] >= 0x7001500000ull && s.state[k] < 0x7001700000ull;
+        for (int k = 0; k < SHAPE_N; k++) {  // (floats, all of them: one not, or far out, and it has none)
+            float v;
+            memcpy(&v, &s.shape[k], 4);
+            if (!isfinite(v) || fabsf(v) > 1e6f) memset(s.shape, 0, sizeof s.shape);
+        }
         if (sane) f.s[f.n++] = s;
     }
     pthread_mutex_lock(&g_lock);
