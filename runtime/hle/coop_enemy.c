@@ -46,13 +46,17 @@ typedef struct {
     // pin: a following copy stays where the host's is through its own update (its own speed, from a state it never really
     // ran, moved it on: after a chuchu was shaken off and flew, its copy overshot and was pulled back each frame)
     bool pin;
+    // free: a byte that's 1 while it holds no Link and 0 while it holds one, kept at 1 on a copy standing in. Every Link near
+    // one holding a Link walks slowly (the speed cap +0x64e8 fell from 23 to 3.6): this player's did by a copy holding the
+    // other player, with its colliders off (a chuchu's +0xfdf; with it held at 1, he walked at full speed at once)
+    int free;
 } EnemyType;
 #define MAX_TYPES 16
 static EnemyType TYPES[MAX_TYPES] = {
     {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
     {"chuchu", 0x155, 0x7001584bf8ull, {0xd20, 0xd48, 0xd50, 0xd58}, 0x510, 0x538, {0xb8, 0x3f8, 0x3fc}, "dAcEsm_c", NULL, NULL,
-     0xd28, 0, {"Absorption", "Shake"}, "Wait", false, false, 0, 0x638, 0x754, true},
+     0xd28, 0, {"Absorption", "Shake"}, "Wait", false, false, 0, 0x638, 0x754, true, 0xfdf},
     // (as their coop_enemies.txt lines were: "dekubaba 16e 700157a670 1560 b78 nores clip=b38",
     // "bokoblin 17e 7001573a90 1948 510 clip=4d0 w=f90,1180,1aac enter"; +0x1aac: 255, then the angle it aims its body and
     // sword at, worked out each frame from the Link it faces - a copy aimed its own way, its sword sometimes behind its back)
@@ -278,6 +282,7 @@ static bool grab_state(int ty, uint64_t st) { return st && (st == g_grab_state[t
 // Baba's Damage lasts a few frames; its knock-back and a shield's stun play on in Wait, and its death in DeadMouth: without
 // this the host's never saw them.
 #define HIT_KEEP_MS 1500
+#define LINK_KEEP 0x6c00  // (how much of this player's dAcPy_c is kept through a standing-in copy's update: its fields seen go to 0x6b38)
 #define MAX_HELD 16
 static struct { uint16_t profile; uint32_t flag; uint64_t until; } g_held[MAX_HELD];  // (the joining player's; flag: the host's id)
 static int g_nheld;
@@ -572,6 +577,7 @@ static void puppet_update(int ty, Cpu *c) {
         if (T->at && T->co) co_off_note(self, true, T);
         if (T->at) *(uint32_t *)(uintptr_t)(self + T->at) &= ~1u;
         if (T->co) *(uint32_t *)(uintptr_t)(self + T->co) &= ~1u;
+        if (T->free) *(uint8_t *)(uintptr_t)(self + T->free) = 1;
     } else if (T->at && T->co) {
         co_off_note(self, false, T);
     }
@@ -583,7 +589,29 @@ static void puppet_update(int ty, Cpu *c) {
     float pinned[3];
     const bool pin = T->pin && (follow || stand_in);
     if (pin) memcpy(pinned, (const void *)(uintptr_t)(self + ACTOR_POS), 12);
+    // Standing in: this player's Link as he was before its update, after it. Its update (even in the harmless state) slowed
+    // his Link however far he went (deleting it freed him at once; its own fields put back as they were when not holding one
+    // didn't; not running its update did, but froze it and its animation). What it changed in him is undone, and told.
+    static uint8_t link_keep[LINK_KEEP];
+    const bool guard = stand_in && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE;
+    if (guard) memcpy(link_keep, (const void *)(uintptr_t)pl, LINK_KEEP);
     g_update[ty](c);
+    if (guard) {
+        static int told;
+        const uint8_t *now = (const uint8_t *)(uintptr_t)pl;
+        if (told < 12 && memcmp(now, link_keep, LINK_KEEP)) {
+            char buf[512];
+            int n = 0, shown = 0;
+            for (int o = 0; o < LINK_KEEP && shown < 16; o += 4) {
+                uint32_t was, is;
+                memcpy(&was, link_keep + o, 4), memcpy(&is, now + o, 4);
+                if (was != is && n < (int)sizeof buf - 32) n += snprintf(buf + n, sizeof buf - n, " +%#x %#x->%#x", o, was, is), shown++;
+            }
+            told++;
+            LOG("[coop] enemies: the %s standing in changed this player's Link (put back):%s\n", T->name, buf);
+        }
+        memcpy((void *)(uintptr_t)pl, link_keep, LINK_KEEP);
+    }
     if (pin && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) memcpy((void *)(uintptr_t)(self + ACTOR_POS), pinned, 12);
     if (follow || back) {  // (back: the host's, following the joining player's: theirs, then, in place of the host's)
         for (int k = 0; k < 3; k++)
@@ -600,6 +628,7 @@ static void puppet_update(int ty, Cpu *c) {
     if (stand_in && !freed) {
         if (T->at) *(uint32_t *)(uintptr_t)(self + T->at) &= ~1u;  // (as the game has it, holding a Link)
         if (T->co) *(uint32_t *)(uintptr_t)(self + T->co) &= ~1u;
+        if (T->free) *(uint8_t *)(uintptr_t)(self + T->free) = 1;  // (not holding one: no Link near it is slowed)
         // (its state stays the stand-in one until the next frame takes the other's again: left in the hold between updates,
         // this player's Link took it for one holding him if he came near, and was slowed. Only its look is the hold's.)
         (void)keep_st;
