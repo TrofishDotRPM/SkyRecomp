@@ -41,7 +41,7 @@
 enum { K_BC5, K_BC3, K_ASTC4, K_RGBA8, K_BC1, K_RG8, K_GR8 /* RG8, alpha in red */, K_R8 /* intensity = alpha */ };
 // roles: the prompt glyphs' R_A..R_MINUS / L_* (prompt_icons.h), then these
 enum { R_HERO = R_MINUS + 1, R_SHEET, R_PICTURE, R_BOTTLE, R_BOTTLE_MODEL, R_FAIRY_MODEL,
-       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG };
+       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG, R_BIRD_ICON, R_BIRD_WING };
 enum { L_LS_CLICK = L_ARM_RIGHT + 1, L_RS_CLICK };  // (the picture font's stick presses: the click's own key on a keyboard)
 
 typedef struct {
@@ -117,6 +117,9 @@ static int role_of(const char *name) {
         {"Hp_00^w", R_HEART}, {"Hp_01^w", R_HEART}, {"Hp_02^w", R_HEART}, {"HeartUp^w", R_HEART},
         // the Items page's cursor brackets: identified only (hidden while the companion card has the cursor, pets.c)
         {"ItemCursor_", R_ITEM_CURSOR},
+        // your Loftwing's HUD icons (DoButton.arc): the altitude gauge's bird, the dash feathers (and their shadow), the
+        // bird marker: identified only, drawn in your Loftwing's colors (runtime/nvn/vulkan/exec.c bird_icon_swap)
+        {"th_skyBird_", R_BIRD_ICON}, {"th_skyWing", R_BIRD_WING}, {"th_targetBird", R_BIRD_ICON},
     };
     for (unsigned i = 0; i < sizeof m / sizeof *m; i++)
         if (!strncmp(name, m[i].prefix, strlen(m[i].prefix))) return m[i].role;
@@ -150,6 +153,9 @@ static void scan_bntx(const uint8_t *b, size_t len, bool sheet) {
             if (n < sizeof name && name_at + 2 + n <= len) { memcpy(name, b + name_at + 2, n); name[n] = 0; }
         }
         int role = sheet ? R_SHEET : role_of(name);
+        static const char *names = (const char *)-1;  // (LARECOMP_TEXPATCH_NAMES=1: log each UI texture's name, to find one)
+        if (names == (const char *)-1) names = getenv("LARECOMP_TEXPATCH_NAMES");
+        if (names && name[0]) LOG("[texpatch] name %s (%ux%u fmt %#x)\n", name, rd32(t + 20), rd32(t + 24), rd32(t + 12));
         if (!role || ptrs + 8 > len) continue;
         uint32_t fmt = rd32(t + 12), w = rd32(t + 20), h = rd32(t + 24), size = rd32(t + 64), levels = rd16(t + 6);
         uint64_t data = rd64(b + ptrs);
@@ -283,6 +289,9 @@ static void scan_u8(const char *rel) {
         if (e[0] || names + no >= n) continue;  // (a directory)
         const char *name = (const char *)t + names + no;
         int role = role_of(name);
+        static const char *names_env = (const char *)-1;  // (LARECOMP_TEXPATCH_NAMES=1: each layout texture's name, to find one)
+        if (names_env == (const char *)-1) names_env = getenv("LARECOMP_TEXPATCH_NAMES");
+        if (names_env && strstr(name, ".tpl")) LOG("[texpatch] name %s: %s\n", rel, name);
         if (!role || sz < 0x20 || sz > (4u << 20) || at + (uint64_t)sz > size) continue;
         uint8_t *f = malloc(sz), *rgba = NULL;
         uint32_t w = 0, h = 0, gx = 15;
@@ -391,6 +400,11 @@ int texpatch_bottle_kind(int id) {
     if (id < 0 || id >= g_nrefs) return 0;
     return g_refs[id].role == R_BOTTLE ? 1 : g_refs[id].role == R_BOTTLE_MODEL ? 2 : g_refs[id].role == R_FAIRY_MODEL ? 3
          : g_refs[id].role == R_POWDER_MODEL ? 4 : 0;
+}
+
+int texpatch_bird_icon(int id) {
+    if (id < 0 || id >= g_nrefs) return 0;
+    return g_refs[id].role == R_BIRD_ICON ? 1 : g_refs[id].role == R_BIRD_WING ? 2 : 0;
 }
 
 int texpatch_heart_kind(int id) {
@@ -1088,7 +1102,7 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
     if (lv || r->w != w || r->h != h) return;
     if (r->role == R_BOTTLE || r->role == R_BOTTLE_MODEL || r->role == R_FAIRY_MODEL || r->role == R_POWDER_MODEL ||
         r->role == R_ITEM_CURSOR ||
-        r->role == R_HEART) return;
+        r->role == R_HEART || r->role == R_BIRD_ICON || r->role == R_BIRD_WING) return;
     if (r->role == R_HERO) {  // fully transparent (BC5 blocks of zeros)
         if (hide_hero()) for (uint32_t y = 0; y < (h + 3) / 4; y++) memset(blocks + y * row, 0, (w + 3) / 4 * 16);
         return;

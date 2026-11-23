@@ -3512,6 +3512,295 @@ static void look_texture_swap(Prog *pr, bool other, int kind) {
     }
 }
 
+// ---- your Loftwing's looks (g_settings.bird_look), as Link's: its body (6669 vertices, skinned) samples one texture, the
+// Crimson Loftwing's (1024x512: red plumage, white chest, wing and tail feathers, a violet eye, purple markings on the chest;
+// its yellow beak and talons, the mouth, tongue and harness left as they are); a second mesh on it (1176: the wing and tail
+// feathers' tips) has a small texture of white, a purple band and their yellow tips; two small rigid pieces (30 and 15
+// vertices: the tuft on its head) sample the body's texture. Parts: 0 plumage, 1 white feathers, 2 eyes, 3 markings,
+// 4 the feathers' yellow tips. Red left as it is: the mouth's lining (around the beak, left) and the fringe the legs and
+// feet sample (around their tan, bottom middle): recoloured, the beak and soles turned the plumage's color. Other Loftwings have other textures: only a body texture mostly red is recoloured, and the
+// second mesh only on the same bird (its bones) in the same frame. Part map checked against a capture (2026-11-22).
+enum { BIRD_NONE = -1, BIRD_BODY, BIRD_SECOND, BIRD_TUFT, BIRD_ICON };
+#define BIRD_BODY_VERTICES 6669
+#define BIRD_SECOND_VERTICES 1176
+static int bird_texel_part(int kind, const uint8_t px[4], float u, float v) {
+    kind &= 0xff;
+    float r = px[0] / 255.0f, g = px[1] / 255.0f, b = px[2] / 255.0f;
+    float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b)), d = hi - lo, s = hi > 0 ? d / hi : 0, h = 0;
+    if (d > 0) {
+        h = hi == r ? fmodf((g - b) / d, 6) : hi == g ? (b - r) / d + 2 : (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+    }
+    if (hi < 0.08f) return -1;
+    const bool purple = (h >= 255 && h <= 320 && s > 0.35f) || (h >= 190 && h < 255 && s > 0.35f);
+    const bool white = s < 0.18f && hi > 0.55f;
+    const bool yellow = h >= 33 && h <= 62 && s > 0.3f && hi > 0.45f;
+    if (kind == BIRD_SECOND) return white ? 1 : purple ? 3 : yellow ? 4 : -1;
+    if (kind == BIRD_ICON)  // (a HUD icon of it: by colour alone - red plumage, white feathers, purple markings, yellow tips)
+        return white ? 1 : purple ? 3 : yellow ? 4 : (h >= 330 || h < 25) && s > 0.4f && hi > 0.15f ? 0 : -1;
+    if (yellow) return -1;  // (the beak, legs and talons: always their own)
+    if (purple) return u >= 0.26f && u <= 0.37f && v >= 0.14f && v <= 0.33f ? 2 : 3;  // (the eye, top left; else markings)
+    if (white) return 1;
+    if ((h >= 330 || h < 25) && s > 0.4f && hi > 0.15f) {
+        // (red left as it is: -2, -3, -4 tell which, for LARECOMP_BIRD_GRID; any below 0 is no part)
+        // (not the dark red by the beak either: the head tuft's underside and the jaw sample it, the flags showed)
+        // (not the red by the legs' tan block below it: that's the feathers under the wings and body, the flags showed)
+        if (u > 0.53f && u < 0.75f && v > 0.6f && v < 0.75f) return -4;  // (around the feet's tan bar: their soles, a grid test showed;
+                                                                           // wider, it caught some tail feathers)
+        return 0;
+    }
+    return -1;
+}
+
+static uint64_t bird_bones, bird_frame;  // (the crimson body's bones, the frame it last drew)
+static NvnTexture *bird_body_tex, *bird_second_tex;  // (your bird's two textures, once seen on it: any mesh with them is its)
+static void bird_texture_swap(Prog *pr, int kind, NvnTexture *force) {
+    if (kind < 0) return;
+    bool any = false;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) any |= (g_settings.bird_look[p] & COOP_LOOK_SET) != 0;
+    const uint64_t frame = renderer_present_count(), bones = st.ubuf[0][3].addr;
+    if ((kind == BIRD_SECOND || kind == BIRD_TUFT) && frame - bird_frame > 1) return;  // (your crimson body drew, this frame or the last)
+    NvnTexture *best = force;
+    for (int i = 0; i < pr->fi->ntex && !force; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->format < 0x79 || t->format > 0x84) continue;
+        if (!best || (uint64_t)t->width * t->height > (uint64_t)best->width * best->height) best = t;
+    }
+    if (!best) return;
+    if ((kind == BIRD_BODY || kind == BIRD_TUFT) && (best->width != 1024 || best->height != 512)) return;
+    if (kind == BIRD_TUFT) kind = BIRD_BODY + 0x100;  // (its texture is the body's: the body's parts, its own cache key)
+    // (once a texture: whether it's the crimson one, mostly red plumage)
+    static struct { NvnTexture *t; uint64_t addr; bool crimson; } seen[8];
+    int si = -1;
+    for (int i = 0; i < 8 && si < 0; i++) if (seen[i].t == best && seen[i].addr == best->addr) si = i;
+    if (kind == BIRD_BODY + 0x100 && (si < 0 || !seen[si].crimson)) return;  // (the tuft: only on the crimson texture)
+    if (kind == BIRD_BODY && si < 0) {
+        uint32_t w, h;
+        uint8_t *px = vk_texture_decode(best, &w, &h);
+        if (!px) return;
+        uint64_t red = 0;
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) red += bird_texel_part(BIRD_BODY, px + i * 4, (float)(i % w + 0.5f) / w, (float)(i / w + 0.5f) / h) == 0;
+        free(px);
+        static int next;
+        si = next++ % 8;
+        seen[si].t = best, seen[si].addr = best->addr, seen[si].crimson = red * 100 > (uint64_t)w * h * 35;
+        LOG("[bird] body texture %p %ux%u: %s (%.0f%% plumage)\n", (void *)best, w, h, seen[si].crimson ? "the Crimson Loftwing's" : "another bird's",
+            100.0 * red / ((double)w * h));
+    }
+    if (kind == BIRD_BODY) {
+        if (!seen[si].crimson) return;
+        bird_bones = bones, bird_frame = frame, bird_body_tex = best;
+    }
+    if (kind == BIRD_SECOND) bird_second_tex = best;
+    if (!any) return;
+    // (the recolored copy, cached as Link's are: key the colors and which mesh)
+    uint64_t key = 0xb12d5eedull ^ (uint64_t)kind;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) key = (key ^ g_settings.bird_look[p]) * 1099511628211ull;
+    int slot = -1;
+    for (int i = 0; i < RECOLOURED; i++) {
+        Recoloured *e = &recoloured[i];
+        if (e->orig == best && e->addr == best->addr && e->key == key) {
+            e->used = frame;
+            if (e->copy) swap_from = best, swap_to = e->copy;
+            return;
+        }
+        if (slot < 0 || e->used < recoloured[slot].used) slot = i;
+    }
+    uint32_t w, h;
+    uint8_t *px = vk_texture_decode(best, &w, &h);
+    if (!px) return;
+    int8_t *part = malloc((size_t)w * h);
+    double sum[BIRD_LOOK_PARTS] = {0};
+    uint32_t n[BIRD_LOOK_PARTS] = {0};
+    for (uint64_t i = 0; part && i < (uint64_t)w * h; i++) {
+        int p = bird_texel_part(kind, px + i * 4, (float)(i % w + 0.5f) / w, (float)(i / w + 0.5f) / h);
+        part[i] = (int8_t)p;
+        if (p < 0) continue;
+        sum[p] += 0.299f * px[i * 4] + 0.587f * px[i * 4 + 1] + 0.114f * px[i * 4 + 2];
+        n[p]++;
+    }
+    NvnTexture *copy = NULL;
+    if (part) {
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+            int p = part[i];
+            static int grid = -1;  // (LARECOMP_BIRD_GRID=1, debugging: the plumage a color by where it is, 4x4 cells; red left
+            if (grid < 0) grid = getenv("LARECOMP_BIRD_GRID") != NULL;  // alone flagged: beak cyan, legs magenta, feet yellow)
+            if (grid && p <= -2) {
+                static const uint8_t FLAG[3][3] = {{0, 255, 255}, {255, 0, 255}, {255, 255, 0}};
+                memcpy(px + i * 4, FLAG[-p - 2], 3);
+                continue;
+            }
+            if (p < 0 || !(g_settings.bird_look[p] & COOP_LOOK_SET) || !n[p]) continue;
+            uint32_t c = g_settings.bird_look[p];
+            if (grid && p == 0) {
+                static const uint32_t CELL[16] = {0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff, 0x000000,
+                                                  0xff8000, 0x8000ff, 0x00ff80, 0x804000, 0x808080, 0x0080ff, 0xff0080, 0x80ff00};
+                c = CELL[(i / w * 4 / h) * 4 + (i % w * 4 / w)];
+            }
+            const float rgb[3] = {(c >> 16 & 255) / 255.0f, (c >> 8 & 255) / 255.0f, (c & 255) / 255.0f};
+            uint8_t *q = px + i * 4;
+            float mean = (float)(sum[p] / n[p]), l = 0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2];
+            float k = mean > 1 ? fminf(l / mean, 2.5f) : 1;
+            for (int ch = 0; ch < 3; ch++) q[ch] = (uint8_t)fminf(255, rgb[ch] * 255 * k + 0.5f);
+        }
+        copy = vk_texture_from_rgba(best, px, w, h);
+    }
+    free(part);
+    free(px);
+    Recoloured *e = &recoloured[slot];
+    vk_texture_free(e->copy);
+    *e = (Recoloured){best, copy, best->addr, key, frame};
+    if (copy) swap_from = best, swap_to = copy;
+}
+
+// Your Loftwing's HUD icons (texpatch_bird_icon: the altitude gauge's bird, the dash feathers, the bird marker) in its colours:
+// a recoloured copy, as its body's
+static void bird_icon_swap(Prog *pr) {
+    bool any = false;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) any |= (g_settings.bird_look[p] & COOP_LOOK_SET) != 0;
+    if (!any) return;
+    extern int texpatch_bird_icon(int id);
+    NvnTexture *icon = NULL;
+    int icon_kind = 0;
+    for (int i = 0; i < pr->fi->ntex && !icon; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+        if (b && b->tp > 0 && (icon_kind = texpatch_bird_icon(b->tp - 1))) icon = t;
+    }
+    if (!icon) return;
+    const uint64_t frame = renderer_present_count();
+    uint64_t key = 0x1c0b12dull;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) key = (key ^ g_settings.bird_look[p]) * 1099511628211ull;
+    int slot = -1;
+    for (int i = 0; i < RECOLOURED; i++) {
+        Recoloured *e = &recoloured[i];
+        if (e->orig == icon && e->addr == icon->addr && e->key == key) {
+            e->used = frame;
+            if (e->copy) swap_from = icon, swap_to = e->copy;
+            return;
+        }
+        if (slot < 0 || e->used < recoloured[slot].used) slot = i;
+    }
+    uint32_t w, h;
+    uint8_t *px = vk_texture_decode(icon, &w, &h);
+    if (!px) {
+        static int told;
+        if (told++ < 4) LOG("[bird] icon texture %p (format %#x): not decoded, left as it is\n", (void *)icon, icon->format);
+        return;
+    }
+    // Soft, unlike the model's: a texel is each part's by a weight (how red, how white), so the small icons' anti-aliased edges
+    // blend instead of going half one way (rough). Yellow is the feathers' tips on the dash feathers, and left alone on the bird
+    // (its beak).
+    const uint64_t N = (uint64_t)w * h;
+    float *wt = malloc(N * 5 * sizeof *wt);  // (per texel: plumage, white, purple markings, yellow tips, eyes)
+    if (!wt) { free(px); return; }
+    double sum[5] = {0}, wsum[5] = {0};
+    for (uint64_t i = 0; i < N; i++) {
+        const uint8_t *q = px + i * 4;
+        float r = q[0] / 255.0f, g = q[1] / 255.0f, b = q[2] / 255.0f;
+        float hi = fmaxf(r, fmaxf(g, b)), lo = fminf(r, fminf(g, b)), d = hi - lo, sat = hi > 0 ? d / hi : 0, hue = 0;
+        if (d > 0) {
+            hue = hi == r ? fmodf((g - b) / d, 6) : hi == g ? (b - r) / d + 2 : (r - g) / d + 4;
+            hue *= 60;
+            if (hue < 0) hue += 360;
+        }
+        float off = hue > 180 ? 360 - hue : hue;  // (degrees from red)
+        if (hue > 180) off = 360 - hue;
+        float hue_w = off <= 22 ? 1 : off >= 36 ? 0 : (36 - off) / 14;  // (red through to orange-red; not yellow)
+        float red = hue_w * fminf(1, fmaxf(0, (sat - 0.25f) / 0.2f)) * fminf(1, fmaxf(0, (hi - 0.1f) / 0.15f));
+        float white = (1 - fminf(1, sat / 0.25f)) * fminf(1, fmaxf(0, (hi - 0.45f) / 0.2f));
+        const float strong = fminf(1, fmaxf(0, (sat - 0.25f) / 0.15f)) * fminf(1, fmaxf(0, (hi - 0.12f) / 0.15f));
+        // (purple through blue: the gauge's bird draws its feathers' band bluish; yellow: degrees from its middle)
+        const float poff = fabsf(hue - 255), yoff = fabsf(hue - 48);
+        float purple = (poff <= 75 ? 1 : poff >= 90 ? 0 : (90 - poff) / 15) * strong;
+        float yellow = (yoff <= 12 ? 1 : yoff >= 20 ? 0 : (20 - yoff) / 8) * strong, eye = 0;
+        // (the gauge's bird: its head, the middle - yellow there is its beak, left as it is; blue there its eyes)
+        const float u = (float)(i % w + 0.5f) / w, v = (float)(i / w + 0.5f) / h;
+        if (icon_kind == 1 && u > 0.36f && u < 0.64f && v > 0.25f && v < 0.62f) yellow = 0, eye = purple, purple = 0;
+        if (q[3] < 8) red = white = purple = yellow = eye = 0;
+        wt[i * 5] = red, wt[i * 5 + 1] = white, wt[i * 5 + 2] = purple, wt[i * 5 + 3] = yellow, wt[i * 5 + 4] = eye;
+        const float l = 0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2];
+        for (int k = 0; k < 5; k++) sum[k] += l * wt[i * 5 + k], wsum[k] += wt[i * 5 + k];
+    }
+    for (uint64_t i = 0; i < N; i++) {
+        uint8_t *q = px + i * 4;
+        const float l = 0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2];
+        for (int k = 0; k < 5; k++) {
+            static const int PART[5] = {0, 1, 3, 4, 2};  // (plumage, white feathers, markings, feather tips, eyes)
+            const int part = PART[k];
+            const float wk = wt[i * 5 + k];
+            if (wk <= 0 || !(g_settings.bird_look[part] & COOP_LOOK_SET) || wsum[k] <= 0) continue;
+            const uint32_t c = g_settings.bird_look[part];
+            const float rgb[3] = {(c >> 16 & 255) / 255.0f, (c >> 8 & 255) / 255.0f, (c & 255) / 255.0f};
+            const float mean = (float)(sum[k] / wsum[k]), kk = mean > 1 ? fminf(l / mean, 2.5f) : 1;
+            for (int ch = 0; ch < 3; ch++) q[ch] = (uint8_t)fminf(255, q[ch] + (fminf(255, rgb[ch] * 255 * kk) - q[ch]) * wk + 0.5f);
+        }
+    }
+    free(wt);
+    uint32_t n[BIRD_LOOK_PARTS] = {(uint32_t)wsum[0], (uint32_t)wsum[1], (uint32_t)wsum[4], (uint32_t)wsum[2], (uint32_t)wsum[3]};
+    NvnTexture *copy = vk_texture_from_rgba(icon, px, w, h);
+    free(px);
+    Recoloured *e = &recoloured[slot];
+    vk_texture_free(e->copy);
+    *e = (Recoloured){icon, copy, icon->addr, key, frame};
+    LOG("[bird] icon texture %p %ux%u recoloured (plumage %u, feathers %u, markings %u, tips %u texels)\n", (void *)icon, w, h, n[0], n[1],
+        n[3], n[4]);
+    if (copy) swap_from = icon, swap_to = copy;
+}
+
+// Any other mesh sampling your bird's textures is part of it too (the tuft on its head, some tail feathers: other meshes,
+// other shaders). Each new one is logged once.
+static void bird_texture_any(Prog *pr, CmdRec *r) {
+    if (!bird_body_tex && !bird_second_tex) return;
+    NvnTexture *hit = NULL;  // (any of its textures, not only its largest: some sample a bigger one too)
+    for (int i = 0; i < pr->fi->ntex && !hit; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (t && (t == bird_body_tex || t == bird_second_tex)) hit = t;
+    }
+    if (!hit) return;
+    const bool body = hit == bird_body_tex;
+    {   // (each of its draws' textures, once: format and size, to see what else colours it)
+        static uint64_t shown[16];
+        static int nshown;
+        const uint64_t id2 = (uint64_t)r->x[2] << 8 | pr->fi->ntex;
+        bool was = false;
+        for (int i = 0; i < nshown; i++) was |= shown[i] == id2;
+        if (!was && nshown < 16) {
+            shown[nshown++] = id2;
+            for (int i = 0; i < pr->fi->ntex; i++) {
+                NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+                LOG("[bird] %u vertices: texture %d: %p format %#x %ux%u%s\n", (uint32_t)r->x[2], i, (void *)t, t ? t->format : 0,
+                    t ? t->width : 0, t ? t->height : 0, t == bird_body_tex ? " (body)" : t == bird_second_tex ? " (tips)" : "");
+                uint32_t w, h;
+                uint8_t *px = t && t->width <= 256 ? vk_texture_decode(t, &w, &h) : NULL;
+                if (px) {
+                    char fn[64];
+                    snprintf(fn, sizeof fn, "build/bird_%u_tex%d.ppm", (uint32_t)r->x[2], i);
+                    FILE *f = fopen(fn, "wb");
+                    if (f) {
+                        fprintf(f, "P6 %u %u 255\n", w, h);
+                        for (uint64_t k = 0; k < (uint64_t)w * h; k++) fwrite(px + k * 4, 1, 3, f);
+                        fclose(f);
+                    }
+                    free(px);
+                }
+            }
+        }
+    }
+    static uint64_t logged[32];
+    static int nlogged;
+    const uint64_t id = (uint64_t)r->x[2] << 16 | (uint64_t)pr->vi->cbuf_mask << 1 | body;
+    bool known = false;
+    for (int i = 0; i < nlogged; i++) known |= logged[i] == id;
+    if (!known && nlogged < 32) {
+        logged[nlogged++] = id;
+        LOG("[bird] another mesh on its %s texture: %u vertices, cbufs %#x, %d textures%s\n", body ? "body" : "feather tips'",
+            (uint32_t)r->x[2], pr->vi->cbuf_mask, pr->fi->ntex, in_pass ? "" : " (outside a pass)");
+    }
+    bird_texture_swap(pr, body ? BIRD_TUFT : BIRD_SECOND, hit);
+}
+
 // (LARECOMP_DUP_TINT_TEST) each part's main texture, once, to build/link_<vertices><r: rigid>.ppm: to tell its parts apart
 static void look_texture_dump(Prog *pr, uint32_t vertices, bool rigid) {
     static uint32_t done[64];
@@ -3539,6 +3828,43 @@ static void look_texture_dump(Prog *pr, uint32_t vertices, bool rigid) {
         fclose(f);
     }
     LOG("[coop] look dump: %u%s texture %p %ux%u -> %s\n", vertices, rigid ? "r" : "", (void *)best, w, h, fn);
+    free(px);
+}
+
+// (debugging: g_skin_dump set from outside, by its symbol) every character mesh's main texture, once a vertex count, to
+// build/skin_<vertices><r: rigid>.ppm: to find other models' parts (the Loftwing's), with where its first bone is
+volatile int g_skin_dump;
+static void skin_texture_dump(Prog *pr, uint32_t vertices, bool rigid) {
+    if (!g_skin_dump || !in_pass || (g_skin_dump == 1 && !st.rt.depth)) return;
+    static uint64_t done[512];
+    static int ndone;
+    uint64_t key = (uint64_t)vertices * 2 + rigid + ((uint64_t)pr->vi->cbuf_mask << 32);
+    for (int i = 0; i < ndone; i++) if (done[i] == key) return;
+    if (ndone >= 512) return;
+    done[ndone++] = key;
+    NvnTexture *best = NULL;
+    for (int i = 0; i < pr->fi->ntex; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->format < 0x79 || t->format > 0x84) continue;
+        if (!best || (uint64_t)t->width * t->height > (uint64_t)best->width * best->height) best = t;
+    }
+    const Range *bones = &st.ubuf[0][rigid ? 0 : 3];
+    const float *m = bones->addr && bones->size >= 64 * 4 ? (const float *)(uintptr_t)bones->addr + (rigid ? 16 : 0) : NULL;
+    if (!best) { LOG("[skin] %u%s: no ASTC texture\n", vertices, rigid ? "r" : ""); return; }
+    uint32_t w, h;
+    uint8_t *px = vk_texture_decode(best, &w, &h);
+    if (!px) return;
+    char fn[64];
+    if (g_skin_dump == 2) snprintf(fn, sizeof fn, "build/any_%u_%x.ppm", vertices, pr->vi->cbuf_mask);
+    else snprintf(fn, sizeof fn, "build/skin_%u%s.ppm", vertices, rigid ? "r" : "");
+    FILE *f = fopen(fn, "wb");
+    if (f) {
+        fprintf(f, "P6 %u %u 255\n", w, h);
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) fwrite(px + i * 4, 1, 3, f);
+        fclose(f);
+    }
+    LOG("[skin] %u%s cbufs %#x: texture %p %ux%u (%d textures) bone0 view %.0f %.0f %.0f -> %s\n", vertices, rigid ? "r" : "", pr->vi->cbuf_mask, (void *)best,
+        w, h, pr->fi->ntex, m ? m[3] : 0, m ? m[7] : 0, m ? m[11] : 0, fn);
     free(px);
 }
 
@@ -4309,8 +4635,14 @@ static void draw_(CmdRec *r, bool indexed) {
     swap_from = swap_to = NULL;
     st_vertices = r->x[2];
     if (dup_drawing && dup_tint_on) look_texture_dump(pr, (uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS);
+    if (!dup_drawing && (g_skin_dump == 2 || pr->vi->cbuf_mask == LINK_CBUFS || (pr->vi->cbuf_mask == LINK_RIGID_CBUFS && st.ds[1])))
+        skin_texture_dump(pr, (uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS);
     if (dup_drawing) look_texture_swap(pr, true, link_kind((uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS));
     else look_texture_swap(pr, false, own_link_kind(pr, r));
+    if (!dup_drawing && !swap_to && g_is_skyward && in_pass && pr->vi->cbuf_mask == LINK_CBUFS)  // (your Loftwing)
+        bird_texture_swap(pr, r->x[2] == BIRD_BODY_VERTICES ? BIRD_BODY : r->x[2] == BIRD_SECOND_VERTICES ? BIRD_SECOND : BIRD_NONE, NULL);
+    if (!dup_drawing && g_is_skyward) { NvnTexture *f = swap_from, *t2 = swap_to; bird_texture_any(pr, r); if (t2) swap_from = f, swap_to = t2; }  // (its other meshes)
+    if (!dup_drawing && g_is_skyward && !swap_to) bird_icon_swap(pr);  // (its HUD icons)
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;

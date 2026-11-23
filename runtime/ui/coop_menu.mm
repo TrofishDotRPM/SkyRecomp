@@ -35,17 +35,17 @@ static uint32_t from_floats(const float c[3]) {
     return r << 16 | g << 8 | b;
 }
 
-// One part's row: the current color (opens the wheel), the common ones, Original. true: changed.
-static bool part_row(int p, float scale) {
+// One part's row: the current color (opens the wheel), the common ones, Original. true: changed. p: an id of its own (Link's
+// parts, then the Loftwing's after them), look: the color it sets.
+static bool part_row(int p, const char *name, uint32_t &look, float scale) {
     bool changed = false;
     const float sw = 30 * scale;
     ImGui::PushID(p);
-    opt_heading(PARTS[p], scale);  // (as the other pages' sections)
-    uint32_t &look = g_settings.coop_look[p];
+    opt_heading(name, scale);  // (as the other pages' sections)
     bool set = look & COOP_LOOK_SET;
     // The wheel works on its own floats while it's open: made again each frame from the 8-bit color saved, its hue would
     // drift (and be lost for greys), turning the triangle under the cursor.
-    static float wheel[COOP_LOOK_PARTS][3];
+    static float wheel[COOP_LOOK_PARTS + BIRD_LOOK_PARTS][3];
     ImVec4 v = set ? to_vec(look) : ImVec4(0.5f, 0.5f, 0.5f, 1);
     if (ImGui::ColorButton("##current", v, ImGuiColorEditFlags_NoTooltip, ImVec2(sw * 2, sw))) {
         wheel[p][0] = v.x, wheel[p][1] = v.y, wheel[p][2] = v.z;
@@ -268,9 +268,22 @@ extern "C" void coop_look_draw(float scale) {
         for (const auto &page : PAGES) {
             if (!ImGui::BeginTabItem(page.name)) continue;
             if (page.note) { ImGui::Spacing(); ImGui::TextWrapped("%s", page.note); }
-            for (const int *p = page.parts; *p >= 0; p++) changed |= part_row(*p, scale);
+            for (const int *p = page.parts; *p >= 0; p++) changed |= part_row(*p, PARTS[*p], g_settings.coop_look[*p], scale);
             if (ImGui::Button("All original")) {
                 for (const int *p = page.parts; *p >= 0; p++) g_settings.coop_look[*p] = 0;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Loftwing")) {  // (your bird: only your game draws it, so only you see these)
+            static const char *const BIRD[BIRD_LOOK_PARTS] = {"Plumage", "White feathers", "Eyes", "Markings", "Feather tips"};
+            ImGui::Spacing();
+            ImGui::TextWrapped("Your Crimson Loftwing's colors. Only you see them: the other player's game doesn't draw "
+                               "your bird.");
+            for (int p = 0; p < BIRD_LOOK_PARTS; p++)
+                changed |= part_row(COOP_LOOK_PARTS + p, BIRD[p], g_settings.bird_look[p], scale);
+            if (ImGui::Button("All original")) {
+                for (int p = 0; p < BIRD_LOOK_PARTS; p++) g_settings.bird_look[p] = 0;
                 changed = true;
             }
             ImGui::EndTabItem();

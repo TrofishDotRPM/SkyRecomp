@@ -212,6 +212,14 @@ void settings_load(void) {
             else strlcpy(g_settings.coop_key, val, sizeof g_settings.coop_key);
             continue;
         }
+        if (!strncmp(key, "bird_look_", 10)) {  // bird_look_<part> = #rrggbb, or original
+            static const char *const parts[BIRD_LOOK_PARTS] = {"plumage", "feathers", "eyes", "markings", "tips"};
+            for (int p = 0; p < BIRD_LOOK_PARTS; p++) {
+                if (strcmp(key + 10, parts[p])) continue;
+                unsigned rgb;
+                g_settings.bird_look[p] = sscanf(val, " #%6x", &rgb) == 1 ? (rgb & 0xffffffu) | COOP_LOOK_SET : 0;
+            }
+        }
         if (!strncmp(key, "coop_look_", 10)) {  // coop_look_<part> = #rrggbb, or original
             static const char *const parts[COOP_LOOK_PARTS] = {"shirt", "tabard", "trousers", "boots", "belt", "tunic", "hat", "undershirt", "tunic_trousers", "tunic_boots", "tunic_belt", "hair", "eyes", "shirt_details", "tabard_design", "earrings", "skin", "gloves"};
             for (int p = 0; p < COOP_LOOK_PARTS; p++) {
@@ -410,6 +418,11 @@ void settings_save(void) {
         for (int p = 0; p < COOP_LOOK_PARTS; p++) {
             if (g_settings.coop_look[p] & COOP_LOOK_SET) fprintf(f, "coop_look_%s = #%06x\n", parts[p], g_settings.coop_look[p] & 0xffffffu);
             else fprintf(f, "coop_look_%s = original\n", parts[p]);
+        }
+        static const char *const bird_parts[BIRD_LOOK_PARTS] = {"plumage", "feathers", "eyes", "markings", "tips"};
+        for (int p = 0; p < BIRD_LOOK_PARTS; p++) {
+            if (g_settings.bird_look[p] & COOP_LOOK_SET) fprintf(f, "bird_look_%s = #%06x\n", bird_parts[p], g_settings.bird_look[p] & 0xffffffu);
+            else fprintf(f, "bird_look_%s = original\n", bird_parts[p]);
         }
     }
     fclose(f);

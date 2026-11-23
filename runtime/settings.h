@@ -41,6 +41,10 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 #define COOP_LOOK_SKIN 16            // his face, ears and hands
 #define COOP_LOOK_GLOVES 17          // the classic tunic's fingerless gloves (and their cuffs)
 #define COOP_LOOK_SET 0x1000000u
+// your Loftwing's looks (the Crimson Loftwing's texture, by its colors: runtime/nvn/vulkan/exec.c bird_texel_part): its
+// plumage, white feathers, eyes, the purple markings, and its feathers' yellow tips (its beak, legs and talons keep their
+// own colors). Not sent: only this game draws it.
+#define BIRD_LOOK_PARTS 5
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
@@ -111,6 +115,7 @@ typedef struct {
     bool coop_upnp;        // hosting: open the port on the router (runtime/hle/coop_upnp.c)
     char coop_name[24];    // shown over your Link to the other players (up to 20 characters); empty: "Other player"
     uint32_t coop_look[COOP_LOOK_PARTS];  // your Link's clothes (COOP_LOOK_PARTS): 0xRRGGBB | COOP_LOOK_SET, or 0 for the
+    uint32_t bird_look[BIRD_LOOK_PARTS];  // (as coop_look: rgb | COOP_LOOK_SET, 0 = the game's own)
                                           // game's own color. Both players see them.
 } Settings;
 
