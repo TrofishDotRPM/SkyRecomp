@@ -31,6 +31,8 @@ Settings g_settings = {
     .mouse_controls = true,
     .mouse_sens = 1.0f,
     .gyro_sens = 1.0f,
+    .touch_sword = true,
+    .touch_sens = 1.0f,
     .reverb = true,
     .movie_audio = true,
     .perf_overlay = PERF_OFF,
@@ -264,6 +266,8 @@ void settings_load(void) {
         else if (!strcmp(key, "mouse_controls")) g_settings.mouse_controls = atoi(val) != 0;
         else if (!strcmp(key, "mouse_sens")) g_settings.mouse_sens = (float)atof(val);
         else if (!strcmp(key, "gyro_sens")) g_settings.gyro_sens = (float)atof(val);
+        else if (!strcmp(key, "touch_sword")) g_settings.touch_sword = atoi(val) != 0;
+        else if (!strcmp(key, "touch_sens")) g_settings.touch_sens = (float)atof(val);
         else if (!strcmp(key, "move_360")) g_settings.move_360 = atoi(val) != 0;
         else if (!strcmp(key, "disabled_mods") || !strcmp(key, "mod_order")) mods_settings_load(key, val);
         else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
@@ -328,6 +332,9 @@ void settings_load(void) {
     if (!isfinite(g_settings.gyro_sens)) g_settings.gyro_sens = 1.0f;
     if (g_settings.gyro_sens < 0.1f) g_settings.gyro_sens = 0.1f;
     if (g_settings.gyro_sens > 2.0f) g_settings.gyro_sens = 2.0f;
+    if (!isfinite(g_settings.touch_sens)) g_settings.touch_sens = 1.0f;
+    if (g_settings.touch_sens < 0.25f) g_settings.touch_sens = 0.25f;
+    if (g_settings.touch_sens > 3.0f) g_settings.touch_sens = 3.0f;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -360,6 +367,7 @@ void settings_save(void) {
     fprintf(f, "free_cam = %d\nfree_cam_sens = %.2f\n", g_settings.free_cam, g_settings.free_cam_sens);
     fprintf(f, "mouse_controls = %d\nmouse_sens = %.2f\n", g_settings.mouse_controls, g_settings.mouse_sens);
     fprintf(f, "gyro_sens = %.2f\n", g_settings.gyro_sens);
+    fprintf(f, "touch_sword = %d\ntouch_sens = %.2f\n", g_settings.touch_sword, g_settings.touch_sens);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);
     fprintf(f, "amiibo = %d\n", g_settings.amiibo);

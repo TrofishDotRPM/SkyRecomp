@@ -901,6 +901,15 @@ static void tab_about(void) {
     slider("Gyro sensitivity", &g_settings.gyro_sens, 0.1f, 2.0f, "%.2fx");
     hint("How far the aim moves when you turn a controller with a gyro (bow, slingshot, first-person view). "
          "1.00x = the controller's own motion; lower it if the aim is too twitchy.");
+    toggle("Touchpad sword", &g_settings.touch_sword);
+    if (g_settings.touch_sword) {
+        slider("Touchpad sword sensitivity", &g_settings.touch_sens, 0.25f, 3.0f, "%.2fx");
+        hint("For controllers with two touchpads (Steam Controller, Steam Deck; Steam Input off for this game). "
+             "Swipe quickly on the right touchpad to swing the sword that way (near straight swipes swing straight). "
+             "Keep your thumb down after a swipe to hold the sword out (raise it for a Skyward Strike). Move your "
+             "thumb slowly to move the sword without swinging. A quick tap thrusts. The right stick stays on the "
+             "camera. Higher sensitivity: shorter, slower swipes count.");
+    }
     ImGui::Spacing();
     header("Button prompts");
     {

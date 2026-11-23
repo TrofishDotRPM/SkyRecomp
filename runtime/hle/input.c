@@ -45,6 +45,57 @@ static _Atomic uint64_t mouse_slash_until, mouse_shield_until;
 static _Atomic bool mouse_swinging, mouse_swung;
 static _Atomic int32_t mouse_sx, mouse_sy;
 static uint64_t mouse_frame_ns;
+// Touchpad sword (g_settings.touch_sword): a controller with two touchpads (Steam Controller, Steam Deck; SDL's own drivers,
+// so Steam Input off for the game). The right one (index 1) is the sword, two ways by speed:
+//  - Slow: the sword follows the finger. Its travel from where it landed is the stick (full tilt at TOUCH_AIM_FULL of
+//    the pad's width at 1x), once past TOUCH_ENGAGE (a thumb resting leaves the stick to the camera): the game moves the
+//    sword without swinging, as it needs at times.
+//  - Fast (TOUCH_FAST of the pad within TOUCH_FAST_MS): a swing, played to the game as the mouse's click slash is: full
+//    tilt for TOUCH_FLICK_MS the stroke's way (over its last TOUCH_STROKE_MS, so a rest or slow move first hardly counts).
+//    Following a fast finger as the stick instead (as the mouse's hold and swing), a swipe read as a ramp (the game reads
+//    every ~8 ms) and few swung; the game takes a swing only from a flick. A swipe takes 50-75 ms, so the swing goes as
+//    soon as it's fast, not when the finger lifts (that felt sluggish). Its angle is its own, pulled to the nearest of
+//    the 8 ways within TOUCH_PULL_DEG of it (8 fixed ways looked stiff; with no pull, straight swings were hard to hit;
+//    pulling only to straight, 12 degrees, diagonals were).
+//    The finger still down after it: the sword stays out that way (raised for a Skyward Strike); another fast stroke
+//    TOUCH_AGAIN_DEG or more off swings again once its flick is over (through TOUCH_NEUTRAL_MS of centre). One
+//    TOUCH_REVERSE_DEG or more off (back the way it came) goes at once: TOUCH_REVERSE_NEUTRAL_MS of centre, then the
+//    other side. A spin attack is three quick flicks side to side (left-right-left, up-down-up), and the game counts a
+//    flick only from the centre: straight across or round the rim (as a stick spun by hand went), only the first one
+//    counted; waiting for each flick to end first made them too slow.
+//  - Moving the sword slowly for TOUCH_LATCH_MS makes the rest of that touch slow, however fast it goes: a quick circle
+//    with the sword (which some puzzles want) swung at its first fast bit. A swipe lands and goes at once (moving within
+//    ~5 ms, a swing within 30-60), so it's fast before the latch; a thumb resting first never starts it.
+//  - A short quick touch that never got fast (TOUCH_MOVE in under TOUCH_QUICK_MS): a swing when it lifts. A tap (no move,
+//    under TOUCH_TAP_MS): a thrust (R3, as the mouse's middle click).
+#define TOUCH_ENGAGE 0.03f
+#define TOUCH_LATCH_MS 100
+#define TOUCH_AIM_FULL 0.12f  // (0.25: the slow sword felt too slow)
+#define TOUCH_FAST 0.09f  // (0.05, 1.25 pad widths a second: moving the sword briskly swung; swipes go ~10)
+#define TOUCH_FAST_MS 40
+#define TOUCH_MOVE 0.05f
+#define TOUCH_QUICK_MS 200
+#define TOUCH_STROKE_MS 150
+#define TOUCH_PULL_DEG 10.0f
+#define TOUCH_AGAIN_DEG 60.0f
+#define TOUCH_REVERSE_DEG 120.0f
+#define TOUCH_REVERSE_NEUTRAL_MS 16
+#define TOUCH_NEUTRAL_MS 20
+#define TOUCH_FLICK_MS 80
+#define TOUCH_TAP_MS 250
+#define TOUCH_THRUST_MS 100
+#define TOUCH_TRAIL 64
+static _Atomic bool touch_down, touch_aiming, touch_fired;  // (fired: a swing went in this touch)
+static float touch_x0, touch_y0;  // (the event thread's: where the finger landed, or was after a swing; its places since)
+static struct { uint64_t ms; float x, y; } touch_trail[TOUCH_TRAIL];
+static int touch_ntrail;
+// (aim: the slow sword; dir: the way of the last swing, held after it; pulse: the swing played)
+static _Atomic int32_t touch_aim_x, touch_aim_y, touch_dir_x, touch_dir_y, touch_pulse_x, touch_pulse_y;
+static _Atomic uint64_t touch_down_ms, touch_aim_ms, touch_pulse_at, touch_thrust_until;  // (aim_ms: when it began following)
+static _Atomic int touch_pulse_neutral;  // (ms of centre before this swing's tilt)
+static _Atomic bool touch_pulse_reverse;  // (this swing reversed the last one)
+static int touch_log = -1;  // LARECOMP_TOUCH_LOG=1: each touch event and each stick the game is given from it
+static bool touch_logging(void) { if (touch_log < 0) touch_log = getenv("LARECOMP_TOUCH_LOG") && atoi(getenv("LARECOMP_TOUCH_LOG")); return touch_log; }
 
 static bool mouse_unbound(int button) {
     for (int i = 0; i < BIND_KEY_COUNT; i++) if (g_bind_key[i] == 512 + button) return false;
@@ -146,6 +197,8 @@ void input_reset(void) {
     mouse_slash_until = mouse_shield_until = 0;
     mouse_swinging = mouse_swung = false;
     mouse_sx = mouse_sy = 0;
+    touch_down = touch_aiming = touch_fired = false;
+    touch_pulse_at = touch_thrust_until = 0;
     recompute_keyboard();
 }
 
@@ -195,6 +248,7 @@ bool input_user_blocked(const SDL_Event *e) {
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_GAMEPAD_ADDED: case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: case SDL_EVENT_JOYSTICK_ADDED:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN: case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION: case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
     case SDL_EVENT_JOYSTICK_AXIS_MOTION:
     case SDL_EVENT_JOYSTICK_BUTTON_DOWN: case SDL_EVENT_JOYSTICK_BUTTON_UP:
         return true;
@@ -277,10 +331,22 @@ static void motion_sample(const SDL_GamepadSensorEvent *s) {
     pthread_mutex_unlock(&motion_lock);
 }
 
+static void touch_event(const SDL_GamepadTouchpadEvent *t);
+// Full tilt the stroke's way, pulled to one of the 8 ways near it: within TOUCH_PULL_DEG of straight or diagonal, exactly
+// that; between, the rest spread evenly (no jump at the edges)
+static void touch_snap(float dx, float dy, int32_t *sx, int32_t *sy) {
+    if (dx == 0 && dy == 0) { *sx = *sy = 0; return; }
+    float a = atan2f(dy, dx) * (180.0f / (float)M_PI);
+    const float axis = roundf(a / 90.0f) * 90.0f, off = a - axis, m = fabsf(off);  // (m: 0 straight .. 45 diagonal)
+    const float eased = m <= TOUCH_PULL_DEG ? 0 : m >= 45.0f - TOUCH_PULL_DEG ? 45.0f
+                                                 : (m - TOUCH_PULL_DEG) * 45.0f / (45.0f - 2 * TOUCH_PULL_DEG);
+    a = (axis + copysignf(eased, off)) * ((float)M_PI / 180.0f);
+    *sx = (int32_t)lrintf(cosf(a) * 32767), *sy = (int32_t)lrintf(sinf(a) * 32767);
+}
 static void pad_opened(void) {  // its name, its button prompts, its gyro (DualSense, DualShock 4, Switch controllers)
     bool gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
     if (gyro && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
-    LOG("[input] gamepad: %s (%s)\n", SDL_GetGamepadName(pad), gyro ? "gyro" : "no gyro");
+    LOG("[input] gamepad: %s (%s, %d touchpads)\n", SDL_GetGamepadName(pad), gyro ? "gyro" : "no gyro", SDL_GetNumGamepadTouchpads(pad));
     note_family();
     motion_reset(gyro);
 }
@@ -291,6 +357,91 @@ static void pad_follow(SDL_JoystickID which) {
     if (pad && SDL_GetGamepadID(pad) == which) return;
     SDL_Gamepad *g = SDL_GetGamepadFromID(which);
     if (g) { pad = g; pad_opened(); }
+}
+
+static void touch_fire(float dx, float dy, float x, float y, uint64_t now, bool reverse) {
+    int32_t sx, sy;
+    touch_snap(dx, dy, &sx, &sy);
+    const uint64_t last = touch_pulse_at;  // (right after another swing: through the centre first, a new flick; a reversal: not)
+    touch_pulse_neutral = reverse ? TOUCH_REVERSE_NEUTRAL_MS
+                          : last && now < last + touch_pulse_neutral + TOUCH_FLICK_MS + TOUCH_NEUTRAL_MS ? TOUCH_NEUTRAL_MS : 0;
+    touch_pulse_reverse = reverse;
+    touch_pulse_x = sx, touch_pulse_y = sy, touch_pulse_at = now;
+    touch_dir_x = sx, touch_dir_y = sy;
+    touch_fired = true, touch_aiming = false;
+    touch_x0 = x, touch_y0 = y;
+}
+
+// The finger's travel over the last `ms` (from its place then, or where the touch began), scaled by the sensitivity
+static void touch_travel(uint64_t now, uint64_t ms, float x, float y, float *dx, float *dy) {
+    int from = touch_ntrail - 1;
+    while (from > 0 && now - touch_trail[from - 1].ms <= ms) from--;
+    const float sens = g_settings.touch_sens;
+    *dx = (x - touch_trail[from].x) * sens, *dy = -(y - touch_trail[from].y) * sens;  // (y: the pad's grows downward, the stick's up)
+}
+
+static void touch_event(const SDL_GamepadTouchpadEvent *t) {
+    if (host_test || t->touchpad != 1 || !g_settings.touch_sword) return;
+    if (t->type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) pad_follow(t->which);  // (touching it makes it the one in your hands)
+    if (!pad || SDL_GetGamepadID(pad) != t->which || SDL_GetNumGamepadTouchpads(pad) < 2) return;
+    const uint64_t now = SDL_GetTicks();
+    if (t->type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) {
+        if (menu_input_captured()) return;
+        touch_x0 = t->x, touch_y0 = t->y;
+        touch_trail[0].ms = now, touch_trail[0].x = t->x, touch_trail[0].y = t->y, touch_ntrail = 1;
+        touch_aiming = touch_fired = false;
+        touch_aim_x = touch_aim_y = 0;
+        touch_down_ms = now;
+        touch_down = true;
+        if (touch_logging()) LOG("[touch] %llu down x %.3f y %.3f\n", (unsigned long long)now, t->x, t->y);
+        return;
+    }
+    if (!touch_down || !isfinite(t->x) || !isfinite(t->y)) return;
+    if (touch_ntrail == TOUCH_TRAIL) memmove(&touch_trail[0], &touch_trail[1], sizeof touch_trail[0] * (TOUCH_TRAIL - 1)), touch_ntrail--;
+    touch_trail[touch_ntrail].ms = now, touch_trail[touch_ntrail].x = t->x, touch_trail[touch_ntrail].y = t->y, touch_ntrail++;
+    const float sens = g_settings.touch_sens;
+    float fx, fy, sdx, sdy;
+    touch_travel(now, TOUCH_FAST_MS, t->x, t->y, &fx, &fy);
+    touch_travel(now, TOUCH_STROKE_MS, t->x, t->y, &sdx, &sdy);
+    const bool up = t->type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP;
+    const char *did = "";
+    const bool latched = touch_aiming && !touch_fired && now - touch_aim_ms >= TOUCH_LATCH_MS;
+    if (!up && hypotf(fx, fy) > TOUCH_FAST && !latched) {
+        const float along = (fx * touch_dir_x + fy * touch_dir_y) / (hypotf(fx, fy) * 32767);  // (cos of the angle to the last swing)
+        const bool reverse = touch_fired && along < cosf(TOUCH_REVERSE_DEG * (float)M_PI / 180.0f);
+        // (a sideways one right after a reversal is the thumb turning round in a spin, not a new swing)
+        const bool spinning = touch_pulse_reverse && now < touch_pulse_at + TOUCH_REVERSE_NEUTRAL_MS + TOUCH_FLICK_MS + 100;
+        const bool again = touch_fired && (reverse || (!spinning && now >= touch_pulse_at + touch_pulse_neutral + TOUCH_FLICK_MS &&
+                                                       along < cosf(TOUCH_AGAIN_DEG * (float)M_PI / 180.0f)));
+        if (!touch_fired || again) {
+            touch_fire(again ? fx : sdx, again ? fy : sdy, t->x, t->y, now, reverse);
+            did = reverse ? " - swing back (reversal)" : again ? " - swing again" : " - swing";
+        }
+    } else if (!up && !touch_fired) {  // (slow: the sword follows it)
+        const float dx = (t->x - touch_x0) * sens, dy = -(t->y - touch_y0) * sens, r = hypotf(dx, dy);
+        if (r > TOUCH_ENGAGE && !touch_aiming) touch_aiming = true, touch_aim_ms = now;
+        if (touch_aiming) {
+            float ax = dx / TOUCH_AIM_FULL * 32767, ay = dy / TOUCH_AIM_FULL * 32767;
+            if (r > TOUCH_AIM_FULL) ax *= TOUCH_AIM_FULL / r, ay *= TOUCH_AIM_FULL / r;
+            touch_aim_x = (int32_t)ax, touch_aim_y = (int32_t)ay;
+        }
+    }
+    if (up) {
+        touch_down = false;
+        if (touch_fired) {
+            did = " - swung already";
+        } else if (!latched && hypotf(sdx, sdy) > TOUCH_MOVE && now - touch_down_ms < TOUCH_QUICK_MS) {
+            touch_fire(sdx, sdy, t->x, t->y, now, false);
+            did = " - swing (lifted)";
+        } else if (!touch_aiming && now - touch_down_ms < TOUCH_TAP_MS) {
+            touch_thrust_until = now + TOUCH_THRUST_MS;
+            did = " - thrust";
+        }
+        touch_aiming = false;
+    }
+    if (touch_logging())
+        LOG("[touch] %llu %s x %.3f y %.3f%s%s\n", (unsigned long long)now, up ? "up" : "move", t->x, t->y,
+            latched ? " moving (latched)" : touch_aiming ? " aiming" : "", did);
 }
 
 static void pad_removed(SDL_JoystickID which) {
@@ -384,6 +535,9 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
         if (pad && !host_test && SDL_GetGamepadID(pad) == e->gsensor.which) motion_sample(&e->gsensor);
+        break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN: case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION: case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+        touch_event(&e->gtouchpad);
         break;
     }
 }
@@ -712,6 +866,34 @@ static bool mouse_input(uint64_t *buttons, int32_t *rx, int32_t *ry, uint64_t no
     return slash || swing || thrust || item_mode;
 }
 
+// The touchpad sword (touch_event): while a finger is on the right pad, or just after a swipe or tap, it is the right stick
+// (and L is withheld, as the game's L + stick is its camera). Not while ZR holds an item: the stick aims it then.
+static bool touch_input(uint64_t *buttons, int32_t *rx, int32_t *ry, uint64_t now, bool captured) {
+    if (captured || !g_is_skyward || !g_settings.touch_sword) return false;
+    uint64_t b = *buttons;
+    if (b & (1ull << BTN_ZR)) return false;
+    bool on = true;
+    const uint64_t pulse = touch_pulse_at;
+    const int neutral = touch_pulse_neutral;
+    if (pulse && now < pulse + neutral) {
+        *rx = *ry = 0;  // (from the centre: a flick)
+    } else if (pulse && now < pulse + neutral + TOUCH_FLICK_MS) {
+        *rx = touch_pulse_x, *ry = touch_pulse_y;
+    } else if (touch_down && touch_fired) {  // (after a swing, the finger still down: held out that way)
+        *rx = touch_dir_x, *ry = touch_dir_y;
+    } else if (touch_down && touch_aiming) {  // (slow: the sword where the finger has it)
+        *rx = touch_aim_x, *ry = touch_aim_y;
+    } else if (now < touch_thrust_until) {
+        b |= 1ull << BTN_RSTICK;
+    } else {
+        on = false;
+    }
+    if (on) b &= ~(1ull << BTN_L);
+    if (on && touch_logging()) LOG("[touch] %llu game reads %d %d%s\n", (unsigned long long)now, *rx, *ry, b & (1ull << BTN_RSTICK) ? " R3" : "");
+    *buttons = b;
+    return on;
+}
+
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
 static void fill_state(Cpu *c) {
@@ -763,6 +945,7 @@ static void fill_state(Cpu *c) {
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
     uint64_t now = SDL_GetTicks();
     bool mouse_sword = mouse_input(&b, &rx, &ry, now, menu);
+    mouse_sword |= touch_input(&b, &rx, &ry, now, menu);
     input_stick_circle(&lx, &ly);
     input_stick_circle(&rx, &ry);
 
@@ -823,6 +1006,15 @@ static void fill_state(Cpu *c) {
     { extern void input_note_rstick(int32_t ry); input_note_rstick(ry); }
     *(int32_t *)(s + 24) = rx;
     *(int32_t *)(s + 28) = ry;
+    if (touch_logging()) {  // (LARECOMP_TOUCH_LOG: every change of the right stick and L / R3 the game is given, from anything)
+        static int32_t lrx, lry;
+        static uint64_t lb;
+        const uint64_t keep = (1ull << BTN_L) | (1ull << BTN_RSTICK);
+        if (rx != lrx || ry != lry || (b & keep) != lb)
+            LOG("[stick] %llu %d %d%s%s\n", (unsigned long long)SDL_GetTicks(), rx, ry, b & (1ull << BTN_L) ? " L" : "",
+                b & (1ull << BTN_RSTICK) ? " R3" : "");
+        lrx = rx, lry = ry, lb = b & keep;
+    }
     *(uint32_t *)(s + 32) = 1;  // IsConnected
 }
 
