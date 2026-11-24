@@ -98,3 +98,45 @@ extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h) {
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &view) != VK_SUCCESS) return 0;
     return (uint64_t)ImGui_ImplVulkan_AddTexture(vk_default_sampler(true), view, VK_IMAGE_LAYOUT_GENERAL);
 }
+
+// An RGBA8 image for ImGui that changes (the Customize tab's Loftwing preview): made on its first use, then its pixels
+// replaced (vk_upload_cmd runs them after everything submitted before, so never under a frame still drawing it). slot:
+// one image each (up to 4); the size is fixed by its first use. Returns its ImTextureID, 0 on failure.
+extern "C" uint64_t vk_imgui_texture_update(int slot, const void *rgba, int w, int h) {
+    static struct { VkImage img; VmaAllocation mem; VkImageView view; uint64_t id; int w, h; } tex[4];
+    if (slot < 0 || slot >= 4 || w <= 0 || h <= 0) return 0;
+    auto &t = tex[slot];
+    if (t.id && (t.w != w || t.h != h)) return 0;
+    if (!t.id) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ci.extent = {(uint32_t)w, (uint32_t)h, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai = {};
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &t.img, &t.mem, NULL) != VK_SUCCESS) return 0;
+        VkCommandBuffer cb = vk_upload_cmd();
+        vk_image_init_layout(cb, t.img, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = t.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(g_vk.dev, &vi, NULL, &t.view) != VK_SUCCESS) return 0;
+        t.id = (uint64_t)ImGui_ImplVulkan_AddTexture(vk_default_sampler(true), t.view, VK_IMAGE_LAYOUT_GENERAL);
+        t.w = w, t.h = h;
+    }
+    VkCommandBuffer cb = vk_upload_cmd();
+    VkSpan sp = vk_transient_copy(rgba, (uint64_t)w * h * 4, 16);
+    VkBufferImageCopy rg = {};
+    rg.bufferOffset = sp.off;
+    rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    rg.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+    vkCmdCopyBufferToImage(cb, sp.buf, t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    return t.id;
+}

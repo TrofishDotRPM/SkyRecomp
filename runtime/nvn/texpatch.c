@@ -41,7 +41,7 @@
 enum { K_BC5, K_BC3, K_ASTC4, K_RGBA8, K_BC1, K_RG8, K_GR8 /* RG8, alpha in red */, K_R8 /* intensity = alpha */ };
 // roles: the prompt glyphs' R_A..R_MINUS / L_* (prompt_icons.h), then these
 enum { R_HERO = R_MINUS + 1, R_SHEET, R_PICTURE, R_BOTTLE, R_BOTTLE_MODEL, R_FAIRY_MODEL,
-       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG, R_BIRD_ICON, R_BIRD_WING };
+       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG, R_BIRD_ICON, R_BIRD_WING, R_BIRD_SMALL };
 enum { L_LS_CLICK = L_ARM_RIGHT + 1, L_RS_CLICK };  // (the picture font's stick presses: the click's own key on a keyboard)
 
 typedef struct {
@@ -119,7 +119,8 @@ static int role_of(const char *name) {
         {"ItemCursor_", R_ITEM_CURSOR},
         // your Loftwing's HUD icons (DoButton.arc): the altitude gauge's bird, the dash feathers (and their shadow), the
         // bird marker: identified only, drawn in your Loftwing's colors (runtime/nvn/vulkan/exec.c bird_icon_swap)
-        {"th_skyBird_", R_BIRD_ICON}, {"th_skyWing", R_BIRD_WING}, {"th_targetBird", R_BIRD_ICON},
+        // (th_skyBird_03: the small one shown falling, its yellow only its beak and legs)
+        {"th_skyBird_03", R_BIRD_SMALL}, {"th_skyBird_", R_BIRD_ICON}, {"th_skyWing", R_BIRD_WING}, {"th_targetBird", R_BIRD_ICON},
     };
     for (unsigned i = 0; i < sizeof m / sizeof *m; i++)
         if (!strncmp(name, m[i].prefix, strlen(m[i].prefix))) return m[i].role;
@@ -402,9 +403,11 @@ int texpatch_bottle_kind(int id) {
          : g_refs[id].role == R_POWDER_MODEL ? 4 : 0;
 }
 
+const char *texpatch_name(int id) { return id >= 0 && id < g_nrefs ? g_refs[id].name : ""; }
+
 int texpatch_bird_icon(int id) {
     if (id < 0 || id >= g_nrefs) return 0;
-    return g_refs[id].role == R_BIRD_ICON ? 1 : g_refs[id].role == R_BIRD_WING ? 2 : 0;
+    return g_refs[id].role == R_BIRD_ICON ? 1 : g_refs[id].role == R_BIRD_WING ? 2 : g_refs[id].role == R_BIRD_SMALL ? 3 : 0;
 }
 
 int texpatch_heart_kind(int id) {
@@ -1102,7 +1105,7 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
     if (lv || r->w != w || r->h != h) return;
     if (r->role == R_BOTTLE || r->role == R_BOTTLE_MODEL || r->role == R_FAIRY_MODEL || r->role == R_POWDER_MODEL ||
         r->role == R_ITEM_CURSOR ||
-        r->role == R_HEART || r->role == R_BIRD_ICON || r->role == R_BIRD_WING) return;
+        r->role == R_HEART || r->role == R_BIRD_ICON || r->role == R_BIRD_WING || r->role == R_BIRD_SMALL) return;
     if (r->role == R_HERO) {  // fully transparent (BC5 blocks of zeros)
         if (hide_hero()) for (uint32_t y = 0; y < (h + 3) / 4; y++) memset(blocks + y * row, 0, (w + 3) / 4 * 16);
         return;

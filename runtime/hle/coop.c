@@ -312,6 +312,14 @@ bool coop_my_position(float out[3]) {
     return true;
 }
 
+// The way this player's Link faces (radians, about up; the actor's angle y, +0x13e: a full turn is 65536)
+bool coop_my_yaw(float *out) {
+    uint64_t p = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (p < 0x7002000000ull || *(uint64_t *)(uintptr_t)p != PLAYER_VTABLE) return false;
+    *out = *(int16_t *)(uintptr_t)(p + 0x13e) * (float)(2 * M_PI / 65536.0);
+    return true;
+}
+
 // ---- what each Link wears: COOP_EV_LOOK, a the part, b red | green << 8, c blue | set << 8. Sent when it changes, and
 // every few seconds for whoever joined since.
 #define COOP_EV_LOOK 9

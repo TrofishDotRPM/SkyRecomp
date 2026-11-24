@@ -24,8 +24,11 @@ uint32_t texpatch_generation(void);
 // tunic (Cosmetics tab colour) changes levels other than 0.
 void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h, uint32_t row);
 // Known texture `id` is one of your Loftwing's HUD icons: 1 the bird (the altitude gauge's, the bird marker: its yellow is
-// its beak), 2 the dash feathers (their yellow is the feathers' tips), else 0
+// its beak), 2 the dash feathers (their yellow is the feathers' tips), 3 the small bird shown falling (its yellow: beak and
+// legs, always their own), else 0
 int texpatch_bird_icon(int id);
+// Known texture `id`'s name in the game's files ("" if none)
+const char *texpatch_name(int id);
 // Known texture `id` is a heart of the HUD / file select (full, empty, frame, life-up flash): 1, else 0.
 int texpatch_heart_kind(int id);
 // The per-draw tint (renderer `ltint`) for a heart draw (`kind` = texpatch_heart_kind) in the Cosmetics tab's heart colour;

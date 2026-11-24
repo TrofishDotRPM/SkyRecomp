@@ -940,6 +940,7 @@ extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" void coop_overlay_draw(ImVec2 display, ImFont *font, ImFont *label_font);
 extern "C" void coop_menu_draw(float scale);  // runtime/ui/coop_menu.mm
 extern "C" void coop_look_draw(float scale);
+extern "C" bool coop_look_full_page(void);  // (runtime/ui/coop_menu.mm: the Loftwing's tab, the size of the other pages)
 extern "C" bool coop_overlay_wanted(void);
 extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
 
@@ -1216,7 +1217,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (open) {
         // dim the game behind the menu. The Customize page instead keeps to the left, undimmed: Link, in the middle of the
         // picture, shows the colors being picked for him.
-        const bool preview = g_tab == 12;
+        const bool preview = g_tab == 12 && !coop_look_full_page();  // (the Loftwing's tab has its own preview)
         if (!preview) ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
         float w = fminf(io.DisplaySize.x * 0.9f, 1500 * scale), h = io.DisplaySize.y - 2 * 18 * scale;  // (all the height: a slim margin)
         if (preview) {
