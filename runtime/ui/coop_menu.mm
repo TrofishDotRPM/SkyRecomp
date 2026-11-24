@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #include "imgui.h"
@@ -52,7 +54,10 @@ static bool part_row(int p, const char *name, uint32_t &look, float scale) {
     ImVec4 v = set ? to_vec(look) : ImVec4(0.5f, 0.5f, 0.5f, 1);
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(name);
-    ImGui::SameLine(150 * scale);
+    // (the colour after the widest name yet: none of them under it)
+    static float widest = 0;
+    widest = fmaxf(widest, ImGui::CalcTextSize(name).x);
+    ImGui::SameLine(fmaxf(120 * scale, widest + ImGui::GetStyle().WindowPadding.x + 12 * scale));
     if (ImGui::ColorButton("##current", v, ImGuiColorEditFlags_NoTooltip, ImVec2(sw * 2.5f, ImGui::GetFrameHeight()))) {
         wheel[p][0] = v.x, wheel[p][1] = v.y, wheel[p][2] = v.z;
         ImGui::OpenPopup("##wheel");
@@ -258,8 +263,8 @@ extern "C" void coop_menu_draw(float scale) {
 
 
 #ifndef __APPLE__
-// ---- previews: your Loftwing and your Link (each outfit), as the game drew them the first time it could (the renderer
-// saves them to the data folder: runtime/nvn/vulkan/exec.c preview_write), turning slowly in your colours (the game's own
+// ---- previews: your Loftwing and your Link (each outfit), read from the game's files the first time one's wanted
+// (runtime/nvn/preview_model.c, saved in the data folder), turning slowly in your colours (the game's own
 // recolouring: bird_recolor_rgba, link_recolor_rgba); drag one to turn it. The GPU draws their triangles through the menu's
 // own renderer (full resolution, textures filtered, clear edges see-through), farthest first.
 extern "C" uint64_t vk_imgui_texture_update(int slot, const void *rgba, int w, int h);
@@ -267,11 +272,10 @@ extern "C" void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h)
 extern "C" void link_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h);
 namespace {
 struct PVtx { float p[3], n[3], uv[2]; uint32_t tex; };
-struct PTex { uint32_t code = 0, w = 0, h = 0, x = 0, y = 0; std::vector<uint8_t> rgba, rec, gloss; };
+struct PTex { uint32_t code = 0, w = 0, h = 0, x = 0, y = 0; std::vector<uint8_t> rgba, rec; };
 struct Model {
     const char *file;
     int slot;      // (its atlas's image: vk_imgui_texture_update)
-    bool bird;     // (the bird's own space faces along its -x; Link's along his +z)
     bool loaded = false;
     double tried = -10;
     std::vector<PVtx> v;
@@ -282,14 +286,25 @@ struct Model {
     float yaw = 0.6f, pitch = 0.15f;
     bool dragged = false;
 };
-Model g_bird = {"loftwing_preview.bin", 1, true}, g_link[2] = {{"link_preview_skyloft.bin", 2, false}, {"link_preview_classic.bin", 3, false}};
+Model g_bird = {"loftwing_preview.bin", 1}, g_link[2] = {{"link_preview_skyloft.bin", 2}, {"link_preview_classic.bin", 3}};
+
+// ---- reading them from the game's files (runtime/nvn/preview_model.c), once, on a thread of its own: 1 doing it, 2 done,
+// 3 it failed
+extern "C" bool preview_models_build(const char *bird_file, const char *skyloft_file, const char *classic_file);
+std::atomic<int> g_build{0};
+void models_build_start() {
+    int idle = 0;
+    if (!g_build.compare_exchange_strong(idle, 1)) return;
+    std::thread([] { g_build = preview_models_build(g_bird.file, g_link[0].file, g_link[1].file) ? 2 : 3; }).detach();
+}
 
 bool model_load(Model &m) {
     FILE *f = fopen(m.file, "rb");
     if (!f) return false;
     uint32_t hdr[4];
-    bool ok = fread(hdr, 4, 4, f) == 4 && hdr[0] == 0x5650574c && (hdr[1] == 1 || hdr[1] == 2) && hdr[2] > 0 && hdr[2] < 400000;
-    const uint32_t ntex = ok ? (hdr[1] == 1 ? 2 : hdr[3]) : 0;
+    // (version 3, from the game's files; earlier ones were seen in the game, and are read again from its files)
+    bool ok = fread(hdr, 4, 4, f) == 4 && hdr[0] == 0x5650574c && hdr[1] == 3 && hdr[2] > 0 && hdr[2] < 400000;
+    const uint32_t ntex = ok ? hdr[3] : 0;
     ok = ok && ntex >= 1 && ntex <= 32;
     if (ok) {
         m.v.resize(hdr[2]);
@@ -298,9 +313,7 @@ bool model_load(Model &m) {
     m.tex.assign(ntex, PTex());
     for (uint32_t t = 0; ok && t < ntex; t++) {
         PTex &x = m.tex[t];
-        if (hdr[1] == 1) x.code = 0x100 | t;  // (version 1: the bird's body, then its feather tips)
-        else ok = fread(&x.code, 4, 1, f) == 1;
-        ok = ok && fread(&x.w, 4, 1, f) == 1 && fread(&x.h, 4, 1, f) == 1 && x.w <= 4096 && x.h <= 4096;
+        ok = fread(&x.code, 4, 1, f) == 1 && fread(&x.w, 4, 1, f) == 1 && fread(&x.h, 4, 1, f) == 1 && x.w <= 4096 && x.h <= 4096;
         if (!ok) break;
         x.rgba.resize((size_t)x.w * x.h * 4);
         if (x.w && x.h) ok = fread(x.rgba.data(), 4, (size_t)x.w * x.h, f) == (size_t)x.w * x.h;
@@ -343,6 +356,7 @@ void model_recolor(Model &m) {
     for (PTex &e : m.tex) {
         if (e.rgba.empty()) continue;
         e.rec = e.rgba;
+        if (e.code == ~0u) continue;  // (none of the parts: as it is)
         if (e.code & 0x100) bird_recolor_rgba((int)(e.code & 0xff), e.rec.data(), e.w, e.h);
         else link_recolor_rgba((int)e.code, e.rec.data(), e.w, e.h);
     }
@@ -364,15 +378,15 @@ void model_render(Model &m, std::vector<uint8_t> &img) {
     const float scale = 0.48f * IN / m.radius, half = IN / 2.0f;
     const float L[3] = {-0.35f, 0.55f, 0.76f};
     const size_t n = m.v.size() / 3 * 3;
-    static std::vector<float> P, shade, NV;
-    P.resize(n * 3), shade.resize(n), NV.resize(n * 3);
+    static std::vector<float> P, shade;
+    P.resize(n * 3), shade.resize(n);
     for (size_t i = 0; i < n; i++) {
         const PVtx &v = m.v[i];
         float o[3], nn[3];
         for (int pass = 0; pass < 2; pass++) {
             const float x = pass ? v.n[0] : v.p[0] - m.centre[0], y = pass ? v.n[1] : v.p[1] - m.centre[1];
             const float z = pass ? v.n[2] : v.p[2] - m.centre[2];
-            const float sx = m.bird ? z : x, syy = y, sz = m.bird ? -x : z;  // (facing you)
+            const float sx = x, syy = y, sz = z;  // (facing you: +z)
             const float rx = cy * sx + sy * sz, rz = -sy * sx + cy * sz;    // (yaw, about up)
             const float ry = cp * syy - sp * rz, rz2 = sp * syy + cp * rz;  // (pitch, about across)
             float *dst = pass ? nn : o;
@@ -382,12 +396,6 @@ void model_render(Model &m, std::vector<uint8_t> &img) {
         const float nl = sqrtf(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
         const float d = nl > 0 ? fabsf(nn[0] * L[0] + nn[1] * L[1] + nn[2] * L[2]) / nl : 1;
         shade[i] = fminf(1.15f, 0.5f + 0.6f * d);
-        for (int k = 0; k < 3; k++) NV[i * 3 + k] = nl > 0 ? nn[k] / nl : 0;  // (for glossy texels' shine, per pixel)
-    }
-    float H[3] = {L[0], L[1], L[2] + 1};  // (half-way between the light and you: the shine's direction)
-    {
-        const float hl = sqrtf(H[0] * H[0] + H[1] * H[1] + H[2] * H[2]);
-        for (int k = 0; k < 3; k++) H[k] /= hl;
     }
     for (size_t t = 0; t < n / 3; t++) {
         const float *A = &P[t * 9], *B = A + 3, *C = A + 6;
@@ -401,8 +409,6 @@ void model_render(Model &m, std::vector<uint8_t> &img) {
         if (e.rec.empty() || !e.w || !e.h) continue;
         const uint8_t *T = e.rec.data();
         const float sa = shade[t * 3], sb = shade[t * 3 + 1], sc = shade[t * 3 + 2], inv = 1 / den;
-        const float *na = &NV[t * 9], *nb = na + 3, *nc = na + 6;
-        const uint8_t *G = e.gloss.empty() ? NULL : e.gloss.data();
         const bool pow2 = !(e.w & (e.w - 1)) && !(e.h & (e.h - 1));  // (the game's are: repeat with a mask)
         const int wm = (int)e.w - 1, hm = (int)e.h - 1;
         for (int y = y0; y <= y1; y++)
@@ -429,18 +435,8 @@ void model_render(Model &m, std::vector<uint8_t> &img) {
                 if (px4[3] < 128) continue;  // (clear: as the game's alpha test)
                 zz = z;
                 const float sh = a * sa + b * sb + c * sc;
-                float shine = 0;
-                if (G) {
-                    const int gu = pow2 ? iu & wm : ((iu % (int)e.w) + (int)e.w) % (int)e.w, gv = pow2 ? iv & hm : ((iv % (int)e.h) + (int)e.h) % (int)e.h;
-                    if (G[(size_t)gv * e.w + gu]) {
-                        float nx = a * na[0] + b * nb[0] + c * nc[0], ny = a * na[1] + b * nb[1] + c * nc[1], nz = a * na[2] + b * nb[2] + c * nc[2];
-                        const float l = sqrtf(nx * nx + ny * ny + nz * nz);
-                        const float d = l > 0 ? fabsf(nx * H[0] + ny * H[1] + nz * H[2]) / l : 0;
-                        shine = powf(d, 40) * 240 + powf(d, 6) * 40;  // (a sharp highlight, and a soft sheen)
-                    }
-                }
                 uint8_t *o = &hi[((size_t)y * IN + x) * 4];
-                for (int ch = 0; ch < 3; ch++) o[ch] = (uint8_t)fminf(255, px4[ch] * sh + shine);
+                for (int ch = 0; ch < 3; ch++) o[ch] = (uint8_t)fminf(255, px4[ch] * sh);
                 o[3] = 255;
             }
     }
@@ -484,9 +480,12 @@ void model_draw(Model &m, float side, bool smooth) {
 // A model's preview, filling `room` (centred), or what to do for one
 static void model_preview(Model &m, ImVec2 room, const char *missing) {
     const double now = ImGui::GetTime();
-    if (!m.loaded && now - m.tried > 2) m.tried = now, m.loaded = model_load(m);
+    if (!m.loaded && now - m.tried > 0.5) {
+        m.tried = now, m.loaded = model_load(m);
+        if (!m.loaded) models_build_start();
+    }
     if (!m.loaded) {
-        ImGui::TextWrapped("%s", missing);
+        ImGui::TextWrapped("%s", g_build == 3 ? missing : "Reading it from the game's files...");
         return;
     }
     if (!m.dragged) m.yaw += ImGui::GetIO().DeltaTime * 0.5f;
@@ -543,7 +542,7 @@ extern "C" void coop_look_draw(float scale) {
 #ifndef __APPLE__
         const ImVec2 room = ImGui::GetContentRegionAvail();
         if (bird) {
-            model_preview(g_bird, room, "Fly with your Loftwing once and a preview of it shows up here.");
+            model_preview(g_bird, room, "The preview couldn't be read from the game's files (see the log).");
         } else {
             int o = PAGES[pg].outfit;
             if (o < 0) {  // (Link himself: in whichever outfit there's a preview of, the classic tunic first)
@@ -552,8 +551,7 @@ extern "C" void coop_look_draw(float scale) {
                     if (!g_link[k].loaded && now - g_link[k].tried > 2) g_link[k].tried = now, g_link[k].loaded = model_load(g_link[k]);
                 o = g_link[1].loaded ? 1 : 0;
             }
-            model_preview(g_link[o], room, o ? "Wear the classic tunic once and a preview of Link in it shows up here."
-                                             : "Wear the Skyloft clothes once and a preview of Link in them shows up here.");
+            model_preview(g_link[o], room, "The preview couldn't be read from the game's files (see the log).");
         }
 #endif
         ImGui::EndChild();

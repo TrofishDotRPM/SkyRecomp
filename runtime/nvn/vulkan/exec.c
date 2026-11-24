@@ -3339,6 +3339,16 @@ static int link_kind(uint32_t vertices, bool rigid) {
     }
 }
 
+// The same for the previews read from the game's files (runtime/nvn/preview_model.c): a mesh by its vertices and its
+// texture's name - the texture tells his hair, face, hands and eyes apart from the clothes' pieces of the same size
+int link_part_kind(uint32_t vertices, bool rigid, const char *texture) {
+    if (strstr(texture, "hair")) return KIND_HAIR;
+    if (strstr(texture, "face")) return KIND_FACE;
+    if (strstr(texture, "hand")) return KIND_HANDS;
+    if (strstr(texture, "eye")) return KIND_EYES;
+    return link_kind(vertices, rigid);
+}
+
 // The look part a texel belongs to, -1 for none (it stays as it is). u v: where it is in the texture, 0-1.
 static int texel_part(int kind, const uint8_t px[4], float u, float v) {
     float r = px[0] / 255.0f, g = px[1] / 255.0f, b = px[2] / 255.0f;
@@ -3586,6 +3596,12 @@ static int bird_texel_part(int kind, const uint8_t px[4], float u, float v) {
 }
 
 static uint64_t bird_bones, bird_frame;  // (the crimson body's bones, the frame it last drew)
+// A preview's (runtime/nvn/preview_model.c) Loftwing texture by its name: 0x100 | which of its textures, ~0 for none
+int bird_part_kind(const char *texture) {
+    return strstr(texture, "Body") ? 0x100 | BIRD_BODY : strstr(texture, "Feather") ? 0x100 | BIRD_SECOND
+         : strstr(texture, "Eye") ? 0x100 | BIRD_EYE : -1;
+}
+
 static NvnTexture *bird_body_tex, *bird_second_tex;  // (your bird's two textures, once seen on it: any mesh with them is its)
 static NvnTexture *bird_eye_tex;  // (and its eyes': a piece of 180 vertices each, fixed to its head, a 64x64 texture of their own)
 #define BIRD_EYE_VERTICES 180
@@ -3783,362 +3799,6 @@ static void bird_mesh_raw(Prog *pr, CmdRec *r, bool indexed) {
     for (int a = 0; a < st.nattrib; a++)
         LOG("[bird]   attrib %d: fmt %#x stream %u offset %u%s\n", a, st.attrib[a] & 0xff, (st.attrib[a] >> 8) & 0x1f, st.attrib[a] >> 13,
             pr->vi->attr_mask & (1u << a) ? " (read)" : "");
-}
-
-// ---- the Loftwing preview's model (runtime/ui/coop_menu.mm draws it): the first time your bird draws and the data folder
-// has no loftwing_preview.bin, its body (6669), feather tips (1176) and head tuft (30, rigid) are saved as they're drawn,
-// posed by their bones and put in its root bone's space (its own: the same way up whatever the camera did), with its two
-// textures as the game has them. Each vertex: position, normal, texture coordinates, which texture (0 body, 1 tips).
-// Their vertices (triangle lists): skinned, a bone index (u32) then position, normal (3 floats each), a colour, uv (2
-// floats); rigid, the same without the index, its bone the vertex stage's first buffer from its 17th float (as Link's).
-#define BIRD_PREVIEW_FILE "loftwing_preview.bin"
-typedef struct { float p[3], n[3], uv[2]; uint32_t tex; } BirdPreviewVtx;
-static BirdPreviewVtx *bp_v;
-static uint32_t bp_n, bp_cap;
-static uint8_t bp_have;  // (bit 0 body, 1 tips, 2 tuft)
-static uint64_t bp_frame;
-static float bp_root[12], bp_rinv[9];
-static int bp_state;  // 0 not checked, 1 wanted, 2 done (or already there)
-
-static bool bp_attr(int fmt_want, int nth, uint32_t *off) {  // (the nth attribute of a format in this draw's layout)
-    for (int a = 0; a < st.nattrib; a++)
-        if ((int)(st.attrib[a] & 0xff) == fmt_want && (st.attrib[a] >> 8 & 0x1f) == 0 && nth-- == 0) { *off = st.attrib[a] >> 13; return true; }
-    return false;
-}
-
-// A preview model file (version 2): "LWPV", 2, its vertex count, its texture count; the vertices (position, normal, uv,
-// which texture); then each texture: what recolours it (Link's part KIND_*, or 0x100 | BIRD_BODY / BIRD_SECOND), its width,
-// height and RGBA as the game has it. Written whole to a .tmp first.
-static bool preview_write(const char *file, const BirdPreviewVtx *v, uint32_t n, NvnTexture *const *tex, const uint32_t *code,
-                          uint32_t ntex) {
-    char tmp[256];
-    snprintf(tmp, sizeof tmp, "%s.tmp", file);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) return false;
-    uint32_t hdr[4] = {0x5650574c, 2, n, ntex};
-    bool ok = fwrite(hdr, 4, 4, f) == 4 && fwrite(v, sizeof *v, n, f) == n;
-    for (uint32_t t = 0; ok && t < ntex; t++) {
-        uint32_t w = 0, h = 0;
-        uint8_t *px = tex[t] ? vk_texture_decode(tex[t], &w, &h) : NULL;
-        if (!px) w = h = 0;
-        ok = fwrite(&code[t], 4, 1, f) == 1 && fwrite(&w, 4, 1, f) == 1 && fwrite(&h, 4, 1, f) == 1 &&
-             (!px || fwrite(px, 4, (size_t)w * h, f) == (size_t)w * h);
-        free(px);
-    }
-    ok &= fclose(f) == 0;
-    if (ok && rename(tmp, file) == 0) return true;
-    remove(tmp);
-    return false;
-}
-
-static void bird_preview_write(void) {
-    // (its eyes in their sockets only: the eyes draw twice a frame, the second time somewhere else (above its head). Its
-    //  sockets: the middle of the body's feather rings round them (that part of its texture), one each side (its own z))
-    float sock[2][3] = {{0}}, cnt[2] = {0, 0};
-    for (uint32_t i = 0; i < bp_n; i++) {
-        const BirdPreviewVtx *v = &bp_v[i];
-        if (v->tex != 0 || v->uv[0] < 0.26f || v->uv[0] > 0.37f || v->uv[1] < 0.14f || v->uv[1] > 0.33f) continue;
-        const int side = v->p[2] >= 0;
-        for (int k = 0; k < 3; k++) sock[side][k] += v->p[k];
-        cnt[side]++;
-    }
-    for (int sd = 0; sd < 2; sd++) for (int k = 0; k < 3 && cnt[sd]; k++) sock[sd][k] /= cnt[sd];
-    if (cnt[0] || cnt[1]) {
-        uint32_t o = 0;
-        for (uint32_t t = 0; t + 3 <= bp_n; t += 3) {
-            if (bp_v[t].tex == 2) {
-                float c[3] = {0, 0, 0}, best = 1e30f;
-                for (int k = 0; k < 3; k++) for (int j = 0; j < 3; j++) c[j] += bp_v[t + k].p[j] / 3;
-                for (int sd = 0; sd < 2; sd++) {
-                    if (!cnt[sd]) continue;
-                    const float dx = c[0] - sock[sd][0], dy = c[1] - sock[sd][1], dz = c[2] - sock[sd][2];
-                    best = fminf(best, dx * dx + dy * dy + dz * dz);
-                }
-                if (best > 40.0f * 40.0f) continue;
-            }
-            if (o != t) memmove(&bp_v[o], &bp_v[t], sizeof *bp_v * 3);
-            o += 3;
-        }
-        bp_n = o;
-    }
-    NvnTexture *tex[3] = {bird_body_tex, bird_second_tex, bird_eye_tex};
-    const uint32_t code[3] = {0x100 | BIRD_BODY, 0x100 | BIRD_SECOND, 0x100 | BIRD_EYE};
-    if (preview_write(BIRD_PREVIEW_FILE, bp_v, bp_n, tex, code, 3))
-        LOG("[bird] preview model saved: %u vertices (%s%s%s%s)\n", bp_n, bp_have & 1 ? "body" : "", bp_have & 2 ? ", feather tips" : "",
-            bp_have & 12 ? ", tuft" : "", bp_have & 16 ? ", eyes" : "");
-}
-
-static void bird_preview_capture(CmdRec *r, bool indexed) {
-    if (bp_state == 0) {
-        FILE *f = fopen(BIRD_PREVIEW_FILE, "rb");
-        bp_state = f ? 2 : 1;
-        if (f) fclose(f);
-    }
-    const uint64_t frame = renderer_present_count();
-    if (bp_state != 1) return;
-    if (bp_have && frame > bp_frame + 1) {  // (all of it that drew: write it)
-        bird_preview_write();
-        bp_state = 2;
-        return;
-    }
-    // (its pieces: body 6669, feather tips 1176, the head tuft's 30 and 15 (two), its eyes 180 (two); the texture each uses:
-    //  0 its body's, 1 the feather tips', 2 the eyes')
-    const uint32_t count = (uint32_t)r->x[2];
-    const int which = count == BIRD_BODY_VERTICES ? 0 : count == BIRD_SECOND_VERTICES ? 1 : count == 30 ? 2 : count == 15 ? 3
-                    : count == BIRD_EYE_VERTICES ? 4 : -1;
-    if (indexed || which < 0 || frame - bird_frame > 1 || (which && !(bp_have & 1)) || (which == 0 && (bp_have & 1))) return;
-    if (!bird_eye_tex) return;  // (not until its eyes have drawn once: they come in the frame it's captured in, then)
-    if (!in_pass || !st.rt.depth || !st.rt.ncolor || !st.rt.color[0]) return;  // (drawn in colour: not the shadow's pass, its pieces elsewhere)
-    if (which <= 2 && (bp_have & (1 << which))) return;  // (its body, feather tips and main tuft piece once: some draw twice, a
-    static int pairs[5];                               //  second pass elsewhere; its eyes and small tuft pieces in pairs)
-    if (which == 0) pairs[3] = pairs[4] = 0;
-    if (which >= 3 && pairs[which] >= (which == 4 ? 4 : 2)) return;  // (its eyes: both, drawn twice - the sockets pick them)
-    const bool rigid = which >= 2;
-    if (rigid && which != 4) {  // (its own pieces only: near its body - other things have pieces of these sizes too)
-        const Range *b0 = &st.ubuf[0][0];
-        if (!b0->addr || b0->size < 28 * 4) return;
-        const float *mm = (const float *)(uintptr_t)b0->addr + 16;
-        const float dx = mm[3] - bp_root[3], dy = mm[7] - bp_root[7], dz = mm[11] - bp_root[11];
-        if (dx * dx + dy * dy + dz * dz > 600.0f * 600.0f) return;
-    }
-    static uint64_t seen[16];  // (each draw once: both eyes and both tuft pieces share a mesh)
-    static int nseen;
-    const Range *bk = &st.ubuf[0][rigid ? 0 : 3];
-    uint64_t id = 1469598103934665603ull ^ count ^ st.vbuf[0].addr * 31;
-    if (bk->addr && bk->size >= 28 * 4) {
-        const uint32_t *mm = (const uint32_t *)(uintptr_t)bk->addr + (rigid ? 16 : 0);
-        for (int i = 0; i < 12; i++) id = (id ^ mm[i]) * 1099511628211ull;
-    }
-    for (int i = 0; i < nseen; i++) if (seen[i] == id) return;
-    if (nseen < 16) seen[nseen++] = id;
-    if (which >= 3) pairs[which]++;
-    uint32_t o_idx = 0, o_pos, o_nrm, o_uv;
-    if ((!rigid && !bp_attr(0x0b, 0, &o_idx)) || !bp_attr(0x22, 0, &o_pos) || !bp_attr(0x22, 1, &o_nrm) || !bp_attr(0x16, 0, &o_uv)) return;
-    const uint32_t stride = st.nstream ? st.stream[0][0] : 0, first = (uint32_t)r->x[1];
-    const Range *bones = &st.ubuf[0][rigid ? 0 : 3], *vb = &st.vbuf[0];
-    if (!stride || !vb->addr || (uint64_t)(first + count) * stride > vb->size || !bones->addr) return;
-    const float *pal = (const float *)(uintptr_t)bones->addr;
-    const uint32_t nmat = (uint32_t)(bones->size / 48);
-    if (which == 0) {  // (its root bone: the space it's kept in)
-        if (nmat < 1) return;
-        memcpy(bp_root, pal, sizeof bp_root);
-        const float *m = bp_root;
-        const float det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) + m[2] * (m[4] * m[9] - m[5] * m[8]);
-        if (fabsf(det) < 1e-12f) return;
-        const float idt = 1 / det;
-        const float inv[9] = {(m[5] * m[10] - m[6] * m[9]) * idt, (m[2] * m[9] - m[1] * m[10]) * idt, (m[1] * m[6] - m[2] * m[5]) * idt,
-                              (m[6] * m[8] - m[4] * m[10]) * idt, (m[0] * m[10] - m[2] * m[8]) * idt, (m[2] * m[4] - m[0] * m[6]) * idt,
-                              (m[4] * m[9] - m[5] * m[8]) * idt, (m[1] * m[8] - m[0] * m[9]) * idt, (m[0] * m[5] - m[1] * m[4]) * idt};
-        memcpy(bp_rinv, inv, sizeof inv);
-        bp_frame = frame;
-    }
-    if (bp_n + count > bp_cap) {
-        uint32_t cap = (bp_n + count) * 2;
-        BirdPreviewVtx *nv = realloc(bp_v, sizeof *nv * cap);
-        if (!nv) return;
-        bp_v = nv, bp_cap = cap;
-    }
-    const uint32_t tex = which == 1 ? 1 : which == 4 ? 2 : 0;
-    const uint8_t *base = (const uint8_t *)(uintptr_t)vb->addr;
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *v = base + (uint64_t)(first + i) * stride;
-        uint32_t bi = 0;
-        if (!rigid) memcpy(&bi, v + o_idx, 4);
-        if (bi >= nmat) bi = 0;
-        const float *M = rigid ? pal + 16 : pal + bi * 12;
-        float p[3], n[3], uv[2], wp[3], wn[3];
-        memcpy(p, v + o_pos, 12), memcpy(n, v + o_nrm, 12), memcpy(uv, v + o_uv, 8);
-        for (int k = 0; k < 3; k++) {
-            wp[k] = M[k * 4] * p[0] + M[k * 4 + 1] * p[1] + M[k * 4 + 2] * p[2] + M[k * 4 + 3] - bp_root[k * 4 + 3];
-            wn[k] = M[k * 4] * n[0] + M[k * 4 + 1] * n[1] + M[k * 4 + 2] * n[2];
-        }
-        BirdPreviewVtx *o = &bp_v[bp_n + i];
-        for (int k = 0; k < 3; k++) {
-            o->p[k] = bp_rinv[k * 3] * wp[0] + bp_rinv[k * 3 + 1] * wp[1] + bp_rinv[k * 3 + 2] * wp[2];
-            o->n[k] = bp_rinv[k * 3] * wn[0] + bp_rinv[k * 3 + 1] * wn[1] + bp_rinv[k * 3 + 2] * wn[2];
-        }
-        const float nl = sqrtf(o->n[0] * o->n[0] + o->n[1] * o->n[1] + o->n[2] * o->n[2]);
-        if (nl > 0) for (int k = 0; k < 3; k++) o->n[k] /= nl;
-        o->uv[0] = uv[0], o->uv[1] = uv[1], o->tex = tex;
-    }
-    uint32_t kept = count;
-    if (which == 4) {  // (its eyes come already in the world, a batch of more than one bird's: only the triangles at its head)
-        kept = 0;
-        for (uint32_t t = 0; t + 3 <= count; t += 3) {
-            const BirdPreviewVtx *q = &bp_v[bp_n + t];
-            float c[3] = {0, 0, 0};
-            for (int k = 0; k < 3; k++) for (int j = 0; j < 3; j++) c[j] += q[k].p[j] / 3;
-            if (c[0] * c[0] + c[1] * c[1] + c[2] * c[2] > 400.0f * 400.0f) continue;
-            memmove(&bp_v[bp_n + kept], q, sizeof *q * 3);
-            kept += 3;
-        }
-        if (!kept) { if (pairs[4]) pairs[4]--; return; }
-    }
-    bp_n += kept;
-    bp_have |= 1 << which;
-}
-
-// ---- Link's preview models (runtime/ui/coop_menu.mm): each outfit the first time he's seen in it with no file of it in the data
-// folder (link_preview_skyloft.bin, link_preview_classic.bin): every part of him drawn in one frame (own_link_kind), posed
-// by its bones, from the camera's view (0x7005b30e78, world to view) into his own space (his feet at 0, facing his way), with
-// each part's texture as the game has it. Tried again every LP_RETRY_FRAMES while a file is missing (another outfit later).
-#define LP_RETRY_FRAMES 600
-extern bool coop_my_yaw(float *out);
-static BirdPreviewVtx *lp_v;
-static uint32_t lp_n, lp_cap, lp_ntex, lp_code[24], lp_nseen;
-static uint64_t lp_seen[64];  // (each draw of him once: its vertices and its bones, as both hands and both eyes share a mesh)
-static NvnTexture *lp_tex[24];
-static uint64_t lp_frame, lp_next;
-static bool lp_on;
-static int lp_have_file[2] = {-1, -1};  // (skyloft, classic: -1 unknown, 0 missing, 1 there)
-static float lp_inv[12], lp_pos[3], lp_yaw;
-static const char *const LP_FILE[2] = {"link_preview_skyloft.bin", "link_preview_classic.bin"};
-
-static bool inv_affine(float o[12], const float m[12]) {
-    const float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], k = m[10];
-    const float det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
-    if (fabsf(det) < 1e-12f) return false;
-    const float id = 1 / det;
-    float r[12] = {(e * k - f * h) * id, (c * h - b * k) * id, (b * f - c * e) * id, 0, (f * g - d * k) * id, (a * k - c * g) * id,
-                   (c * d - a * f) * id, 0, (d * h - e * g) * id, (b * g - a * h) * id, (a * e - b * d) * id, 0};
-    for (int i = 0; i < 3; i++) r[i * 4 + 3] = -(r[i * 4] * m[3] + r[i * 4 + 1] * m[7] + r[i * 4 + 2] * m[11]);
-    memcpy(o, r, sizeof r);
-    return true;
-}
-
-static void link_preview_finish(void) {
-    lp_on = false;
-    lp_next = renderer_present_count() + LP_RETRY_FRAMES;
-    bool classic = false, skyloft = false;
-    for (uint32_t t = 0; t < lp_ntex; t++) classic |= lp_code[t] == KIND_TUNIC || lp_code[t] == KIND_HAT, skyloft |= lp_code[t] == KIND_TABARD;
-    if (classic == skyloft || !lp_n) return;  // (neither, or both: not a clear look at one outfit)
-    const int o = classic ? 1 : 0;
-    if (lp_have_file[o] == 1) return;
-    if (preview_write(LP_FILE[o], lp_v, lp_n, lp_tex, lp_code, lp_ntex)) {
-        lp_have_file[o] = 1;
-        LOG("[link] preview model saved (%s): %u vertices, %u textures\n", LP_FILE[o], lp_n, lp_ntex);
-    }
-}
-
-static void link_preview_capture(Prog *pr, CmdRec *r, bool indexed, int kind) {
-    for (int o = 0; o < 2; o++)
-        if (lp_have_file[o] < 0) {
-            FILE *f = fopen(LP_FILE[o], "rb");
-            lp_have_file[o] = f != NULL;
-            if (f) fclose(f);
-        }
-    if (lp_have_file[0] == 1 && lp_have_file[1] == 1) return;
-    const uint64_t frame = renderer_present_count();
-    if (lp_on && frame != lp_frame) link_preview_finish();
-    // (standing still for a moment first - his forward speed, +0x1dc, about 0 - so he's in his standing pose, not mid-run;
-    //  and his pieces are known as his from a frame after his big meshes)
-    static uint64_t moved = 0, last_check = 0;
-    if (frame != last_check) {
-        last_check = frame;
-        const uint64_t pl = *(const uint64_t *)(uintptr_t)0x7001826AD0ull;
-        float speed = 1;
-        if (pl >= 0x7002000000ull && pl < 0x7100000000ull) memcpy(&speed, (const void *)(uintptr_t)(pl + 0x1dc), 4);
-        if (!(fabsf(speed) < 0.05f)) moved = frame;
-    }
-    if (!lp_on) {
-        if (frame < lp_next || frame < moved + 30) return;
-        const float *view = (const float *)(uintptr_t)0x7005b30e78ull;
-        if (!inv_affine(lp_inv, view) || !coop_my_position(lp_pos) || !coop_my_yaw(&lp_yaw)) return;
-        lp_on = true, lp_frame = frame, lp_n = lp_ntex = lp_nseen = 0;
-    }
-    if (r->x[0] != 4) return;  // (triangle lists only)
-    const bool skinned = pr->vi->cbuf_mask == LINK_CBUFS;
-    const uint32_t count = (uint32_t)r->x[2];
-    const Range *bk = &st.ubuf[0][skinned ? 3 : 0];
-    uint64_t id = 1469598103934665603ull ^ count ^ st.vbuf[0].addr * 31;
-    if (bk->addr && bk->size >= 28 * 4) {  // (and where its bones put it)
-        const uint32_t *m = (const uint32_t *)(uintptr_t)bk->addr + (skinned ? 0 : 16);
-        for (int i = 0; i < 12; i++) id = (id ^ m[i]) * 1099511628211ull;
-    }
-    for (uint32_t i = 0; i < lp_nseen; i++) if (lp_seen[i] == id) return;  // (once a draw)
-    if (lp_nseen < 64) lp_seen[lp_nseen++] = id;
-    if (!skinned) {  // (the layout of his pieces fixed to one bone, once each)
-        static uint32_t told[8];
-        static int ntold;
-        bool was = false;
-        for (int i = 0; i < ntold; i++) was |= told[i] == count;
-        if (!was && ntold < 8) {
-            told[ntold++] = count;
-            LOG("[link] preview: piece %u (kind %d), stride %u:", count, kind, st.nstream ? st.stream[0][0] : 0);
-            for (int a = 0; a < st.nattrib; a++) LOG(" %#x@%u/s%u", st.attrib[a] & 0xff, st.attrib[a] >> 13, st.attrib[a] >> 8 & 0x1f);
-            LOG("\n");
-        }
-    }
-    uint32_t o_idx = 0, o_pos, o_nrm, o_uv;
-    if ((skinned && !bp_attr(0x0b, 0, &o_idx)) || !bp_attr(0x22, 0, &o_pos) || !bp_attr(0x22, 1, &o_nrm) || !bp_attr(0x16, 0, &o_uv)) {
-        static int told;
-        if (told++ < 8) {
-            LOG("[link] preview: part %u (kind %d) not in the layout known, left out:", count, kind);
-            for (int a = 0; a < st.nattrib; a++) LOG(" %#x@%u", st.attrib[a] & 0xff, st.attrib[a] >> 13);
-            LOG("\n");
-        }
-        return;
-    }
-    NvnTexture *best = NULL;  // (its main texture: the largest ASTC one, as look_texture_swap's)
-    for (int i = 0; i < pr->fi->ntex; i++) {
-        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
-        if (!t || t->format < 0x79 || t->format > 0x84) continue;
-        if (!best || (uint64_t)t->width * t->height > (uint64_t)best->width * best->height) best = t;
-    }
-    if (!best) return;
-    uint32_t te = 0;
-    while (te < lp_ntex && !(lp_tex[te] == best && lp_code[te] == (uint32_t)kind)) te++;
-    if (te == lp_ntex) {
-        if (lp_ntex >= 24) return;
-        lp_tex[lp_ntex] = best, lp_code[lp_ntex] = (uint32_t)kind, lp_ntex++;
-    }
-    // (its vertices: `count` from the first (x[1]); indexed, through its indices (x[3], type x[1]: 2 u16, else u32) from
-    // its base vertex (x[4]) - his eyes and hands are drawn so)
-    const uint32_t stride = st.nstream ? st.stream[0][0] : 0, first = indexed ? 0 : (uint32_t)r->x[1];
-    const uint32_t itype = (uint32_t)r->x[1];
-    const uint8_t *ib = indexed ? (const uint8_t *)(uintptr_t)r->x[3] : NULL;
-    const int32_t vbase = indexed ? (int32_t)r->x[4] : 0;
-    const Range *bones = &st.ubuf[0][skinned ? 3 : 0], *vb = &st.vbuf[0];
-    if (!stride || !vb->addr || !bones->addr || (indexed && !ib)) return;
-    if (!indexed && (uint64_t)(first + count) * stride > vb->size) return;
-    const float *pal = (const float *)(uintptr_t)bones->addr;
-    const uint32_t nmat = (uint32_t)(bones->size / 48);
-    if (lp_n + count > lp_cap) {
-        uint32_t cap = (lp_n + count) * 2;
-        BirdPreviewVtx *nv = realloc(lp_v, sizeof *nv * cap);
-        if (!nv) return;
-        lp_v = nv, lp_cap = cap;
-    }
-    const float cy = cosf(-lp_yaw), sy = sinf(-lp_yaw);
-    const uint8_t *base = (const uint8_t *)(uintptr_t)vb->addr;
-    for (uint32_t i = 0; i < count; i++) {
-        int64_t vi = first + i;
-        if (indexed) vi = vbase + (int64_t)(itype == 1 ? ((const uint16_t *)ib)[i] : itype == 2 ? ((const uint32_t *)ib)[i] : ib[i]);
-        if (vi < 0 || (uint64_t)(vi + 1) * stride > vb->size) vi = 0;
-        const uint8_t *v = base + (uint64_t)vi * stride;
-        uint32_t bi = 0;
-        if (skinned) memcpy(&bi, v + o_idx, 4);
-        if (bi >= nmat) bi = 0;
-        const float *M = skinned ? pal + bi * 12 : pal + 16;
-        float p[3], n[3], uv[2], vp[3], vn[3], wp[3], wn[3];
-        memcpy(p, v + o_pos, 12), memcpy(n, v + o_nrm, 12), memcpy(uv, v + o_uv, 8);
-        for (int k = 0; k < 3; k++) {  // (posed, in the camera's view)
-            vp[k] = M[k * 4] * p[0] + M[k * 4 + 1] * p[1] + M[k * 4 + 2] * p[2] + M[k * 4 + 3];
-            vn[k] = M[k * 4] * n[0] + M[k * 4 + 1] * n[1] + M[k * 4 + 2] * n[2];
-        }
-        for (int k = 0; k < 3; k++) {  // (in the world, from his feet)
-            wp[k] = lp_inv[k * 4] * vp[0] + lp_inv[k * 4 + 1] * vp[1] + lp_inv[k * 4 + 2] * vp[2] + lp_inv[k * 4 + 3] - lp_pos[k];
-            wn[k] = lp_inv[k * 4] * vn[0] + lp_inv[k * 4 + 1] * vn[1] + lp_inv[k * 4 + 2] * vn[2];
-        }
-        BirdPreviewVtx *o = &lp_v[lp_n + i];
-        // (turned back by his way: facing his own front)
-        o->p[0] = cy * wp[0] + sy * wp[2], o->p[1] = wp[1], o->p[2] = -sy * wp[0] + cy * wp[2];
-        o->n[0] = cy * wn[0] + sy * wn[2], o->n[1] = wn[1], o->n[2] = -sy * wn[0] + cy * wn[2];
-        const float nl = sqrtf(o->n[0] * o->n[0] + o->n[1] * o->n[1] + o->n[2] * o->n[2]);
-        if (nl > 0) for (int k = 0; k < 3; k++) o->n[k] /= nl;
-        o->uv[0] = uv[0], o->uv[1] = uv[1], o->tex = te;
-    }
-    lp_n += count;
 }
 
 // Your Loftwing's HUD icons (texpatch_bird_icon: the altitude gauge's bird, the dash feathers, the bird marker) in its colours:
@@ -5164,18 +4824,13 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!dup_drawing && (g_skin_dump == 2 || pr->vi->cbuf_mask == LINK_CBUFS || (pr->vi->cbuf_mask == LINK_RIGID_CBUFS && st.ds[1])))
         skin_texture_dump(pr, (uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS);
     if (dup_drawing) look_texture_swap(pr, true, link_kind((uint32_t)r->x[2], pr->vi->cbuf_mask != LINK_CBUFS));
-    else {
-        const int own = own_link_kind(pr, r);
-        if (own >= 0) link_preview_capture(pr, r, indexed, own);  // (his preview's models, once an outfit)
-        look_texture_swap(pr, false, own);
-    }
+    else look_texture_swap(pr, false, own_link_kind(pr, r));
     if (!dup_drawing && !swap_to && g_is_skyward && in_pass && pr->vi->cbuf_mask == LINK_CBUFS)  // (your Loftwing)
         bird_texture_swap(pr, r->x[2] == BIRD_BODY_VERTICES ? BIRD_BODY : r->x[2] == BIRD_SECOND_VERTICES ? BIRD_SECOND : BIRD_NONE, NULL);
     if (!dup_drawing && g_is_skyward) { NvnTexture *f = swap_from, *t2 = swap_to; bird_texture_any(pr, r); if (t2) swap_from = f, swap_to = t2; }  // (its other meshes)
     if (!dup_drawing && !swap_to && g_is_skyward && in_pass && pr->vi->cbuf_mask == LINK_RIGID_CBUFS && r->x[2] == BIRD_EYE_VERTICES)
         bird_texture_swap(pr, BIRD_EYE, NULL);  // (its eyes)
     if (!dup_drawing && g_is_skyward && !swap_to) bird_icon_swap(pr);  // (its HUD icons)
-    if (!dup_drawing && g_is_skyward && bird_body_tex) bird_preview_capture(r, indexed);  // (the preview's model, once)
     if (g_bird_capture == 2 && !dup_drawing && g_is_skyward && renderer_present_count() == bird_frame && r->x[2] < 400) {
         // (debugging: every small draw in your bird's frame, with where each of its uniform buffers' matrices would put it
         //  against its body's root, and its textures - to find its eyes)
