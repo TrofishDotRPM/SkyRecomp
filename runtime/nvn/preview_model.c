@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "../platform.h"  // (pread on Windows)
 #include "astc.h"
 #include "tegra.h"
 

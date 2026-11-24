@@ -8,7 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <thread>
+#include <pthread.h>
 #include <vector>
 
 #include "imgui.h"
@@ -295,7 +295,13 @@ std::atomic<int> g_build{0};
 void models_build_start() {
     int idle = 0;
     if (!g_build.compare_exchange_strong(idle, 1)) return;
-    std::thread([] { g_build = preview_models_build(g_bird.file, g_link[0].file, g_link[1].file) ? 2 : 3; }).detach();
+    pthread_t t;
+    if (pthread_create(&t, NULL, [](void *) -> void * {
+            g_build = preview_models_build(g_bird.file, g_link[0].file, g_link[1].file) ? 2 : 3;
+            return NULL;
+        }, NULL) == 0)
+        pthread_detach(t);
+    else g_build = 3;
 }
 
 bool model_load(Model &m) {
