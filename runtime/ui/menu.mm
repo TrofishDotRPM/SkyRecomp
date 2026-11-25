@@ -901,7 +901,10 @@ static void tab_about(void) {
     slider("Gyro sensitivity", &g_settings.gyro_sens, 0.1f, 2.0f, "%.2fx");
     hint("How far the aim moves when you turn a controller with a gyro (bow, slingshot, first-person view). "
          "1.00x = the controller's own motion; lower it if the aim is too twitchy.");
-    toggle("Touchpad sword", &g_settings.touch_sword);
+    ImGui::Spacing();
+    header("Steam Deck / Steam Controller");
+    toggle("Touchpad sword (right touchpad)", &g_settings.touch_sword);
+    if (!g_settings.touch_sword) hint("Swing the sword with the right touchpad, keeping the right stick on the camera.");
     if (g_settings.touch_sword) {
         slider("Touchpad sword sensitivity", &g_settings.touch_sens, 0.25f, 3.0f, "%.2fx");
         hint("For controllers with two touchpads (Steam Controller, Steam Deck; Steam Input off for this game). "

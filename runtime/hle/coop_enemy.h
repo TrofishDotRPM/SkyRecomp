@@ -20,6 +20,8 @@ void coop_enemy_set_gone_sender(void (*fn)(uint16_t profile, uint32_t id));
 void coop_enemy_gone(uint16_t profile, uint32_t id);
 // Shared health (once coop_enemies.txt says where it is): who to tell of a drop here, and one the other's game says.
 void coop_enemy_set_hp_sender(void (*fn)(uint32_t id, uint16_t hp));
+void coop_enemy_set_word_sender(void (*fn)(uint32_t id, int k, uint16_t v));
+void coop_enemy_word(uint32_t id, int k, uint16_t v);
 void coop_enemy_hp(uint32_t id, uint16_t hp);
 // More types: a line (see coop_enemy.c), on the game thread. And the host's added lines, to send to whoever joins.
 bool coop_enemy_add_type(const char *line);

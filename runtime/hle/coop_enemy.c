@@ -1,4 +1,4 @@
-// Co-op enemies driven by the host (bats and chuchus so far). The host sends, for each live one, where it is, which way it
+// Co-op enemies driven by the host (bats, chuchus, Deku Babas and Bokoblins tested; the rest of the game's found, untested). The host sends, for each live one, where it is, which way it
 // faces, its size, its AI state and its animation; a joining player's take those just before each of their updates, so
 // they move where the host's move, doing what they do. Their own update still runs after (it places their model), from the
 // host's state.
@@ -19,6 +19,12 @@
 
 #define UPDATE_SLOT 20
 #define SHAPE_N 20
+#define CLIP_FRAME 0x28
+#define CLIP_RATE 0x2c
+#define CLIP_START 0x30
+#define CLIP_END 0x34
+#define CLIP_RES 0x40
+static uint64_t clip_obj(uint64_t at);
 typedef struct {
     const char *name;
     uint16_t profile;
@@ -56,8 +62,39 @@ typedef struct {
     // translation last), its up (+0x24c, tilted with him), its offset from him (+0x8a8) and +0xcb8. A copy's update ran
     // its stand-in state, so on this player's screen it floated upright on the other player instead of wrapping him
     int shape[SHAPE_N];
+    // scn: its scene model's pointer (0: none). Its bones are worked out in its update (the model's calc, from its matrix and
+    // clip then): standing in, that was the stand-in state's pose (a carried Remlit sat as in its Wait). With its look the
+    // other's again after the update, its bones are worked out once more, as its update does (+0x18: the model's matrix)
+    int scn;
+    // mdl: its animated model (m3d's, 0: none), to put the other's animation on by name through the game's own setAnm: a
+    // clip's resource written in place isn't bound to its bones (a carried Remlit kept its Wait's pose under the Hold clip)
+    int mdl;
+    // mirror: one an enemy fires (a projectile): a joining player's following copies don't make their own (each crossing of
+    // the frame it's fired on made another: an Octorok's fired at that player, four at once); the host's are made there
+    // instead, where they are (coop_enemy_mirror), each with the host's parameters (its words: +0xc and +0x12c), and gone
+    // as soon as the host's is
+    bool mirror;
+    // face: following, it faces the host's way: its update turned it to this player's Link (a Guay swooping at the other
+    // player faced this one). Its model's turn (its shape's first 12 words, the matrix +0x1f4) is the host's after its update,
+    // and its bones worked out again (scn)
+    bool face;
+    bool aim;  // (a projectile the host's game fired at the other player, its shooter facing them: aim_at_other)
+    // ride: the state (by name, cls's) it rides a Link in (a Guay's drop stuck on him). Following one riding the other player,
+    // its update isn't run: it put it among this player's targets (it's the host's to run, where it is and its end); its
+    // model's matrix the host's (its shape) and its bones worked out (scn)
+    const char *ride;
+    // only_less: words (bit k: words[k]) that only lose bits - kept as the AND of its own and the other's, so what's gone in
+    // either game stays gone (a Moblin's shield pieces: one cut in the joining player's game, then the host's whole mask
+    // written over it, grew back at once and was cut again and again)
+    uint8_t only_less;
+    // death: killed in the other game, this one dies its own death - its health 0, into this state (by name, cls's) - rather
+    // than being removed: what its death does happens here too (a Geko's explosion, seen and felt only in the game of the
+    // player who killed it). Removed as before if it's still about DEATH_MS later
+    const char *death;
 } EnemyType;
-#define MAX_TYPES 16
+#define MAX_TYPES 48
+#define DEATH_MS 4000  // (EnemyType.death: one killed in the other game, dying its own death here)
+static struct { uint64_t self; uint64_t at; bool started; } g_death[8];
 static EnemyType TYPES[MAX_TYPES] = {
     {"bat", 0x16d, 0x700157de18ull, {0xcd8, 0xd00, 0xd08, 0xd10}, 0x530, 0, {0}, "dAcEKs_c", "Wait", "WakeUp", 0xce0, 350, {0}, 0},
     // (dAcEsm_c's states, from the game's own names: Wait Walk Attack BirthJump Absorption Shake Fusion Electrical Dead)
@@ -72,8 +109,118 @@ static EnemyType TYPES[MAX_TYPES] = {
      true, false, 0xb38},
     {"bokoblin", 0x17e, 0x7001573a90ull, {0x1920, 0x1948, 0x1950, 0x1958}, 0x510, 0, {0xf90, 0x1180, 0x1aac}, NULL, NULL, NULL, 0, 0,
      {NULL, NULL}, NULL, false, true, 0x4d0},
+    // ---- the rest, in the order they're met in the game (the first stage each is placed in: each stage's rooms' actor names,
+    // runtime's actor table). Untested: found from the game itself, as for the four above - each one's constructor (its
+    // profile's build function, from the profile table 0x7001674448) stores its vtable at +0, its state machine's vtable
+    // (0x7001689080, the same for all) where its state machine is (its state 0x20 after, as above), and before each of its
+    // animated models' frame block a model's vtable (0x7001688940, at -0x88) - its animation: the first of them. No resource
+    // slot after it (nores): another model's block right behind (0x7001688b20 at +0x28), as a Deku Baba's.
+    // (E_REMLY: Skyloft at night. Picked up (its Hold), Link carries it: the game of the player carrying it runs it, as a chuchu
+    // holding one - the other's stands in its Wait, kept where the carrier's is and as it looks there. Tested 2026-11-23)
+    // (its look as carried - its model's matrix +0x1f4, built in its update from where its stand-in left it, 30 lower and turned
+    //  by its other angle +0x1d4 - is taken from the carrier's after it, as a chuchu's. Only the matrix: the shape's words are
+    //  checked as floats, and the angle's two s16s aren't one)
+    {"remlit", 0x170, 0x7001582ae8ull, {0x498, 0x4c0, 0x4c8, 0x4d0}, 0x590, 0, {0}, "dAcEremly_c", NULL, NULL, 0x4a0, 0, {"Hold", NULL},
+     "Wait", false, false, 0x550, 0, 0, true, 0,  // (its clip: 0x40 before its animation, as a Deku Baba's and a Bokoblin's)
+     {0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220}, 0x528, 0x4f0},
+    // (E_KG: walks walls and roofs - the Aracha, its archive MoldoGut_Baby; placed in Lanayru (Mining Facility, Sand Sea))
+    {"aracha", 0x1a5, 0x700157d648ull, {0x1090, 0x10b8, 0x10c0, 0x10c8}, 0x510, 0, {0}, NULL, NULL, NULL, 0x1098, 0, {NULL, NULL}, NULL, false, false},
+    // (E_OR: Faron Woods)
+    {"octorok", 0x15c, 0x7001581410ull, {0x5e8, 0x610, 0x618, 0x620}, 0x510, 0, {0}, NULL, NULL, NULL, 0x5f0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_GUE: Faron Woods)
+    // (its states entered through its own state machine: its start sets up what a sword hits - a joining player's never
+    // took a hit; it faces the host's way, pinned. Tested 2026-11-24)
+    // (w: its two attack colliders' flags (dCcD spheres at +0xac8 and +0xc98, their mObjAt flags 0x38 in, as a chuchu's +0x638):
+    //  on when the host's are - its dive hit a joining player in their own game only by chance before)
+    {"guay", 0x188, 0x70015791c8ull, {0xf90, 0xfb8, 0xfc0, 0xfc8}, 0x510, 0, {0xb00, 0xcd0}, NULL, NULL, NULL, 0xf98, 0, {NULL, NULL}, NULL, false, true,
+     0, 0, 0, true, 0, {0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220}, 0x4a8, 0, false, true},
+    // (E_MR: Faron Woods (its shield is its own actor, not synced))
+    // (faces the host's way, pinned, as a Guay: it turned to this player's Link. w: its shield - 8 pieces (Moriburin_shield1-8),
+    //  +0x1d10 the mask of those it still holds (0xff whole; a cut or a break clears some, and +0x1d20 the ones just lost, the
+    //  piece that falls away being an actor of its own, E_MR_SHIELD, made with it): the other game's shows the same cut. The
+    //  falling piece is only in the game it was cut in. Tested 2026-11-24)
+    // (enter: into each state through its own state machine - its ShieldCut's start cuts the shield, shown only by that)
+    {"moblin", 0xc1, 0x70015800b0ull, {0xdb0, 0xdd8, 0xde0, 0xde8}, 0x510, 0, {0x1d10}, NULL, NULL, NULL, 0xdb8, 0, {NULL, NULL}, NULL, false, true,
+     0, 0, 0, true, 0, {0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220}, 0x4a8, 0, false, true, false, NULL, 1},
+    // (E_GEKO: Faron Woods. Its explosion as it dies happens in both games: its copy follows into Damage with its health
+    //  shared at 0. Tested 2026-11-24)
+    // (enter: into each state through its own state machine - its Damage's start is its explosion: followed into it without,
+    //  the host's copy of one the joining player killed just went)
+    {"geko", 0x158, 0x70015786c0ull, {0xd08, 0xd30, 0xd38, 0xd40}, 0x510, 0, {0}, "dAcEgeko_c", NULL, NULL, 0xd10, 0, {NULL, NULL}, NULL, false,
+     true, 0, 0, 0, false, 0, {0}, 0, 0, false, false, false, NULL, 0, "Damage"},
+    // (E_HYDRA: Skyview Temple; no animation block found)
+    {"staldra", 0x175, 0x700157c8d8ull, {0x498, 0x4c0, 0x4c8, 0x4d0}, 0x0, 0, {0}, NULL, NULL, NULL, 0x4a0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_SF: Skyview Temple)
+    {"stalfos", 0x167, 0x7001583608ull, {0xce8, 0xd10, 0xd18, 0xd20}, 0x510, 0, {0}, NULL, NULL, NULL, 0xcf0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_ST: Skyview Temple: holds Link in Hug - not handled like a chuchu's hold yet; no animation block found)
+    {"skulltula", 0x169, 0x7001585d28ull, {0x498, 0x4c0, 0x4c8, 0x4d0}, 0x0, 0, {0}, NULL, NULL, NULL, 0x4a0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_WS: Skyview Temple: Hug, as above)
+    {"walltula", 0x190, 0x7001587470ull, {0x908, 0x930, 0x938, 0x940}, 0x510, 0, {0}, NULL, NULL, NULL, 0x910, 0, {NULL, NULL}, NULL, false, false},
+    // (E_HP)
+    {"e_hp", 0x186, 0x700157c260ull, {0x1540, 0x1568, 0x1570, 0x1578}, 0x510, 0, {0}, NULL, NULL, NULL, 0x1548, 0, {NULL, NULL}, NULL, false, false},
+    // (E_HIDOKARI: Eldin Volcano)
+    {"pyrup", 0x173, 0x700157af58ull, {0x4c8, 0x4f0, 0x4f8, 0x500}, 0x5c0, 0, {0}, NULL, NULL, NULL, 0x4d0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_HIDOKARIS: Eldin Volcano)
+    {"pyrup_s", 0x174, 0x700157b490ull, {0x438, 0x460, 0x468, 0x470}, 0x520, 0, {0}, NULL, NULL, NULL, 0x440, 0, {NULL, NULL}, NULL, false, false},
+    // (E_MAGMA: Eldin Volcano)
+    {"magma", 0x163, 0x700157ef58ull, {0x548, 0x570, 0x578, 0x580}, 0x4b0, 0, {0}, NULL, NULL, NULL, 0x550, 0, {NULL, NULL}, NULL, true, false},
+    // (E_PH: Eldin Volcano)
+    {"e_ph", 0xc2, 0x7001581bb0ull, {0x608, 0x630, 0x638, 0x640}, 0x510, 0, {0}, NULL, NULL, NULL, 0x610, 0, {NULL, NULL}, NULL, false, false},
+    // (E_LIZARUFOS: Earth Temple (its tail is its own actor))
+    {"lizalfos", 0x171, 0x700157ea78ull, {0x568, 0x590, 0x598, 0x5a0}, 0x510, 0, {0}, NULL, NULL, NULL, 0x570, 0, {NULL, NULL}, NULL, false, false},
+    // (E_MAGUPPO: Earth Temple)
+    {"maguppo", 0x164, 0x700157f678ull, {0xcc8, 0xcf0, 0xcf8, 0xd00}, 0x510, 0, {0}, NULL, NULL, NULL, 0xcd0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_SYAKOMAITO: Lanayru Desert)
+    {"syakomaito", 0xc0, 0x7001586970ull, {0x618, 0x640, 0x648, 0x650}, 0x510, 0, {0}, NULL, NULL, NULL, 0x620, 0, {NULL, NULL}, NULL, false, false},
+    // (E_GEROCK: Lanayru Desert)
+    {"gerock", 0x18c, 0x7001578c48ull, {0x10a0, 0x10c8, 0x10d0, 0x10d8}, 0x510, 0, {0}, NULL, NULL, NULL, 0x10a8, 0, {NULL, NULL}, NULL, false, false},
+    // (E_BCE: Lanayru)
+    {"bokoblin_e", 0x17f, 0x7001574e50ull, {0x1698, 0x16c0, 0x16c8, 0x16d0}, 0x510, 0, {0}, NULL, NULL, NULL, 0x16a0, 0, {NULL, NULL}, NULL, false, true},
+    // (E_BEAMOS: Lanayru Mining Facility)
+    {"beamos", 0x156, 0x7001576018ull, {0x1bf8, 0x1c20, 0x1c28, 0x1c30}, 0x528, 0, {0}, NULL, NULL, NULL, 0x1c00, 0, {NULL, NULL}, NULL, false, false},
+    // (E_GUNHO: Lanayru Mining Facility)
+    {"gunho", 0x176, 0x7001579b30ull, {0x498, 0x4c0, 0x4c8, 0x4d0}, 0x5c0, 0, {0}, NULL, NULL, NULL, 0x4a0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_AM: Lanayru Mining Facility; its archive Amos)
+    {"armos", 0x14f, 0x7001572850ull, {0x5e8, 0x610, 0x618, 0x620}, 0x510, 0, {0}, NULL, NULL, NULL, 0x5f0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_BFISH: Lake Floria)
+    {"bfish", 0x178, 0x7001572de0ull, {0x498, 0x4c0, 0x4c8, 0x4d0}, 0x590, 0, {0}, NULL, NULL, NULL, 0x4a0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_HIDORY: Ancient Cistern; no animation block found)
+    {"hidory", 0x18e, 0x7001572220ull, {0xf58, 0xf80, 0xf88, 0xf90}, 0x0, 0, {0}, NULL, NULL, NULL, 0xf60, 0, {NULL, NULL}, NULL, false, false},
+    // (E_BCZ: Ancient Cistern: holds Link (Hold*) - not handled yet)
+    {"cursed_bokoblin", 0x184, 0x7001575878ull, {0x10c0, 0x10e8, 0x10f0, 0x10f8}, 0x548, 0, {0}, NULL, NULL, NULL, 0x10c8, 0, {NULL, NULL}, NULL, false, true},
+    // (E_SF4: Ancient Cistern)
+    {"stalmaster", 0x168, 0x7001583c38ull, {0xec0, 0xee8, 0xef0, 0xef8}, 0x510, 0, {0}, NULL, NULL, NULL, 0xec8, 0, {NULL, NULL}, NULL, false, false},
+    // (E_SKYTAIL: the sky)
+    {"skytail", 0x185, 0x7001584590ull, {0x15d0, 0x15f8, 0x1600, 0x1608}, 0x510, 0, {0}, NULL, NULL, NULL, 0x15d8, 0, {NULL, NULL}, NULL, false, false},
+    // (E_SPARK)
+    {"spark", 0x162, 0x70015851a0ull, {0x12f8, 0x1320, 0x1328, 0x1330}, 0x5a0, 0, {0}, NULL, NULL, NULL, 0x1300, 0, {NULL, NULL}, NULL, false, false},
+    // (E_GUMARM: Fire Sanctuary)
+    {"gumarm", 0x6e, 0x7001579490ull, {0xd00, 0xd28, 0xd30, 0xd38}, 0x510, 0, {0}, NULL, NULL, NULL, 0xd08, 0, {NULL, NULL}, NULL, false, false},
+    // (E_KGIRA)
+    {"kgira", 0x17c, 0x700157e200ull, {0x7e8, 0x810, 0x818, 0x820}, 0x510, 0, {0}, NULL, NULL, NULL, 0x7f0, 0, {NULL, NULL}, NULL, false, false},
+    // (E_HOC)
+    {"bokoblin_hoc", 0x17a, 0x700157bc80ull, {0x1678, 0x16a0, 0x16a8, 0x16b0}, 0x528, 0, {0}, NULL, NULL, NULL, 0x1680, 0, {NULL, NULL}, NULL, false, true},
+    // (E_OC)
+    {"bokoblin_oc", 0x17b, 0x7001580e58ull, {0x14a8, 0x14d0, 0x14d8, 0x14e0}, 0x558, 0, {0}, NULL, NULL, NULL, 0x14b0, 0, {NULL, NULL}, NULL, false, true},
+    // (E_BCAL)
+    {"bokoblin_archer", 0x180, 0x70015743c8ull, {0xdb8, 0xde0, 0xde8, 0xdf0}, 0x510, 0, {0}, NULL, NULL, NULL, 0xdc0, 0, {NULL, NULL}, NULL, false, true},
+    // (E_GE)
+    {"e_ge", 0x18a, 0x7001578270ull, {0xc58, 0xc80, 0xc88, 0xc90}, 0x510, 0, {0}, NULL, NULL, NULL, 0xc60, 0, {NULL, NULL}, NULL, false, false},
+    // (E_BS)
+    {"e_bs", 0x166, 0x7001576618ull, {0xec8, 0xef0, 0xef8, 0xf00}, 0x510, 0, {0}, NULL, NULL, NULL, 0xed0, 0, {NULL, NULL}, NULL, false, false},
+    // (COMMON_BULLET: the rock an Octorok (and others) fire. Each game's enemy fires its own: the joining player's is paired
+    // with the host's and flies where it does, pinned - aimed at whoever the host's aimed at, so it hits that player in their
+    // own game. Tested 2026-11-23 with Octoroks)
+    {"rock", 0xbf, 0x70015707b0ull, {0xbb0, 0xbd8, 0xbe0, 0xbe8}, 0, 0, {0xc, 0x12c}, NULL, NULL, NULL, 0xbb8, 0, {NULL, NULL}, NULL, false,
+     false, 0, 0, 0, true, 0, {0}, 0, 0, true, false, true},
+    // (GUE_BULLET: what a Guay drops on Link - mirrored as the rock is, not aimed)
+    // (its Hold: stuck on a Link - one stuck on the joining player is theirs to run, as a chuchu holding them, the host's
+    //  following it; one on the host, the joining player's stands in its Wait, not run (ride) - not theirs to target)
+    {"guay_drop", 0x189, 0x7001570c90ull, {0xc10, 0xc38, 0xc40, 0xc48}, 0x4b8, 0, {0xc, 0x12c}, "dAcBulletGue_c", NULL, NULL, 0xc18, 0,
+     {"Hold", NULL}, "Wait", false, false, 0, 0, 0, true, 0, {0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220},
+     0x450, 0, true, false, false, "Hold"},
 };
-#define BUILTIN_TYPES 4
+#define BUILTIN_TYPES 42
 static int g_ntypes = BUILTIN_TYPES;  // (the ones above; more from coop_enemies.txt, or sent by the host: coop_enemy_add_type)
 #define NTYPES g_ntypes
 #define PLAYER_PTR 0x7001826AD0ull
@@ -144,6 +291,10 @@ static struct { uint16_t profile; uint32_t id; bool hurt; } g_sent[64];  // (the
 // add up, and whichever takes it to nothing kills it (and its death is shared as any is).
 static int g_hp_off = 0x42e;  // (measured in 1.0.0: a Bokoblin's 12, 4 a sword hit; an "hp" line can still move it)
 static void (*g_send_hp)(uint32_t id, uint16_t hp);
+// A joining player: an only_less word (EnemyType.only_less) that lost bits in their game (a Moblin's shield cut by them, in a
+// state that isn't a hit's: its guard's) goes to the host, whose own loses them too (coop_enemy_word)
+static void (*g_send_word)(uint32_t id, int k, uint16_t v);
+void coop_enemy_set_word_sender(void (*fn)(uint32_t id, int k, uint16_t v)) { g_send_word = fn; }
 void coop_enemy_set_hp_sender(void (*fn)(uint32_t id, uint16_t hp)) { g_send_hp = fn; }
 #define HP_TRACK 64
 static struct { uint64_t self; uint32_t id; uint16_t hp; uint64_t seen; } g_hp[HP_TRACK];
@@ -187,8 +338,10 @@ static bool hurt_state(uint64_t st) {
     n += 8;
     // (a Bokoblin's dying state is "Fail": dAcEbc_c::StateID_Fail; a Deku Baba hit goes Damage -> Blow / Stun before
     // it's back to Wait, and following the host's in the middle of that flips its states and sprays its hit effect)
+    // (a Moblin's ShieldCut: its shield cut by this player - theirs for a while, the host's then following theirs)
     return strstr(n, "Damage") || strstr(n, "Dead") || strstr(n, "Death") || strstr(n, "Die") || strstr(n, "Kill") ||
-           !strcmp(n, "Fail") || !strcmp(n, "Stun") || !strcmp(n, "Blow");
+           !strcmp(n, "Fail") || !strcmp(n, "Stun") || !strcmp(n, "Blow") || !strcmp(n, "ShieldCut") ||
+           !strcmp(n, "Reflect");  // (a Geko knocked back by this player's sword: its knock-back theirs to play)
 }
 
 // A death (not a hurt it gets over): the state it dies in. Followed into, its own update ends it at once (that state's start
@@ -231,6 +384,7 @@ static struct { uint64_t self; uint16_t profile; uint32_t id; uint64_t seen; boo
 #define ORPHAN_MS 2000  // (entered: its
 // state's start has run here, once paired: in the state the host's is already in, there's no change to run it)
 static int g_nmap;
+static bool mirrored(uint16_t profile);
 
 static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pair) {
     const uint64_t now = SDL_GetTicks();
@@ -241,7 +395,7 @@ static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pai
         if (g_map[i].self == self && g_map[i].profile == profile && now - g_map[i].seen < MAP_FORGET_MS) {
             g_map[i].seen = now;
             if (!fresh || find(f, profile, g_map[i].id)) { g_map[i].in_frame = now; return g_map[i].id; }
-            if (now - g_map[i].in_frame < LOST_MS || !pair) return g_map[i].id;
+            if ((now - g_map[i].in_frame < LOST_MS && !mirrored(profile)) || !pair) return g_map[i].id;
             lost = i;
             break;
         }
@@ -260,7 +414,7 @@ static uint32_t map_key(uint64_t self, uint16_t profile, uint16_t flag, bool pai
         if (d < best_d) best_d = d, best = c;
     }
     if (!best) {
-        if (lost >= 0 && now - g_map[lost].in_frame >= ORPHAN_MS && *(uint8_t *)(uintptr_t)(self + 0x13) == 0) {
+        if (lost >= 0 && now - g_map[lost].in_frame >= (mirrored(profile) ? 0 : ORPHAN_MS) && *(uint8_t *)(uintptr_t)(self + 0x13) == 0) {
             *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (fBase_c's delete request, as a kill's removal)
             LOG("[coop] enemies: a %#x the host hasn't got any more (its was %#x): removed here\n", profile, g_map[lost].id);
         }
@@ -375,11 +529,19 @@ static void sm_change(int ty, Cpu *c) {
     g_sm_change[ty](c);
 }
 #define SMC(n) static void sm_change_##n(Cpu *c) { sm_change(n, c); }
-SMC(0) SMC(1) SMC(2) SMC(3) SMC(4) SMC(5) SMC(6) SMC(7) SMC(8) SMC(9) SMC(10) SMC(11) SMC(12) SMC(13) SMC(14) SMC(15)
+SMC(0) SMC(1) SMC(2) SMC(3) SMC(4) SMC(5) SMC(6) SMC(7) SMC(8) SMC(9) SMC(10) SMC(11)
+SMC(12) SMC(13) SMC(14) SMC(15) SMC(16) SMC(17) SMC(18) SMC(19) SMC(20) SMC(21) SMC(22) SMC(23)
+SMC(24) SMC(25) SMC(26) SMC(27) SMC(28) SMC(29) SMC(30) SMC(31) SMC(32) SMC(33) SMC(34) SMC(35)
+SMC(36) SMC(37) SMC(38) SMC(39) SMC(40) SMC(41) SMC(42) SMC(43) SMC(44) SMC(45) SMC(46) SMC(47)
 #undef SMC
-static const HostFn SM_CHANGES[MAX_TYPES] = {sm_change_0, sm_change_1, sm_change_2, sm_change_3, sm_change_4, sm_change_5,
-                                             sm_change_6, sm_change_7, sm_change_8, sm_change_9, sm_change_10, sm_change_11,
-                                             sm_change_12, sm_change_13, sm_change_14, sm_change_15};
+static const HostFn SM_CHANGES[MAX_TYPES] = {
+    sm_change_0, sm_change_1, sm_change_2, sm_change_3, sm_change_4, sm_change_5, sm_change_6, sm_change_7,
+    sm_change_8, sm_change_9, sm_change_10, sm_change_11, sm_change_12, sm_change_13, sm_change_14, sm_change_15,
+    sm_change_16, sm_change_17, sm_change_18, sm_change_19, sm_change_20, sm_change_21, sm_change_22, sm_change_23,
+    sm_change_24, sm_change_25, sm_change_26, sm_change_27, sm_change_28, sm_change_29, sm_change_30, sm_change_31,
+    sm_change_32, sm_change_33, sm_change_34, sm_change_35, sm_change_36, sm_change_37, sm_change_38, sm_change_39,
+    sm_change_40, sm_change_41, sm_change_42, sm_change_43, sm_change_44, sm_change_45, sm_change_46, sm_change_47,
+};
 
 static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
     if (g_sm_change_at[ty]) return;
@@ -398,8 +560,144 @@ static void sm_change_install(int ty, uint64_t self) {  // (the game's thread)
 
 static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const Snap *b, float t);
 
+// ---- projectiles (EnemyType.mirror). Each kind is built through its profile's build function (fProfile's list,
+// 0x7001674448: a pointer to each profile, its build function first), called through that pointer - so taken over (a
+// direct call, as the actor allocation's, isn't): refused (0, as out of memory) while a joining player's copy follows the host's
+static bool g_following;
+#define PROFILE_LIST 0x7001674448ull
+static GuestFn g_build[8];  // (each hook slot's: the type of each in g_build_type)
+static int g_build_type[8];
+static bool mirrored(uint16_t profile) {
+    for (int ty = 0; ty < NTYPES; ty++) if (TYPES[ty].profile == profile) return TYPES[ty].mirror;
+    return false;
+}
+static void no_mirrored_fire(int k, Cpu *c) {
+    if (g_following) {
+        static int told;
+        if (told++ < 4) LOG("[coop] enemies: a copy following the host's would fire a %s: the host's is made here instead\n",
+                            TYPES[g_build_type[k]].name);
+        c->x[0] = 0;
+        return;
+    }
+    g_build[k](c);
+}
+#define NB(n) static void no_fire_##n(Cpu *c) { no_mirrored_fire(n, c); }
+NB(0) NB(1) NB(2) NB(3) NB(4) NB(5) NB(6) NB(7)
+#undef NB
+static const HostFn NO_FIRE[8] = {no_fire_0, no_fire_1, no_fire_2, no_fire_3, no_fire_4, no_fire_5, no_fire_6, no_fire_7};
+static void mirror_install(void) {
+    int n = 0;
+    for (int ty = 0; ty < NTYPES && n < 8; ty++) {
+        if (!TYPES[ty].mirror) continue;
+        const uint64_t prof = *(uint64_t *)(uintptr_t)(PROFILE_LIST + 8ull * TYPES[ty].profile);
+        const uint64_t fn = prof >= 0x7001000000ull && prof < 0x7002000000ull ? *(uint64_t *)(uintptr_t)prof : 0;  // (in its data)
+        GuestFn g = fn ? dispatch_lookup(fn) : NULL;
+        if (!g) { LOG("[coop] enemies: the %s's build function isn't found: not mirrored\n", TYPES[ty].name); continue; }
+        g_build[n] = g, g_build_type[n] = ty;
+        hle_override_now(fn, NO_FIRE[n], "coop: projectiles of following copies");
+        LOG("[coop] enemies: the %s is mirrored from the host's (its build function %#llx)\n", TYPES[ty].name, (unsigned long long)fn);
+        n++;
+    }
+}
+
+// The host: one just fired at the other player (its shooter turned to them: it faces their way, the game's aim being only for
+// its own Link) flies at them. Fired, its velocity (+0x1e8) is set once, at the game's Link; turned to the way it faces, as
+// fast, and dropping to the same height on the other player as it would have on this one. Each once, its first update.
+#define SHOT_VEL 0x1e8
+static void aim_at_other(uint64_t self) {
+    static uint64_t done[16];  // (by its address and its own id, +0x8: each new one is often at the last one's address)
+    static int nd;
+    const uint64_t me_key = self ^ (uint64_t)*(uint32_t *)(uintptr_t)(self + 8) << 40;
+    for (int i = 0; i < 16; i++) if (done[i] == me_key) return;
+    done[nd] = me_key, nd = (nd + 1) % 16;
+    float other[3];
+    const uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (!coop_other_feet(other) || !guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return;
+    float *v = (float *)(uintptr_t)(self + SHOT_VEL);
+    const float *at = (const float *)(uintptr_t)(self + ACTOR_POS), *me = (const float *)(uintptr_t)(pl + ACTOR_POS);
+    const float sh = sqrtf(v[0] * v[0] + v[2] * v[2]);
+    if (!(sh > 0.01f) || !isfinite(v[1])) return;
+    const float face = *(int16_t *)(uintptr_t)(self + ACTOR_ROT + 2) * (float)(M_PI / 32768.0);
+    const float dx = sinf(face), dz = cosf(face);
+    if ((v[0] * dx + v[2] * dz) / sh > 0.985f) return;  // (within 10 degrees: aimed as it faces already)
+    const float to_me = hypotf(me[0] - at[0], me[2] - at[2]), to_other = hypotf(other[0] - at[0], other[2] - at[2]);
+    if (to_me < 1 || to_other < 1) return;
+    const float height = at[1] + v[1] / sh * to_me - me[1];  // (where on this Link it would have hit, above his feet)
+    v[0] = dx * sh, v[2] = dz * sh, v[1] = (other[1] + height - at[1]) * sh / to_other;
+    LOG("[coop] enemies: a shot at the other player, aimed at them (%.0f away)\n", to_other);
+}
+
+// A joining player: the host's projectiles made here, where they are (each once: then paired with it, as any)
+void coop_enemy_mirror(Cpu *c, uint64_t (*spawn)(Cpu *, uint16_t, uint32_t, uint32_t, const float[3], int16_t)) {
+    if (!g_puppets || g_hosting) return;
+    static struct { uint32_t id; uint64_t at; } made[32];
+    const uint64_t now = SDL_GetTicks();
+    Snap want[8];
+    int nwant = 0;
+    pthread_mutex_lock(&g_lock);
+    const Frame *f = g_nframes ? &g_frames[g_nframes - 1] : NULL;
+    if (f && now - f->at < STALE_MS && g_stage && f->stage == g_stage())
+        for (int k = 0; k < f->n && nwant < 8; k++) {
+            const Snap *s = &f->s[k];
+            if (!mirrored(s->profile)) continue;
+            static int seen;
+            if (seen++ < 4) LOG("[coop] enemies: the host's %#x %#x is in its frame\n", s->profile, s->id);
+            bool have = false;
+            for (int i = 0; i < g_nmap && !have; i++) have = g_map[i].id == s->id && now - g_map[i].seen < 200;
+            for (int i = 0; i < 32 && !have; i++) have = made[i].id == s->id && now - made[i].at < 1000;
+            if (!have) want[nwant++] = *s;
+        }
+    pthread_mutex_unlock(&g_lock);
+    for (int k = 0; k < nwant; k++) {
+        int slot = 0;
+        for (int i = 1; i < 32; i++) if (made[i].at < made[slot].at) slot = i;
+        made[slot].id = want[k].id, made[slot].at = now;
+        const uint64_t a = spawn(c, want[k].profile, want[k].words[0], want[k].words[1], want[k].pos, want[k].rot[1]);
+        static int told;
+        if (told++ < 8) LOG("[coop] enemies: the host's %#x %#x made here: %#llx\n", want[k].profile, want[k].id, (unsigned long long)a);
+    }
+}
+
+// An animated model (m3d::mdlAnmChr_c) put into the animation `res` (a CHR0, as the game has it: its name at +0x18) with the
+// game's setAnm (0x7000013afc: the model, the name, the play mode, the frames to blend over - none: it's put in each frame)
+#define SET_ANM 0x7000013afcull
+static bool set_anim(Cpu *c, uint64_t mdl, uint64_t res) {
+    if (!guest_ptr(res) || memcmp((const void *)(uintptr_t)res, "CHR0", 4)) return false;
+    const uint32_t off = *(uint32_t *)(uintptr_t)(res + 0x18);
+    if (!off || off > 0x1000000) return false;
+    const char *name = (const char *)(uintptr_t)(res + off);
+    int n = 0;
+    while (n < 64 && name[n] >= 0x20 && name[n] < 0x7f) n++;
+    if (!n || n == 64 || name[n]) return false;
+    static GuestFn fn;
+    if (!fn) fn = dispatch_lookup(SET_ANM);
+    if (!fn) return false;
+    Cpu t = *c;
+    t.x[0] = mdl, t.x[1] = res + off, t.x[2] = 4, t.v[0] = 0;
+    fn(&t);
+    return true;
+}
+
+// Its bones worked out again from its matrix (+0x1f4) and clip as they are now, as its update does: the scene model's matrix
+// (+0x18, its flag +0xd8's top bit cleared), then its calc (vtable +8: 1, 0, 0) between its callbacks off and on (+0x38)
+static void model_recalc(Cpu *c, uint64_t self, int scn) {
+    const uint64_t obj = *(uint64_t *)(uintptr_t)(self + scn);
+    if (!guest_ptr(obj)) return;
+    const uint64_t vt = *(uint64_t *)(uintptr_t)obj;
+    if (vt != 0x7001698d50ull) return;  // (a scene model: nw4r's ScnMdl, as every one's so far)
+    GuestFn cb = dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 0x38)), calc = dispatch_lookup(*(uint64_t *)(uintptr_t)(vt + 8));
+    if (!cb || !calc) return;
+    *(uint32_t *)(uintptr_t)(obj + 0xd8) &= 0x7fffffffu;
+    memcpy((void *)(uintptr_t)(obj + 0x18), (const void *)(uintptr_t)(self + 0x1f4), 48);
+    Cpu t = *c;
+    t.x[0] = obj, t.x[1] = 2, t.x[2] = 0, cb(&t);
+    t = *c, t.x[0] = obj, t.x[1] = 1, t.x[2] = 0, t.x[3] = 0, calc(&t);
+    t = *c, t.x[0] = obj, t.x[1] = 2, t.x[2] = 1, cb(&t);
+}
+
 // The host: one the joining player is running (it holds them) takes their latest, as theirs take the host's. true: it did.
-static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], uint64_t *die_into, uint64_t *enter_into) {
+static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], uint32_t shape[SHAPE_N], uint64_t *die_into,
+                       uint64_t *enter_into) {
     const EnemyType *T = &TYPES[ty];
     bool ok = false;
     pthread_mutex_lock(&g_lock);
@@ -410,7 +708,7 @@ static bool back_apply(int ty, uint64_t self, uint32_t flag, uint32_t words[3], 
         else if (b) {
             uint64_t had[4];
             for (int k = 0; k < 4; k++) had[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
-            snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), ok = true;
+            snap_apply(T, self, b, b, 1), memcpy(words, b->words, sizeof b->words), memcpy(shape, b->shape, sizeof b->shape), ok = true;
             if (T->enter && b->state[1] != had[1]) {
                 for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = had[k];
                 *enter_into = b->state[1];
@@ -460,6 +758,7 @@ static void puppet_update(int ty, Cpu *c) {
     bool driven = false, host_hurt = false;
     uint32_t host_words[3] = {0};  // (the host's, put back after its own update: it sets its own each frame)
     uint32_t host_shape[SHAPE_N] = {0};
+    uint64_t host_state = 0;  // (the host's, followed: its own may have left it in its update, a Guay's drop on the other player)
     const uint16_t flag = *(uint16_t *)(uintptr_t)(self + ENEMY_FLAG);
     // key: which of the host's this is (the host: its own address; a joining player: the one it's paired with, 0 for none)
     uint32_t key = g_hosting ? (uint32_t)self : 0;
@@ -488,7 +787,7 @@ static void puppet_update(int ty, Cpu *c) {
     }
     uint32_t own_words[3];  // (its own, before the other's are taken: kept while it stands in)
     for (int k = 0; k < 3; k++) own_words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(self + T->words[k]) : 0;
-    if (g_hosting) back = back_apply(ty, self, key, host_words, &die_into, &enter_into);
+    if (g_hosting) back = back_apply(ty, self, key, host_words, host_shape, &die_into, &enter_into);
     if (g_puppets && key && !held && !released(T->profile, key)) {
         uint64_t now = SDL_GetTicks();
         pthread_mutex_lock(&g_lock);
@@ -524,6 +823,7 @@ static void puppet_update(int ty, Cpu *c) {
                 enter_into = b->state[1];
             }
             driven = true;
+            host_state = b->state[1];
             memcpy(host_words, b->words, sizeof host_words);
             memcpy(host_shape, b->shape, sizeof host_shape);
             host_hurt = hurt_state(b->state[1]);
@@ -531,6 +831,24 @@ static void puppet_update(int ty, Cpu *c) {
         pthread_mutex_unlock(&g_lock);
     }
     if (enter_into && !change_state(T, c, self, enter_into)) *(uint64_t *)(uintptr_t)(self + T->state[1]) = enter_into;
+    if (T->death) {  // (killed in the other game: its own death here, then its own updates, following nothing, until it's gone)
+        static uint64_t death_state[MAX_TYPES];
+        int d = -1;
+        for (int i = 0; d < 0 && i < 8; i++) if (g_death[i].self == self) d = i;
+        if (d >= 0 && SDL_GetTicks() - g_death[d].at >= DEATH_MS) {
+            g_death[d].self = 0;
+            if (*(uint8_t *)(uintptr_t)(self + 0x13) == 0) *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (still here: removed)
+        } else if (d >= 0) {
+            if (!g_death[d].started) {
+                if (!death_state[ty]) death_state[ty] = find_state(T->cls, T->death);
+                g_death[d].started = true;
+                if (death_state[ty] && !change_state(T, c, self, death_state[ty])) *(uint64_t *)(uintptr_t)(self + T->state[1]) = death_state[ty];
+            }
+            if (g_hp_off) *(uint16_t *)(uintptr_t)(self + g_hp_off) = 0;
+            g_update[ty](c);
+            return;
+        }
+    }
     if (die_into) {
         if (g_ndying < MAX_DYING && change_state(T, c, self, die_into)) {
             g_dying[g_ndying++] = self;
@@ -579,10 +897,14 @@ static void puppet_update(int ty, Cpu *c) {
     }
     uint64_t keep_st[4];
     uint8_t keep_an[0x20];
+    uint8_t keep_clip[CLIP_RES + 8 - CLIP_FRAME];  // (its clip object's frame, rate, start, end ... and resource)
+    uint64_t keep_clip_obj = 0;
     uint64_t keep_ex = 0;
     if (stand_in) {
         for (int k = 0; k < 4; k++) keep_st[k] = *(uint64_t *)(uintptr_t)(self + T->state[k]);
-        memcpy(keep_an, (const void *)(uintptr_t)(self + T->anim), sizeof keep_an);
+        if (T->anim) memcpy(keep_an, (const void *)(uintptr_t)(self + T->anim), sizeof keep_an);
+        // (and its clip: its stand-in state's start sets its own - a carried Remlit played its Wait on the other screen)
+        if (T->clip && (keep_clip_obj = clip_obj(self + T->clip))) memcpy(keep_clip, (const void *)(uintptr_t)(keep_clip_obj + CLIP_FRAME), sizeof keep_clip);
         if (T->extra) keep_ex = *(uint64_t *)(uintptr_t)(self + T->extra);
         *(uint64_t *)(uintptr_t)(self + T->state[1]) = g_idle_state[ty];
         if (T->at && T->co) co_off_note(self, true, T);
@@ -598,15 +920,52 @@ static void puppet_update(int ty, Cpu *c) {
         if (g_sm_change[ty]) g_block_sm = self + (uint64_t)(T->state[1] - 0x20), g_block_grab = stand_in;
     }
     float pinned[3];
+    int16_t pinned_rot[3];  // (and, standing in, which way it faces: a carried Remlit faces the way its carrier does)
     const bool pin = T->pin && (follow || stand_in);
-    if (pin) memcpy(pinned, (const void *)(uintptr_t)(self + ACTOR_POS), 12);
+    if (pin) memcpy(pinned, (const void *)(uintptr_t)(self + ACTOR_POS), 12), memcpy(pinned_rot, (const void *)(uintptr_t)(self + ACTOR_ROT), 6);
     // Standing in: this player's Link as he was before its update, after it. Its update (even in the harmless state) slowed
     // his Link however far he went (deleting it freed him at once; its own fields put back as they were when not holding one
     // didn't; not running its update did, but froze it and its animation). What it changed in him is undone, and told.
     static uint8_t link_keep[LINK_KEEP];
     const bool guard = stand_in && guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE;
     if (guard) memcpy(link_keep, (const void *)(uintptr_t)pl, LINK_KEEP);
-    g_update[ty](c);
+    if (T->aim && g_hosting) aim_at_other(self);  // (no other player: coop_other_feet says so)
+    const bool was_following = g_following;
+    g_following = driven && !g_hosting;  // (what it fires, the host's are made here instead: no_mirrored_fire)
+    bool riding_other = false;
+    if (T->ride && (follow || stand_in)) {  // (riding the other player: not this one's to target)
+        static uint64_t ride_state[MAX_TYPES];
+        if (!ride_state[ty]) ride_state[ty] = find_state(T->cls, T->ride);
+        const float *it = (const float *)(uintptr_t)(self + ACTOR_POS);
+        float d2 = 1e30f;
+        if (guest_ptr(pl) && *(uint64_t *)(uintptr_t)pl == PLAYER_VTABLE) {
+            const float *me = (const float *)(uintptr_t)(pl + ACTOR_POS);
+            d2 = 0;
+            for (int k = 0; k < 3; k++) d2 += (me[k] - it[k]) * (me[k] - it[k]);
+        }
+        float other[3], o2 = 1e30f;  // (the Link it rides: whichever player it's nearer)
+        if (coop_other_feet(other)) {
+            o2 = 0;
+            for (int k = 0; k < 3; k++) o2 += (other[k] - it[k]) * (other[k] - it[k]);
+        }
+        // (this player's Link is at the other player's for this update when they're nearer it - swap: then compared with itself)
+        riding_other = ride_state[ty] && host_state == ride_state[ty] && (swap || o2 < d2);
+        static int told;
+        if (getenv("LARECOMP_COOP_TEST") && host_state == ride_state[ty] && told++ < 40)
+            LOG("[coop] enemies: a %s rides a Link: %.0f from this one, %.0f from the other (state %llx): %s\n", T->name, sqrtf(d2),
+                o2 < 1e29f ? sqrtf(o2) : -1.0f, (unsigned long long)host_state, riding_other ? "the other player's, not run" : "this player's");
+        static int told2;
+        if (getenv("LARECOMP_COOP_TEST") && told2++ < 3)
+            LOG("[coop] enemies: a %s following: its riding state %llx, the host's now %llx\n", T->name, (unsigned long long)ride_state[ty],
+                (unsigned long long)host_state);
+    }
+    if (!riding_other) g_update[ty](c);
+    else if (T->scn && T->shape[0] == 0x1f4) {
+        bool have = false;
+        for (int k = 0; k < 12; k++) have |= host_shape[k] != 0;
+        if (have) memcpy((void *)(uintptr_t)(self + 0x1f4), host_shape, 48), model_recalc(c, self, T->scn);
+    }
+    g_following = was_following;
     if (guard) {
         static int told;
         const uint8_t *now = (const uint8_t *)(uintptr_t)pl;
@@ -623,10 +982,46 @@ static void puppet_update(int ty, Cpu *c) {
         }
         memcpy((void *)(uintptr_t)pl, link_keep, LINK_KEEP);
     }
-    if (pin && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) memcpy((void *)(uintptr_t)(self + ACTOR_POS), pinned, 12);
+    if (pin && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+        // (its model was placed in its update where its own motion had taken it: moved by as much as it's put back, or a
+        // thrown Remlit stuttered on the other screen, each frame drawn a frame's flight off)
+        float *pos = (float *)(uintptr_t)(self + ACTOR_POS), d[3], *mtx = (float *)(uintptr_t)(self + 0x1f4);
+        for (int k = 0; k < 3; k++) d[k] = pinned[k] - pos[k];
+        memcpy(pos, pinned, 12);
+        if (stand_in) memcpy((void *)(uintptr_t)(self + ACTOR_ROT), pinned_rot, 6);
+        else if (T->scn && (d[0] != 0 || d[1] != 0 || d[2] != 0) && fabsf(d[0]) + fabsf(d[1]) + fabsf(d[2]) < 500) {
+            for (int k = 0; k < 3; k++) mtx[k * 4 + 3] += d[k];
+            if (!T->face) model_recalc(c, self, T->scn);
+        }
+    }
+    if (T->face && follow && T->scn && T->shape[0] == 0x1f4 && !hurt_state(*(uint64_t *)(uintptr_t)(self + T->state[1]))) {
+        bool have = false;
+        for (int k = 0; k < 12; k++) have |= host_shape[k] != 0;
+        if (have) {  // (the host's turn; where it is, its own - pinned)
+            uint32_t *mtx = (uint32_t *)(uintptr_t)(self + 0x1f4);
+            for (int r = 0; r < 3; r++)
+                for (int k = 0; k < 3; k++) mtx[r * 4 + k] = host_shape[r * 4 + k];
+            model_recalc(c, self, T->scn);
+        }
+    }
     if (follow || back) {  // (back: the host's, following the joining player's: theirs, then, in place of the host's)
         for (int k = 0; k < 3; k++)
-            if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = host_words[k];
+            if (T->words[k]) {
+                uint32_t *w = (uint32_t *)(uintptr_t)(self + T->words[k]);
+                if (T->only_less >> k & 1 && follow && key && g_send_word && (host_words[k] & ~*w & 0xffff)) {
+                    static struct { uint32_t id; int k; uint16_t v; } sent[8];
+                    const uint16_t v = (uint16_t)(*w & host_words[k]);
+                    bool told = false;
+                    for (int i = 0; i < 8; i++) told |= sent[i].id == key && sent[i].k == k && sent[i].v == v;
+                    if (!told) {
+                        static int n;
+                        sent[n].id = key, sent[n].k = k, sent[n].v = v, n = (n + 1) % 8;
+                        g_send_word(key, k, v);
+                        LOG("[coop] enemies: the %s with flag %#x lost bits of its word %d here (%#x): told the host\n", T->name, flag, k, v);
+                    }
+                }
+                *w = T->only_less >> k & 1 ? *w & host_words[k] : host_words[k];
+            }
     }
     g_block_sm = 0, g_block_grab = false;
     // Hit here while it stands in (this player's sword, on the one holding the other player): the hit stands. It's hurt or dies
@@ -643,7 +1038,14 @@ static void puppet_update(int ty, Cpu *c) {
         // (its state stays the stand-in one until the next frame takes the other's again: left in the hold between updates,
         // this player's Link took it for one holding him if he came near, and was slowed. Only its look is the hold's.)
         (void)keep_st;
-        memcpy((void *)(uintptr_t)(self + T->anim), keep_an, sizeof keep_an);
+        // (its animation the other's: put on by name if its stand-in state put on its own, then where it was in it)
+        uint64_t co = keep_clip_obj ? clip_obj(self + T->clip) : 0;
+        const uint64_t want = *(uint64_t *)(void *)(keep_clip + (CLIP_RES - CLIP_FRAME));
+        if (co && T->mdl && *(uint64_t *)(uintptr_t)(co + CLIP_RES) != want && set_anim(c, self + T->mdl, want)) co = clip_obj(self + T->clip);
+        if (T->anim) memcpy((void *)(uintptr_t)(self + T->anim), keep_an, sizeof keep_an);
+        if (co && *(uint64_t *)(uintptr_t)(co + CLIP_RES) == want)
+            memcpy((void *)(uintptr_t)(co + CLIP_FRAME), keep_clip, CLIP_RES - CLIP_FRAME);
+        else if (co && !T->mdl) memcpy((void *)(uintptr_t)(co + CLIP_FRAME), keep_clip, sizeof keep_clip);
         // (and its own flag words, not the holder's: a chuchu's +0xb8 holding Link made this player's Link, it the nearest
         // enemy to him, act held: his action flags (+0x460) went from 0x90081185 to 0x84000001 with nothing touching him)
         for (int k = 0; k < 3; k++)
@@ -651,8 +1053,9 @@ static void puppet_update(int ty, Cpu *c) {
         if (T->extra) *(uint64_t *)(uintptr_t)(self + T->extra) = keep_ex;
         bool shaped = false;
         for (int k = 0; k < SHAPE_N; k++) shaped |= host_shape[k] != 0;
-        if (shaped && driven)  // (the host's shape, wrapped around the Link it holds there)
+        if (shaped && (driven || back))  // (the other's shape: wrapped around the Link it holds there, or carried by him)
             for (int k = 0; k < SHAPE_N && T->shape[k]; k++) *(uint32_t *)(uintptr_t)(self + T->shape[k]) = host_shape[k];
+        if (T->scn) model_recalc(c, self, T->scn);
         static int told;
         if (told++ < 8) LOG("[coop] enemies: the %s with flag %#x holds the other player: not this one\n", T->name, flag);
     }
@@ -731,11 +1134,6 @@ static void puppet_update(int ty, Cpu *c) {
 // The second animation (behind a pointer): frame +0x28, speed +0x2c, first frame +0x30, last +0x34, its clip +0x40, a CHR0
 // in the object's archive. Archives are loaded at the same place in each game, but the clip is only taken if this game has
 // the same one there (the magic and size match).
-#define CLIP_FRAME 0x28
-#define CLIP_RATE 0x2c
-#define CLIP_START 0x30
-#define CLIP_END 0x34
-#define CLIP_RES 0x40
 static uint64_t clip_obj(uint64_t at) {
     uint64_t p = *(uint64_t *)(uintptr_t)at;
     if (!guest_ptr(p)) return 0;
@@ -771,6 +1169,13 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
         scale[k] = a->scale[k] + (b->scale[k] - a->scale[k]) * t;
     }
     for (int k = 0; k < 4; k++) *(uint64_t *)(uintptr_t)(self + T->state[k]) = b->state[k];
+    for (int k = 0; k < 3; k++)
+        if (T->words[k]) {
+            uint32_t *w = (uint32_t *)(uintptr_t)(self + T->words[k]);
+            *w = T->only_less >> k & 1 ? *w & b->words[k] : b->words[k];
+        }
+    if (T->clip) clip_apply(self + T->clip, a, b, t);
+    if (!T->anim) return;  // (none found: it plays its own)
     uint64_t an = self + T->anim;
     const float old_end = *(float *)(uintptr_t)(an + ANIM_END);  // (before the host's: whether it's the same animation)
     if (!T->no_res && (b->anim == 0 || guest_ptr(b->anim))) *(uint64_t *)(uintptr_t)(an + ANIM_RES) = b->anim;
@@ -779,8 +1184,6 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     *(float *)(uintptr_t)(an + ANIM_END) = b->end;
     *(float *)(uintptr_t)(an + ANIM_START) = b->start;
     *(uint32_t *)(uintptr_t)(an + ANIM_MODE) = b->mode;
-    for (int k = 0; k < 3; k++)
-        if (T->words[k]) *(uint32_t *)(uintptr_t)(self + T->words[k]) = b->words[k];
     bool same = a->anim == b->anim && a->end == b->end && b->frame >= a->frame;  // (not across a change or a wrap)
     const float want = same ? a->frame + (b->frame - a->frame) * t : b->frame;
     // Never a little back: each step back made it cross the same frames again, and what a frame sets off (a Deku Baba's
@@ -789,14 +1192,21 @@ static void snap_apply(const EnemyType *T, uint64_t self, const Snap *a, const S
     float *fr = (float *)(uintptr_t)(an + ANIM_FRAME);
     const float ahead = *fr - want;
     if (!(old_end == b->end && ahead > 0 && ahead < FRAME_LEAD_MAX)) *fr = want;
-    if (T->clip) clip_apply(self + T->clip, a, b, t);
 }
 
 #define U(n) static void update_##n(Cpu *c) { puppet_update(n, c); }
 U(0) U(1) U(2) U(3) U(4) U(5) U(6) U(7) U(8) U(9) U(10) U(11) U(12) U(13) U(14) U(15)
+U(16) U(17) U(18) U(19) U(20) U(21) U(22) U(23) U(24) U(25) U(26) U(27) U(28) U(29) U(30) U(31)
+U(32) U(33) U(34) U(35) U(36) U(37) U(38) U(39) U(40) U(41) U(42) U(43) U(44) U(45) U(46) U(47)
 #undef U
-static const HostFn UPDATES[MAX_TYPES] = {update_0, update_1, update_2, update_3, update_4, update_5, update_6, update_7,
-                                          update_8, update_9, update_10, update_11, update_12, update_13, update_14, update_15};
+static const HostFn UPDATES[MAX_TYPES] = {
+    update_0, update_1, update_2, update_3, update_4, update_5, update_6, update_7,
+    update_8, update_9, update_10, update_11, update_12, update_13, update_14, update_15,
+    update_16, update_17, update_18, update_19, update_20, update_21, update_22, update_23,
+    update_24, update_25, update_26, update_27, update_28, update_29, update_30, update_31,
+    update_32, update_33, update_34, update_35, update_36, update_37, update_38, update_39,
+    update_40, update_41, update_42, update_43, update_44, update_45, update_46, update_47,
+};
 
 // Its update taken over (vtable slot 20), and its named states found. now: while the game runs (on its thread).
 static bool install_type(int ty, bool now) {
@@ -890,6 +1300,7 @@ int coop_enemy_types_text(char *out, int cap) {
 
 void coop_enemy_init(uint8_t (*stage)(void)) {
     g_stage = stage;
+    mirror_install();
     for (int ty = 0; ty < g_ntypes; ty++) install_type(ty, true);
     FILE *f = fopen("coop_enemies.txt", "r");
     if (!f && (f = fopen("coop_enemies.txt", "w"))) {  // (a start, saying how)
@@ -989,6 +1400,10 @@ int coop_enemy_take(uint8_t *out, int cap) {
         for (int ty = 0; ty < NTYPES && !T; ty++)
             if (TYPES[ty].profile == prof) T = &TYPES[ty];
         if (!T) continue;
+        if (T->mirror && g_hosting && getenv("LARECOMP_COOP_TEST")) {  // (test: the host's projectiles going out)
+            static int sent;
+            if (sent++ < 4) LOG("[coop] enemies: sending a %s (%#x) at %#llx\n", T->name, prof, (unsigned long long)a);
+        }
         Snap s;
         if (back) {
             pthread_mutex_lock(&g_lock);
@@ -1005,12 +1420,15 @@ int coop_enemy_take(uint8_t *out, int cap) {
         memcpy(s.scale, (const void *)(uintptr_t)(a + ACTOR_SCALE), 12);
         memcpy(s.rot, (const void *)(uintptr_t)(a + ACTOR_ROT), 6);
         for (int k = 0; k < 4; k++) s.state[k] = *(uint64_t *)(uintptr_t)(a + T->state[k]);
-        uint64_t an = a + T->anim;
-        s.anim = *(uint64_t *)(uintptr_t)(an + ANIM_RES);
+        s.anim = 0, s.frame = s.end = s.start = 0, s.mode = 0;
+        if (T->anim) {
+            uint64_t an = a + T->anim;
+            s.anim = *(uint64_t *)(uintptr_t)(an + ANIM_RES);
+            s.frame = *(float *)(uintptr_t)(an + ANIM_FRAME);
+            s.end = *(float *)(uintptr_t)(an + ANIM_END), s.start = *(float *)(uintptr_t)(an + ANIM_START);
+            s.mode = *(uint32_t *)(uintptr_t)(an + ANIM_MODE);
+        }
         s.extra = T->extra ? *(uint64_t *)(uintptr_t)(a + T->extra) : 0;
-        s.frame = *(float *)(uintptr_t)(an + ANIM_FRAME);
-        s.end = *(float *)(uintptr_t)(an + ANIM_END), s.start = *(float *)(uintptr_t)(an + ANIM_START);
-        s.mode = *(uint32_t *)(uintptr_t)(an + ANIM_MODE);
         for (int k = 0; k < 3; k++) s.words[k] = T->words[k] ? *(uint32_t *)(uintptr_t)(a + T->words[k]) : 0;
         s.clip_res = 0, s.clip_size = 0, s.clip_frame = s.clip_end = s.clip_start = s.clip_rate = 0;
         uint64_t co = T->clip ? clip_obj(a + T->clip) : 0;
@@ -1057,6 +1475,21 @@ int coop_enemy_take(uint8_t *out, int cap) {
 
 static uint64_t actor_by_id(uint32_t id);
 // The other player's hit lowered one's health (by the host's id for it): this player's copy goes down to it too.
+// The host: the joining player's copy of one lost bits of an only_less word: this one loses them too
+static uint64_t actor_by_id(uint32_t id);
+void coop_enemy_word(uint32_t id, int k, uint16_t v) {
+    if (!g_hosting || k < 0 || k > 2) return;
+    uint64_t self = actor_by_id(id);
+    if (!self || *(uint8_t *)(uintptr_t)(self + ACTOR_LIFE) != 1) return;
+    const uint16_t prof = *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE);
+    for (int ty = 0; ty < NTYPES; ty++) {
+        if (TYPES[ty].profile != prof || !TYPES[ty].words[k] || !(TYPES[ty].only_less >> k & 1)) continue;
+        uint32_t *w = (uint32_t *)(uintptr_t)(self + TYPES[ty].words[k]);
+        LOG("[coop] enemies: the other player's %s lost bits of its word %d: %#x -> %#x\n", TYPES[ty].name, k, *w & 0xffff, *w & v);
+        *w &= 0xffff0000u | v;
+    }
+}
+
 void coop_enemy_hp(uint32_t id, uint16_t hp) {
     if (!g_hp_off) return;
     uint64_t self = actor_by_id(id);
@@ -1120,6 +1553,22 @@ void coop_enemy_gone(uint16_t profile, uint32_t id) {
     if (!self || *(uint16_t *)(uintptr_t)(self + ACTOR_PROFILE) != profile || *(uint8_t *)(uintptr_t)(self + ACTOR_LIFE) != 1) return;
     for (int ty = 0; ty < NTYPES; ty++)  // (dying its own death already, after theirs: it goes when that's done)
         if (TYPES[ty].profile == profile && dying(self, TYPES[ty].state[1])) return;
+    for (int ty = 0; ty < NTYPES; ty++) {  // (one that dies its own death: health 0, its death state in its next update)
+        if (TYPES[ty].profile != profile || !TYPES[ty].death || !g_hp_off) continue;
+        for (int i = 0; i < 8; i++) if (g_death[i].self == self && SDL_GetTicks() - g_death[i].at < DEATH_MS) return;
+        {  // (in its death state already, following the other's into it: it's dying here - left to)
+            const uint64_t st = *(uint64_t *)(uintptr_t)(self + TYPES[ty].state[1]);
+            const uint64_t nm = st >= 0x7001000000ull && st < 0x7002000000ull ? *(uint64_t *)(uintptr_t)(st + 8) : 0;
+            const char *sn = nm >= 0x7001000000ull && nm < 0x7002000000ull ? strstr((const char *)(uintptr_t)nm, "StateID_") : NULL;
+            if (sn && !strcmp(sn + 8, TYPES[ty].death)) return;
+        }
+        int slot = 0;
+        for (int i = 1; i < 8; i++) if (g_death[i].at < g_death[slot].at) slot = i;
+        g_death[slot].self = self, g_death[slot].at = SDL_GetTicks(), g_death[slot].started = false;
+        *(uint16_t *)(uintptr_t)(self + g_hp_off) = 0;
+        LOG("[coop] enemies: the other player killed a %s (id %#x): it dies its own death here\n", TYPES[ty].name, id);
+        return;
+    }
     *(uint8_t *)(uintptr_t)(self + 0x13) = 1;  // (fBase_c's delete request, as coop.c removes a kill)
     LOG("[coop] enemies: the other player killed one (profile %#x, id %#x): removed here too\n", profile, id);
 }
@@ -1149,7 +1598,7 @@ void coop_enemy_receive(const uint8_t *d, int size) {
         bool sane = known && s.mode <= 1 && isfinite(s.frame) && isfinite(s.end) && isfinite(s.start) && isfinite(s.clip_frame) &&
                     isfinite(s.clip_end) && isfinite(s.clip_start) && isfinite(s.clip_rate) && fabsf(s.clip_rate) < 100;
         for (int k = 0; k < 3; k++) sane &= isfinite(s.pos[k]) && isfinite(s.scale[k]) && fabsf(s.scale[k]) < 100;
-        for (int k = 0; k < 4; k++) sane &= s.state[k] >= 0x7001500000ull && s.state[k] < 0x7001700000ull;
+        for (int k = 0; k < 4; k++) sane &= !s.state[k] || (s.state[k] >= 0x7001000000ull && s.state[k] < 0x7002000000ull);
         for (int k = 0; k < SHAPE_N; k++) {  // (floats, all of them: one not, or far out, and it has none)
             float v;
             memcpy(&v, &s.shape[k], 4);

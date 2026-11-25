@@ -971,6 +971,11 @@ static void send_hp(uint32_t id, uint16_t hp) {
     CoopEvent ev = {COOP_EV_ENEMY_HP, 0, hp, (uint16_t)(id & 0xffff), (uint16_t)(id >> 16)};
     emit(&ev, NULL);
 }
+#define COOP_EV_ENEMY_WORD 17  // a: which of its words, b: its value now (it only loses bits), c d: the host's id for it
+static void send_word(uint32_t id, int k, uint16_t v) {
+    CoopEvent ev = {COOP_EV_ENEMY_WORD, (uint8_t)k, v, (uint16_t)(id & 0xffff), (uint16_t)(id >> 16)};
+    emit(&ev, NULL);
+}
 static void send_gone(uint16_t profile, uint32_t id) {
     CoopEvent ev = {COOP_EV_ENEMY_GONE, 0, profile, (uint16_t)(id & 0xffff), (uint16_t)(id >> 16)};
     emit(&ev, NULL);
@@ -999,6 +1004,7 @@ static void on_event(const CoopEvent *ev, void *user) {
     if (ev->type == COOP_EV_POUCH) { pouch_received(ev); return; }
     if (ev->type == COOP_EV_ENEMY_GONE) { coop_enemy_gone(ev->b, (uint32_t)ev->c | (uint32_t)ev->d << 16); return; }
     if (ev->type == COOP_EV_ENEMY_HP) { coop_enemy_hp((uint32_t)ev->c | (uint32_t)ev->d << 16, ev->b); return; }
+    if (ev->type == COOP_EV_ENEMY_WORD) { coop_enemy_word((uint32_t)ev->c | (uint32_t)ev->d << 16, ev->a, ev->b); return; }
     if (ev->type == COOP_EV_COPY_END) { copy_end(); return; }
     // (only what this player didn't have: chests and doors have no name here, and re-sent flags are no news)
     uint16_t had = 0, hp = *g_core.health;
@@ -1319,12 +1325,16 @@ static const struct { uint16_t profile; const char *arcs[3]; uint32_t p1, p2; } 
     {0x155, {"Sm"}, 0xffffffff, 0xffffffff}, {0x184, {"Bocoburin_Z", "Skull"}, 0xb37d97fd, 0x25ffffff},
     {0x17f, {"Bce"}, 0xf0ffdfef, 0x21dfffff}, {0x171, {"LizarufosA", "Liza_tail"}, 0xf0affff1, 0x045fffff},
     {0x167, {"Sf"}, 0xfffffff0, 0x26ffffff}, {0x168, {"Sf4", "Skull"}, 0xffffd4ff, 0x23ffffff},
-    {0x169, {"Staltula", "StalchulaThread"}, 0xffffff01, 0x25ffffff}, {0x15c, {"Or", "OrCannon"}, 0xfffffffc, 0x26ffffff},
+    {0x169, {"Staltula", "StalchulaThread"}, 0xffffff01, 0x25ffffff}, {0x15c, {"Or", "Bullet"}, 0xfffffffc, 0x26ffffff},
     {0xc2, {"Ph"}, 0xfffffff0, 0xffffffff}, {0x188, {"Gue"}, 0xfffffffc, 0x09ffffff}, {0x170, {"Remly"}, 0xfff14fff, 0xffffffff},
     {0x158, {"Geko"}, 0xffffffff, 0xffffffff}, {0x14f, {"Amos"}, 0xf120cfff, 0x06ffffff}, {0x156, {"Beamos"}, 0xfcfc63ff, 0x07dfffff},
     {0x190, {"StalWall"}, 0xfffffff1, 0x07ffffff}, {0x173, {"Hidokari", "HidokariS"}, 0xffeffff2, 0x25ffffff},
     {0x175, {"Hydra"}, 0xfff0703f, 0x14ffffff}, {0x163, {"Magma"}, 0xffffffff, 0xffffffff}, {0x164, {"Maguppo"}, 0xfff2efff, 0xffffffff},
     {0x185, {"Skytail"}, 0xffffffff, 0xffffffff}, {0x18d, {"Chaser_A", "Chaser_B"}, 0xf800ffff, 0xffffffff},
+    {0x1a5, {"MoldoGut_Baby"}, 0xfefff2ff, 0x07ffffff}, {0xc1, {"Moriburin", "MoriburinAnm", "Moriburin_Shield"}, 0xc8ff0000, 0x04dfffff}  /* (Faron Woods' Moblin: Sky Keep's, 0xff010100, is an iron one, Moriburin_Iron) */,
+    {0x18c, {"Gerock"}, 0xfffffc66, 0x14dfffff}, {0x176, {"Gunho"}, 0xffefffff, 0x14ffffff}, {0x18e, {"Hidory"}, 0xffff0007, 0x07ffffff},
+    {0x6e, {"Gumarm"}, 0xffffffbc, 0x25ffffff}, {0xc0, {"Syakomaito"}, 0xf0c0c030, 0x12ffffff},
+    {0xbf, {"Bullet"}, 0xffffffff, 0xffffffff}, {0x189, {"Gue"}, 0xffffffff, 0xffffffff},  // (a Guay's drop)  // (an Octorok's rock: made from the host's, coop_enemy_mirror)
     {0x17e, {NULL}, 0xf0ffff20, 0x255fffff},  // (Bc: in ObjectPack, always loaded. Faron Woods's: the commonest, d9ffd00d, are Lanayru's time-shift skeletons)
 };
 
@@ -1431,7 +1441,15 @@ static void spawn_received(const uint8_t *d, int size) {  // [kind][stage][prof 
 }
 
 // Once per frame, with the game's own call in hand (runtime/hle/input.c): what needs the game's functions.
+static uint64_t mirror_spawn(Cpu *c, uint16_t prof, uint32_t p1, uint32_t p2, const float pos[3], int16_t yaw) {
+    uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
+    if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return 0;
+    return spawn_actor(c, prof, p1, p2, pos, yaw, 1, *(int8_t *)(uintptr_t)(pl + ACTOR_ROOM));
+}
+
 void coop_game_tick(Cpu *c) {
+    extern void coop_enemy_mirror(Cpu *c, uint64_t (*spawn)(Cpu *, uint16_t, uint32_t, uint32_t, const float[3], int16_t));
+    if (g_state == 1 && g_core.baselined) coop_enemy_mirror(c, mirror_spawn);  // (the host's projectiles, made here)
     if (!g_test || g_state != 1 || !g_core.baselined) { g_spawn_req = 0, g_spawn_theirs.due = false; return; }
     uint64_t pl = *(uint64_t *)(uintptr_t)PLAYER_PTR;
     if (!guest_ptr(pl) || *(uint64_t *)(uintptr_t)pl != PLAYER_VTABLE) return;
@@ -1515,6 +1533,7 @@ void coop_tick(void) {
         coop_enemy_init(stage_hash);
         coop_enemy_set_gone_sender(send_gone);
         coop_enemy_set_hp_sender(send_hp);
+        coop_enemy_set_word_sender(send_word);
         start(true);
     }
     if (g_apply) {
