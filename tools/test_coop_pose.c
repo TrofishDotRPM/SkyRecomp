@@ -50,8 +50,8 @@ int main(void) {
     size_t n = coop_pose_take(wire, sizeof wire);
     CHECK(n > 0);
     CHECK(coop_pose_take(wire + 0, sizeof wire) == 0);  // (taken)
-    // sharing: 3 parts' 4 slots, but only 2 bones: 20 + 27 + 8 + 48
-    CHECK(n == 20 + 27 + 8 + 48);
+    // sharing: 3 parts' 4 slots, but only 2 bones: 20 + 27 + 8 + 1 (which are wide) + 48
+    CHECK(n == 20 + 27 + 8 + 1 + 48);
 
     float got[2][12], rot[2][12], want[2][12];
     CHECK(!coop_pose_apply(1, 1000, 900, 0, 0, false, got[0], rot[0], 2, cam_b, NULL));  // nothing received yet
@@ -158,6 +158,20 @@ int main(void) {
     bool hid = false;
     CHECK(coop_pose_apply(70, 16000, 102, 9, 0, true, one, NULL, 1, cam_b, &hid) && hid);
     CHECK(coop_pose_apply(70, 16000, 630, 9, 0, true, one, NULL, 1, cam_b, &hid) && !hid);
+
+    // A piece far from his feet (his Loftwing, flying apart from him): coarser, but where it is
+    float wf[12] = {0, 0, 1, 5000 + 4321, 0, 1, 0, 1200 - 2500, -1, 0, 0, -6000 + 30000}, hf[12], want_f[12];
+    mul(hf, cam_a, wf);
+    coop_pose_capture(80, 17000, 6669, 5, false, false, hf, 1, cam_a, feet_a);
+    coop_pose_capture(80, 17000, 744, 1, true, false, hl, 1, cam_a, feet_a);
+    coop_pose_capture(81, 17016, 6669, 5, false, false, hf, 1, cam_a, feet_a);
+    n = coop_pose_take(wire, sizeof wire);
+    CHECK(n > 0 && coop_pose_receive(wire, n, 17016));
+    mul(want_f, cam_b, wf);
+    CHECK(coop_pose_apply(90, 20000, 6669, 5, 0, false, one, NULL, 1, cam_b, NULL));
+    CHECK(near_all(one, want_f, 12, 1.01f));  // (2 units a step: within 1)
+    CHECK(coop_pose_apply(90, 20000, 744, 1, 0, true, one, NULL, 1, cam_b, NULL));  // (and what's near stays fine)
+    CHECK(near_all(one, want_l, 12, 0.05f));
 
     printf(fails ? "%d failed\n" : "all passed\n", fails);
     return fails != 0;

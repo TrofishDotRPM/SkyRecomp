@@ -3605,6 +3605,12 @@ int bird_part_kind(const char *texture) {
 static NvnTexture *bird_body_tex, *bird_second_tex;  // (your bird's two textures, once seen on it: any mesh with them is its)
 static NvnTexture *bird_eye_tex;  // (and its eyes': a piece of 180 vertices each, fixed to its head, a 64x64 texture of their own)
 #define BIRD_EYE_VERTICES 180
+// Whose Loftwing colours are on: this player's, or (g_bird_other, while the other player's bird draws - their Link's draws
+// copied, dup_drawing) theirs (runtime/hle/coop.c: COOP_EV_LOOK parts 0x40 on)
+extern uint32_t coop_bird_look(bool other, int part);
+static bool g_bird_other;
+static uint32_t bird_col(int p) { return coop_bird_look(g_bird_other, p); }
+
 // Your Loftwing's colours on a copy of one of its textures (RGBA, in place): kind BIRD_BODY (its body's) or BIRD_SECOND (the
 // feather tips'). The game's draws and the Customize tab's preview (runtime/ui/coop_menu.mm) both use it.
 void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h) {
@@ -3644,7 +3650,7 @@ void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h) {
                 const float tu = (float)(i % w + 0.5f) / w, tv = (float)(i / w + 0.5f) / h;
                 if (pink && kind == BIRD_BODY && tu < 0.3f && tv > 0.2f && tv < 0.5f) continue;  // (the mouth's pinks: its own)
                 const int other = pink ? 0 : 3;           // (plumage, or the markings)
-                const bool set_w = (g_settings.bird_look[1] & COOP_LOOK_SET) && n[1], set_m = (g_settings.bird_look[other] & COOP_LOOK_SET) && n[other];
+                const bool set_w = (bird_col(1) & COOP_LOOK_SET) && n[1], set_m = (bird_col(other) & COOP_LOOK_SET) && n[other];
                 if ((pink || (hue >= 190 && hue <= 300)) && sat >= 0.1f && sat <= 0.45f && hi > 0.35f && (set_w || set_m)) {
                     const float t = fminf(1, fmaxf(0, (sat - 0.12f) / 0.23f)), l = 0.299f * q0[0] + 0.587f * q0[1] + 0.114f * q0[2];
                     float out[3] = {(float)q0[0], (float)q0[1], (float)q0[2]};
@@ -3653,7 +3659,7 @@ void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h) {
                         const float wgt = side ? t : 1 - t;
                         const bool on = side ? set_m : set_w;
                         if (!on || wgt <= 0) continue;
-                        const uint32_t c = g_settings.bird_look[pp];
+                        const uint32_t c = bird_col(pp);
                         const float mean = (float)(sum[pp] / n[pp]), k = mean > 1 ? fminf(l / mean, 2.5f) : 1;
                         const float tgt[3] = {(c >> 16 & 255) * k, (c >> 8 & 255) * k, (c & 255) * k};
                         for (int ch = 0; ch < 3; ch++) out[ch] += (fminf(255, tgt[ch]) - q0[ch]) * wgt;
@@ -3663,8 +3669,8 @@ void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h) {
                 }
                 continue;
             }
-            if (p < 0 || !(g_settings.bird_look[p] & COOP_LOOK_SET) || !n[p]) continue;
-            uint32_t c = g_settings.bird_look[p];
+            if (p < 0 || !(bird_col(p) & COOP_LOOK_SET) || !n[p]) continue;
+            uint32_t c = bird_col(p);
             if (grid && p == 0) {
                 static const uint32_t CELL[16] = {0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff, 0x000000,
                                                   0xff8000, 0x8000ff, 0x00ff80, 0x804000, 0x808080, 0x0080ff, 0xff0080, 0x80ff00};
@@ -3683,7 +3689,7 @@ void bird_recolor_rgba(int kind, uint8_t *px, uint32_t w, uint32_t h) {
 static void bird_texture_swap(Prog *pr, int kind, NvnTexture *force) {
     if (kind < 0) return;
     bool any = false;
-    for (int p = 0; p < BIRD_LOOK_PARTS; p++) any |= (g_settings.bird_look[p] & COOP_LOOK_SET) != 0;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) any |= (bird_col(p) & COOP_LOOK_SET) != 0;
     const uint64_t frame = renderer_present_count(), bones = st.ubuf[0][3].addr;
     if ((kind == BIRD_SECOND || kind == BIRD_TUFT || kind == BIRD_EYE) && frame - bird_frame > 1) return;  // (your crimson body drew, this frame or the last)
     NvnTexture *best = force;
@@ -3726,7 +3732,7 @@ static void bird_texture_swap(Prog *pr, int kind, NvnTexture *force) {
     if (!any) return;
     // (the recolored copy, cached as Link's are: key the colors and which mesh)
     uint64_t key = 0xb12d5eedull ^ (uint64_t)kind;
-    for (int p = 0; p < BIRD_LOOK_PARTS; p++) key = (key ^ g_settings.bird_look[p]) * 1099511628211ull;
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) key = (key ^ bird_col(p)) * 1099511628211ull;
     int slot = -1;
     for (int i = 0; i < RECOLOURED; i++) {
         Recoloured *e = &recoloured[i];
@@ -4352,6 +4358,18 @@ static void link_range_note(Prog *pr) {
     if (vb > next_hi) next_hi = vb;
 }
 
+// A draw of this player's own Loftwing (by its textures: the crimson body's, its tips', its eyes'). It's copied for the other
+// player's bird however far it is from Link: falling, or the bird flying in to catch him, it's apart from him
+static bool bird_own_draw(Prog *pr, bool skinned, uint32_t vertices) {
+    if (!skinned && vertices != BIRD_EYE_VERTICES) return false;
+    if (renderer_present_count() - bird_frame > 1) return false;  // (its crimson body drew, this frame or the last)
+    for (int i = 0; i < pr->fi->ntex; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (t && (skinned ? t == bird_body_tex || t == bird_second_tex : t == bird_eye_tex)) return true;
+    }
+    return false;
+}
+
 static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     if (!g_is_skyward || !in_pass || !pr || !st.rt.depth) return;
     // cbuf_mask counts from cbuf_base: bit k is uniform buffer k - 3. A skinned mesh (bits 3 4 6 7) has its bones in buffer 3;
@@ -4368,11 +4386,12 @@ static void dup_link(Prog *pr, CmdRec *r, bool indexed) {
     float d[3];
     for (int i = 0; i < 3; i++)
         d[i] = src[first + i * 4 + 3] - (view[i * 4] * me[0] + view[i * 4 + 1] * me[1] + view[i * 4 + 2] * me[2] + view[i * 4 + 3]);
-    if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > LINK_BONES_NEAR * LINK_BONES_NEAR) return;  // not Link
+    const bool bird = bird_own_draw(pr, skinned, vertices);
+    if (!bird && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > LINK_BONES_NEAR * LINK_BONES_NEAR) return;  // not Link
     // Near him isn't enough: save statues, villagers. His model is loaded in one place (link_range_note): what else is his
     // has its vertices close to those of his big meshes.
     const uint64_t vb = st.vbuf[0].addr;
-    if (!(skinned && bones->size >= LINK_BIG_MESH_BYTES) &&
+    if (!bird && !(skinned && bones->size >= LINK_BIG_MESH_BYTES) &&
         (!link_hi || vb + LINK_MODEL_SLACK < link_lo || vb > link_hi + LINK_MODEL_SLACK) && (skinned || !link_carried(vertices, vb, src + first, view, me)))
         return;
     dup_seen_frame = renderer_present_count();
@@ -4831,6 +4850,14 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!dup_drawing && !swap_to && g_is_skyward && in_pass && pr->vi->cbuf_mask == LINK_RIGID_CBUFS && r->x[2] == BIRD_EYE_VERTICES)
         bird_texture_swap(pr, BIRD_EYE, NULL);  // (its eyes)
     if (!dup_drawing && g_is_skyward && !swap_to) bird_icon_swap(pr);  // (its HUD icons)
+    if (dup_drawing && !swap_to && g_is_skyward && in_pass) {  // (the other player's Loftwing - yours, its draws copied - in their colours)
+        g_bird_other = true;
+        if (pr->vi->cbuf_mask == LINK_CBUFS)
+            bird_texture_swap(pr, r->x[2] == BIRD_BODY_VERTICES ? BIRD_BODY : r->x[2] == BIRD_SECOND_VERTICES ? BIRD_SECOND : BIRD_NONE, NULL);
+        if (!swap_to) bird_texture_any(pr, r);
+        if (!swap_to && pr->vi->cbuf_mask == LINK_RIGID_CBUFS && r->x[2] == BIRD_EYE_VERTICES) bird_texture_swap(pr, BIRD_EYE, NULL);
+        g_bird_other = false;
+    }
     if (g_bird_capture == 2 && !dup_drawing && g_is_skyward && renderer_present_count() == bird_frame && r->x[2] < 400) {
         // (debugging: every small draw in your bird's frame, with where each of its uniform buffers' matrices would put it
         //  against its body's root, and its textures - to find its eyes)

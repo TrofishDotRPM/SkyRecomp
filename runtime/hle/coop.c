@@ -87,6 +87,9 @@ static void emit(const CoopEvent *ev, void *user) {
 // COOP_EV_POS: a a hash of the stage's name, b c d the position in units of 2 (the game's maps fit 16 bits that way).
 // There's no sender in an event, so with more than two players the marker would jump between them.
 #define COOP_EV_POS 8
+// COOP_EV_POS_FAR: the same in units of 8, when a coordinate is past what units of 2 hold (the sky's islands go to 166000 out:
+// clamped at 65534, the marker's distance went wrong and stopped changing once out there)
+#define COOP_EV_POS_FAR 18
 #define PLAYER_PTR 0x7001826AD0ull
 #define PLAYER_VTABLE 0x7001637D28ull
 #define PLAYER_POS 0x144
@@ -182,7 +185,17 @@ static void pos_send_tick(void) {
     uint64_t p = *(uint64_t *)(uintptr_t)PLAYER_PTR;
     if (p < 0x7002000000ull || *(uint64_t *)(uintptr_t)p != PLAYER_VTABLE) return;  // (no Link: loading)
     const float *pos = (const float *)(uintptr_t)(p + PLAYER_POS);
+    bool far = false;
+    for (int k = 0; k < 3; k++) far |= fabsf(pos[k]) > 65000;
     CoopEvent ev = {COOP_EV_POS, stage, (uint16_t)pos_unit(pos[0]), (uint16_t)pos_unit(pos[1]), (uint16_t)pos_unit(pos[2])};
+    if (far) {
+        int16_t u[3];
+        for (int k = 0; k < 3; k++) {
+            const float v = roundf(pos[k] / 8);
+            u[k] = v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
+        }
+        ev = (CoopEvent){COOP_EV_POS_FAR, stage, (uint16_t)u[0], (uint16_t)u[1], (uint16_t)u[2]};
+    }
     coop_net_send(&ev);
     last = now;
 }
@@ -192,11 +205,12 @@ static void pos_send_tick(void) {
 static volatile bool g_kills_due;
 
 static void pos_received(const CoopEvent *ev) {
+    const float unit = ev->type == COOP_EV_POS_FAR ? 8.0f : 2.0f;
     pthread_mutex_lock(&g_pos_lock);
     if ((ev->a != g_other_stage || !g_other_at) && ev->a == g_my_stage) g_kills_due = true;
-    g_other[0] = (int16_t)ev->b * 2.0f;
-    g_other[1] = (int16_t)ev->c * 2.0f;
-    g_other[2] = (int16_t)ev->d * 2.0f;
+    g_other[0] = (int16_t)ev->b * unit;
+    g_other[1] = (int16_t)ev->c * unit;
+    g_other[2] = (int16_t)ev->d * unit;
     g_other_stage = ev->a;
     g_other_at = SDL_GetTicks();
     pthread_mutex_unlock(&g_pos_lock);
@@ -317,6 +331,9 @@ bool coop_my_position(float out[3]) {
 #define COOP_EV_LOOK 9
 #define LOOK_RESEND_MS 3000
 static uint32_t g_other_look[COOP_LOOK_PARTS];
+// (and their Loftwing's: parts BIRD_LOOK_BASE + its part, so older builds - which take only Link's - pass them by)
+#define BIRD_LOOK_BASE 0x40
+static uint32_t g_other_bird[BIRD_LOOK_PARTS];
 
 static void look_send_tick(void) {
     static uint32_t sent[COOP_LOOK_PARTS];
@@ -331,13 +348,29 @@ static void look_send_tick(void) {
         coop_net_send(&ev);
         sent[p] = v;
     }
+    static uint32_t sent_bird[BIRD_LOOK_PARTS];
+    for (int p = 0; p < BIRD_LOOK_PARTS; p++) {
+        uint32_t v = g_settings.bird_look[p];
+        if (!due && v == sent_bird[p]) continue;
+        CoopEvent ev = {COOP_EV_LOOK, (uint8_t)(BIRD_LOOK_BASE + p), (uint16_t)((v >> 16 & 255) | (v >> 8 & 255) << 8),
+                        (uint16_t)((v & 255) | (v & COOP_LOOK_SET ? 1u << 8 : 0)), 0};
+        coop_net_send(&ev);
+        sent_bird[p] = v;
+    }
     if (due) last = now;
 }
 
 static void look_received(const CoopEvent *ev) {
-    if (ev->a >= COOP_LOOK_PARTS) return;
     uint32_t rgb = (uint32_t)(ev->b & 255) << 16 | (uint32_t)(ev->b >> 8) << 8 | (ev->c & 255);
-    g_other_look[ev->a] = ev->c >> 8 & 1 ? rgb | COOP_LOOK_SET : 0;
+    const uint32_t v = ev->c >> 8 & 1 ? rgb | COOP_LOOK_SET : 0;
+    if (ev->a >= BIRD_LOOK_BASE && ev->a < BIRD_LOOK_BASE + BIRD_LOOK_PARTS) g_other_bird[ev->a - BIRD_LOOK_BASE] = v;
+    else if (ev->a < COOP_LOOK_PARTS) g_other_look[ev->a] = v;
+}
+
+// A Loftwing's colour for one of its parts (COOP_LOOK_SET with it, 0 for its own): this player's, or the other's
+uint32_t coop_bird_look(bool other, int part) {
+    if (part < 0 || part >= BIRD_LOOK_PARTS) return 0;
+    return other ? g_other_bird[part] : g_settings.bird_look[part];
 }
 
 // ---- the name over each Link: COOP_EV_NAME, a the chunk (0-3), b c d six bytes of it. Sent as the colors are.
@@ -985,12 +1018,12 @@ static void on_event(const CoopEvent *ev, void *user) {
     (void)user;
     if (!g_core.baselined) return;  // we'll ask for it all when a save is in play
     // (in a boss area: the other's progress waits until this player leaves it; where they are, how they look, still come)
-    if (in_boss() && ev->type != COOP_EV_POS && ev->type != COOP_EV_LOOK && ev->type != COOP_EV_NAME && ev->type != COOP_EV_SYNC &&
+    if (in_boss() && ev->type != COOP_EV_POS && ev->type != COOP_EV_POS_FAR && ev->type != COOP_EV_LOOK && ev->type != COOP_EV_NAME && ev->type != COOP_EV_SYNC &&
         ev->type != COOP_EV_COPY && ev->type != COOP_EV_COPY_END) {
         if (g_ndeferred < DEFER_MAX) g_deferred[g_ndeferred++] = *ev;
         return;
     }
-    if (ev->type == COOP_EV_POS) { pos_received(ev); return; }
+    if (ev->type == COOP_EV_POS || ev->type == COOP_EV_POS_FAR) { pos_received(ev); return; }
     if (ev->type == COOP_EV_LOOK) { look_received(ev); return; }
     if (ev->type == COOP_EV_NAME) { name_received(ev); return; }
     log_event("got", ev);

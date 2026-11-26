@@ -12,6 +12,8 @@
 #define MAX_SLOTS 4096
 #define ROT_SCALE 16000.0f  // bone rotations are near unit size
 #define POS_SCALE 32.0f     // 1/32 of a game unit; +-1000 units from his feet
+#define WIDE_SCALE 0.5f     // a bone further off (his Loftwing, flying apart from him): 2 units, +-65000
+#define WIDE_FROM 1000.0f
 #define HASH_SLOTS 4096
 
 // Named by its vertex count, kind and where in memory its mesh is (tag): Link has pieces of the same size, both hands.
@@ -117,15 +119,17 @@ void coop_pose_capture(uint64_t frame, uint64_t now_ms, uint32_t vertices, uint1
 }
 
 // ---- on the wire, little-endian: time u32, feet (3 f32), nbones u16, nparts u16, parts (vertices u32, count u16, tag u16, flags u8: 1
-// rigid, 2 hidden), slots (u16 each), bones (12 i16 each)
+// rigid, 2 hidden), slots (u16 each), which bones are wide (a bit each, WIDE_SCALE), bones (12 i16 each)
 static void put_u16(uint8_t **w, uint16_t v) { (*w)[0] = (uint8_t)v, (*w)[1] = (uint8_t)(v >> 8), *w += 2; }
 static uint16_t get_u16(const uint8_t **r) { uint16_t v = (uint16_t)((*r)[0] | (*r)[1] << 8); *r += 2; return v; }
+
+static bool bone_wide(const float b[12]) { return fabsf(b[3]) > WIDE_FROM || fabsf(b[7]) > WIDE_FROM || fabsf(b[11]) > WIDE_FROM; }
 
 size_t coop_pose_take(uint8_t *out, size_t cap) {
     pthread_mutex_lock(&g_lock);
     if (!g_ready_new) { pthread_mutex_unlock(&g_lock); return 0; }
     const Pose *p = &g_ready;
-    size_t need = 20 + (size_t)p->nparts * 9 + (size_t)p->nslots * 2 + (size_t)p->nbones * 24;
+    size_t need = 20 + (size_t)p->nparts * 9 + (size_t)p->nslots * 2 + ((size_t)p->nbones + 7) / 8 + (size_t)p->nbones * 24;
     if (need > cap) { g_ready_new = false; pthread_mutex_unlock(&g_lock); return 0; }
     uint8_t *w = out;
     put_u16(&w, (uint16_t)p->time_ms), put_u16(&w, (uint16_t)(p->time_ms >> 16));
@@ -139,8 +143,14 @@ size_t coop_pose_take(uint8_t *out, size_t cap) {
         *w++ = (uint8_t)(q->rigid | q->hidden << 1);
     }
     for (uint32_t i = 0; i < p->nslots; i++) put_u16(&w, p->slots[i]);
-    for (int b = 0; b < p->nbones; b++)
-        for (int k = 0; k < 12; k++) put_u16(&w, (uint16_t)quant(p->bones[b][k], k % 4 == 3 ? POS_SCALE : ROT_SCALE));
+    memset(w, 0, ((size_t)p->nbones + 7) / 8);
+    for (int b = 0; b < p->nbones; b++) if (bone_wide(p->bones[b])) w[b / 8] |= (uint8_t)(1 << b % 8);
+    const uint8_t *wide = w;
+    w += ((size_t)p->nbones + 7) / 8;
+    for (int b = 0; b < p->nbones; b++) {
+        const float pos = wide[b / 8] >> b % 8 & 1 ? WIDE_SCALE : POS_SCALE;
+        for (int k = 0; k < 12; k++) put_u16(&w, (uint16_t)quant(p->bones[b][k], k % 4 == 3 ? pos : ROT_SCALE));
+    }
     g_ready_new = false;
     pthread_mutex_unlock(&g_lock);
     return (size_t)(w - out);
@@ -168,13 +178,17 @@ bool coop_pose_receive(const uint8_t *data, size_t size, uint64_t now_ms) {
         if (in.nslots + q->count > MAX_SLOTS) return false;
         in.nslots += q->count;
     }
-    if ((size_t)(end - r) != (size_t)in.nslots * 2 + (size_t)in.nbones * 24) return false;
+    if ((size_t)(end - r) != (size_t)in.nslots * 2 + ((size_t)in.nbones + 7) / 8 + (size_t)in.nbones * 24) return false;
     for (uint32_t i = 0; i < in.nslots; i++) {
         in.slots[i] = get_u16(&r);
         if (in.slots[i] >= in.nbones) return false;
     }
-    for (int b = 0; b < in.nbones; b++)
-        for (int k = 0; k < 12; k++) in.bones[b][k] = (int16_t)get_u16(&r) / (k % 4 == 3 ? POS_SCALE : ROT_SCALE);
+    const uint8_t *wide = r;
+    r += ((size_t)in.nbones + 7) / 8;
+    for (int b = 0; b < in.nbones; b++) {
+        const float pos = wide[b / 8] >> b % 8 & 1 ? WIDE_SCALE : POS_SCALE;
+        for (int k = 0; k < 12; k++) in.bones[b][k] = (int16_t)get_u16(&r) / (k % 4 == 3 ? pos : ROT_SCALE);
+    }
     pthread_mutex_lock(&g_lock);
     int64_t off = (int64_t)now_ms - (int64_t)in.time_ms;
     if (!g_have_offset || off < g_offset) g_offset = off;

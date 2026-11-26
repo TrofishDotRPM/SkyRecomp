@@ -529,7 +529,7 @@ extern "C" void coop_look_draw(float scale) {
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         ImGui::BeginChild("##colours", ImVec2(avail.x * 0.46f, avail.y));
         ImGui::Spacing();
-        ImGui::TextWrapped("%s", bird ? "Your Crimson Loftwing's colors. Only you see them: the other player's game doesn't draw your bird."
+        ImGui::TextWrapped("%s", bird ? "Your Crimson Loftwing's colors. The other player sees them on your bird too."
                                       : PAGES[pg].note);
         ImGui::Spacing();
         if (bird) {
